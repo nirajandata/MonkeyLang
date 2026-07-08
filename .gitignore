@@ -59,6 +59,9 @@ compile_commands.json
 *.bak
 *.swp
 
+#Clion
+.idea
+
 # vcpkg
 vcpkg_installed/
 

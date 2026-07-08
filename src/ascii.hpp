@@ -1,9 +1,9 @@
 #pragma once
-
 #include <immintrin.h>
 #include <cstdint>
 
 namespace ascii {
+
     constexpr bool is_alpha(char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     }
@@ -20,27 +20,33 @@ namespace ascii {
         return c == ' ' || (c >= '\t' && c <= '\r');
     }
 
-    inline __mmask64 is_alpha_512(__m512i chars) {
-        __mmask64 lower = _mm512_cmpge_epu8_mask(chars, _mm512_set1_epi8('a')) &
-                          _mm512_cmple_epu8_mask(chars, _mm512_set1_epi8('z'));
-        __mmask64 upper = _mm512_cmpge_epu8_mask(chars, _mm512_set1_epi8('A')) &
-                          _mm512_cmple_epu8_mask(chars, _mm512_set1_epi8('Z'));
-        return lower | upper;
+    inline __mmask64 in_range_512(__m512i chars, uint8_t lo, uint8_t hi)
+    {
+        __m512i shifted = _mm512_sub_epi8(chars, _mm512_set1_epi8(static_cast<char>(lo)));
+        return _mm512_cmple_epu8_mask(shifted, _mm512_set1_epi8(static_cast<char>(hi - lo)));
     }
 
-    inline __mmask64 is_digit_512(__m512i chars) {
-        return _mm512_cmpge_epu8_mask(chars, _mm512_set1_epi8('0')) &
-               _mm512_cmple_epu8_mask(chars, _mm512_set1_epi8('9'));
+    inline __mmask64 is_alpha_512(__m512i chars)
+    {
+        __m512i lowered = _mm512_or_si512(chars, _mm512_set1_epi8(0x20));
+        return in_range_512(lowered, 'a', 'z');
     }
 
-    inline __mmask64 is_alnum_512(__m512i chars) {
+    inline __mmask64 is_digit_512(__m512i chars)
+    {
+        return in_range_512(chars, '0', '9');
+    }
+
+    inline __mmask64 is_alnum_512(__m512i chars)
+    {
         return is_alpha_512(chars) | is_digit_512(chars);
     }
 
-    inline __mmask64 is_space_512(__m512i chars) {
+    inline __mmask64 is_space_512(__m512i chars)
+    {
         __mmask64 space = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8(' '));
-        __mmask64 range = _mm512_cmpge_epu8_mask(chars, _mm512_set1_epi8('\t')) &
-                          _mm512_cmple_epu8_mask(chars, _mm512_set1_epi8('\r'));
+        __mmask64 range = in_range_512(chars, '\t', '\r');
         return space | range;
     }
+
 }

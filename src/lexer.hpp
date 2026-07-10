@@ -1,23 +1,29 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <string_view>
+#include <vector>
 #include <filesystem>
-#include <fstream>
 #include <immintrin.h>
 #include <bit>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "token.hpp"
 #include "ascii.hpp"
 
 class Lexer
 {
-    std::string source_;
+    void* map_base_ = nullptr;
+    size_t map_size_ = 0;
+    int fd_ = -1;
+
     const char* cursor_;
     const char* limit_;
     std::vector<Token> tokens_;
     uint32_t current_line_ = 1;
     bool had_error_ = false;
+    bool open_ok_ = false;
 
     inline uint64_t tail_mask() const
     {
@@ -220,31 +226,106 @@ class Lexer
 public:
     Lexer(const std::filesystem::path& path) : cursor_{nullptr}, limit_{nullptr}
     {
-        std::ifstream file(path, std::ios::ate | std::ios::binary);
-        if (file.is_open())
+        fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0)
         {
-            auto size = static_cast<size_t>(file.tellg());
-            source_.resize(size + 64, '\0');
-            file.seekg(0);
-            file.read(source_.data(), static_cast<std::streamsize>(size));
-            cursor_ = source_.data();
-            limit_ = source_.data() + size;
+            cursor_ = nullptr;
+            limit_ = nullptr;
+            return;
         }
-        else
+
+        struct stat st{};
+        if (fstat(fd_, &st) != 0 || st.st_size < 0)
         {
-            cursor_ = source_.data();
-            limit_ = source_.data();
+            close(fd_);
+            fd_ = -1;
+            cursor_ = nullptr;
+            limit_ = nullptr;
+            return;
         }
+
+        size_t size = static_cast<size_t>(st.st_size);
+        long page_size_l = sysconf(_SC_PAGESIZE);
+        size_t page_size = page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
+
+        size_t file_pages = (size + page_size - 1) / page_size;
+        map_size_ = (file_pages + 1) * page_size; // +1 guard page
+
+        map_base_ = mmap(nullptr, map_size_, PROT_READ,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map_base_ == MAP_FAILED)
+        {
+            close(fd_);
+            fd_ = -1;
+            map_base_ = nullptr;
+            cursor_ = nullptr;
+            limit_ = nullptr;
+            return;
+        }
+
+        if (size > 0)
+        {
+            void* filemap = mmap(map_base_, size, PROT_READ,
+                                  MAP_PRIVATE | MAP_FIXED | MAP_POPULATE,
+                                  fd_, 0);
+            if (filemap == MAP_FAILED)
+            {
+                munmap(map_base_, map_size_);
+                close(fd_);
+                fd_ = -1;
+                map_base_ = nullptr;
+                cursor_ = nullptr;
+                limit_ = nullptr;
+                return;
+            }
+        }
+
+        madvise(map_base_, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+        cursor_ = static_cast<const char*>(map_base_);
+        limit_ = cursor_ + size;
+        open_ok_ = true;
+
+        close(fd_);
+        fd_ = -1;
+    }
+
+    ~Lexer()
+    {
+        if (map_base_)
+        {
+            munmap(map_base_, map_size_);
+        }
+        if (fd_ >= 0)
+        {
+            close(fd_);
+        }
+    }
+
+    Lexer(const Lexer&) = delete;
+    Lexer& operator=(const Lexer&) = delete;
+
+    Lexer(Lexer&& other) noexcept
+        : map_base_(other.map_base_), map_size_(other.map_size_), fd_(other.fd_),
+          cursor_(other.cursor_), limit_(other.limit_),
+          tokens_(std::move(other.tokens_)), current_line_(other.current_line_),
+          had_error_(other.had_error_), open_ok_(other.open_ok_)
+    {
+        other.map_base_ = nullptr;
+        other.map_size_ = 0;
+        other.fd_ = -1;
+        other.cursor_ = nullptr;
+        other.limit_ = nullptr;
     }
 
     void lex()
     {
         tokens_.clear();
-        tokens_.reserve(source_.size() / 3 + 16);
+        tokens_.reserve(static_cast<size_t>(limit_ - cursor_) / 3 + 16);
 
         had_error_ = false;
         current_line_ = 1;
-        cursor_ = source_.data();
+        cursor_ = static_cast<const char*>(map_base_);
 
         while (cursor_ < limit_)
         {
@@ -287,6 +368,6 @@ public:
         tokens_.push_back({TokenType::Eof, "", current_line_});
     }
 
-    bool ok() const { return !had_error_; }
+    bool ok() const { return !had_error_ && open_ok_; }
     const std::vector<Token>& get_tokens() const { return tokens_; }
 };

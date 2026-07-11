@@ -4,6 +4,7 @@
 #include <print>
 #include <cstdlib>
 #include "lexer.hpp"
+#include "parser.hpp"
 
 enum class Stage : std::uint8_t { Lex, Parse, CodeGen, EmitAsm };
 
@@ -28,6 +29,22 @@ static void print_tokens(const std::vector<Token>& tokens) {
                      t.line,
                      t.text);
     }
+}
+
+static void pretty_print(const Program& program, int indent = 0) {
+    std::string pad(indent * 2, ' ');
+    std::println("{}Program(", pad);
+    std::println("{}  Function(", pad);
+    std::println("{}    name=\"{}\",", pad, program.function.name);
+
+    const auto& ret = std::get<Return>(program.function.body);
+    const auto& constant = std::get<Constant>(ret.value);
+
+    std::println("{}    body=Return(", pad);
+    std::println("{}      Constant({})", pad, constant.value);
+    std::println("{}    )", pad);
+    std::println("{}  )", pad);
+    std::println("{})", pad);
 }
 
 int main(int argc, char *argv[]) {
@@ -56,8 +73,21 @@ int main(int argc, char *argv[]) {
             print_tokens(lexer.get_tokens());
             return 0;
     }
-    case Parse:
-        return 0;
+    case Parse: {
+            Lexer lexer(source_path);
+            lexer.lex();
+            if (!lexer.ok()) {
+                std::println("error: lexer encountered invalid tokens");
+                return 1;
+            }
+            Parser parser(lexer.get_tokens(), source_path.string());
+            auto program = parser.parse();
+            if (!program) {
+                return 1;
+            }
+            pretty_print(*program);
+            return 0;
+    }
     case CodeGen:
         return 0;
     case EmitAsm:

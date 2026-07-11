@@ -7,7 +7,9 @@ add_executable(Monkey
         src/main.cpp
         src/lexer.hpp
         src/token.hpp
-        src/ascii.hpp)
+        src/ascii.hpp
+        src/ast.hpp
+        src/parser.hpp)
 
 target_compile_options(Monkey PRIVATE -march=native -O3)
 

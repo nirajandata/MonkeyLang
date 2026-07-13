@@ -37,11 +37,15 @@ class Parser {
             return {0, tok.line};
         }
 
-        int32_t val = 0;
-        for (char c : tok.text) {
-            val = val * 10 + (c - '0');
+        int32_t value = 0;
+        const auto [ptr, ec] =
+            std::from_chars(tok.text.data(), tok.text.data() + tok.text.size(), value);
+
+        if (ec != std::errc{} || ptr != tok.text.data() + tok.text.size()) {
+            std::println("{} a valid integer constant  {} ", tok.line,tok.text);
+            return {.value = 0, .line = tok.line};
         }
-        return {val, tok.line};
+        return {.value = value, .line = tok.line};
     }
 
     Exp parse_exp() {

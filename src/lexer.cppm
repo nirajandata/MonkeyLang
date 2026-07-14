@@ -1,4 +1,4 @@
-#pragma once
+module;
 
 #include <string_view>
 #include <vector>
@@ -9,10 +9,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "token.hpp"
-#include "ascii.hpp"
 
-class Lexer
+export module lexer;
+
+import token;
+import ascii;
+
+export class Lexer
 {
     void* map_base_ = nullptr;
     size_t map_size_ = 0;
@@ -249,7 +252,7 @@ public:
         size_t page_size = page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
 
         size_t file_pages = (size + page_size - 1) / page_size;
-        map_size_ = (file_pages + 1) * page_size; // +1 guard page
+        map_size_ = (file_pages + 1) * page_size;
 
         map_base_ = mmap(nullptr, map_size_, PROT_READ,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

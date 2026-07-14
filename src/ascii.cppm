@@ -1,8 +1,11 @@
-#pragma once
+module;
+
 #include <immintrin.h>
 #include <cstdint>
 
-namespace ascii {
+export module ascii;
+
+export namespace ascii {
 
     constexpr bool is_alpha(char c) {
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');

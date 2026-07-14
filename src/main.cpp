@@ -5,9 +5,13 @@
 #include <string_view>
 #include <print>
 #include <cstdlib>
-#include "lexer.hpp"
-#include "parser.hpp"
-#include "codegen.hpp"
+#include <variant>
+
+import token;
+import ast;
+import lexer;
+import parser;
+import codegen;
 
 enum class Stage : std::uint8_t { Lex, Parse, CodeGen, EmitAsm, Run };
 

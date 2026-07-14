@@ -1,9 +1,11 @@
-#pragma once
+module;
 
 #include <string_view>
 #include <cstdint>
 
-enum class TokenType : uint32_t {
+export module token;
+
+export enum class TokenType : uint32_t {
     Identifier = 1,
     Constant,
     Int,
@@ -19,7 +21,7 @@ enum class TokenType : uint32_t {
     Eof
 };
 
-struct Token {
+export struct Token {
     TokenType type;
     std::string_view text;
     uint32_t line;

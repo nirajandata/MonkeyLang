@@ -1,12 +1,15 @@
-#pragma once
+module;
 
 #include <string_view>
 #include <vector>
 #include <print>
-#include "token.hpp"
-#include "ast.hpp"
 
-class Parser {
+export module parser;
+
+import token;
+import ast;
+
+export class Parser {
     const std::vector<Token>& tokens_;
     size_t pos_ = 0;
     bool had_error_ = false;

@@ -4,12 +4,17 @@ project(Monkey)
 set(CMAKE_CXX_STANDARD 26)
 
 add_executable(Monkey
-        src/main.cpp
-        src/lexer.hpp
-        src/token.hpp
-        src/ascii.hpp
-        src/ast.hpp
-        src/parser.hpp)
+    src/main.cpp
+)
+
+target_sources(Monkey PRIVATE
+    FILE_SET CXX_MODULES FILES
+    src/token.cppm
+    src/ascii.cppm
+    src/ast.cppm
+    src/lexer.cppm
+    src/parser.cppm
+    src/codegen.cppm
+)
 
 target_compile_options(Monkey PRIVATE -march=native -O3)
-

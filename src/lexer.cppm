@@ -220,6 +220,7 @@ export class Lexer
         case '{': return {TokenType::LBrace, std::string_view(start, 1), current_line_};
         case '}': return {TokenType::RBrace, std::string_view(start, 1), current_line_};
         case ';': return {TokenType::Semicolon, std::string_view(start, 1), current_line_};
+        case '~': return {TokenType::Tilde, std::string_view(start, 1), current_line_};
         default:
             had_error_ = true;
             return {TokenType::Error, std::string_view(start, 1), current_line_};
@@ -360,6 +361,20 @@ public:
                 else
                 {
                     tokens_.push_back({TokenType::Slash, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '-')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '-')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::Decrement, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    tokens_.push_back({TokenType::Hyphen, std::string_view(start, 1), current_line_});
                 }
             }
             else

@@ -17,6 +17,9 @@ export enum class TokenType : uint32_t {
     RBrace,
     Semicolon,
     Slash,
+    Tilde,
+    Hyphen,
+    Decrement,
     Error,
     Eof
 };

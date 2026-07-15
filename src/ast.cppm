@@ -3,8 +3,14 @@ module;
 #include <cstdint>
 #include <string_view>
 #include <variant>
+#include <utility>
 
 export module ast;
+
+export template <typename... Ts>
+struct Overload : Ts... {
+    using Ts::operator()...;
+};
 
 export struct Constant {
     int32_t value;

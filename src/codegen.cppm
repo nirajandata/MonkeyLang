@@ -37,21 +37,17 @@ export struct AsmProgram {
 };
 
 export Operand gen_exp(const Exp& exp) {
-    return std::visit([](const auto& e) -> Operand {
-        using T = std::decay_t<decltype(e)>;
-        if constexpr (std::is_same_v<T, Constant>) {
-            return Imm{e.value};
-        }
+    return std::visit(Overload{
+        [](const Constant& c) -> Operand { return Imm{c.value}; },
     }, exp);
 }
 
 export std::vector<Instruction> gen_statement(const Statement& stmt) {
-    return std::visit([](const auto& s) -> std::vector<Instruction> {
-        using T = std::decay_t<decltype(s)>;
-        if constexpr (std::is_same_v<T, Return>) {
-            auto operand = gen_exp(s.value);
+    return std::visit(Overload{
+        [](const Return& r) -> std::vector<Instruction> {
+            auto operand = gen_exp(r.value);
             return {Mov{operand, Register{}}, Ret{}};
-        }
+        },
     }, stmt);
 }
 
@@ -81,31 +77,17 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
     output += prefix + name + ":\n";
 
     for (const auto& instr : program.function.instructions) {
-        std::visit([&output](const auto& i) {
-            using T = std::decay_t<decltype(i)>;
-            if constexpr (std::is_same_v<T, Mov>) {
-                std::string src = std::visit([](const auto& o) -> std::string {
-                    using O = std::decay_t<decltype(o)>;
-                    if constexpr (std::is_same_v<O, Imm>) {
-                        return "$" + std::to_string(o.value);
-                    } else if constexpr (std::is_same_v<O, Register>) {
-                        return "%eax";
-                    }
-                }, i.src);
-
-                std::string dst = std::visit([](const auto& o) -> std::string {
-                    using O = std::decay_t<decltype(o)>;
-                    if constexpr (std::is_same_v<O, Imm>) {
-                        return "$" + std::to_string(o.value);
-                    } else if constexpr (std::is_same_v<O, Register>) {
-                        return "%eax";
-                    }
-                }, i.dst);
-
-                output += "    movl " + src + ", " + dst + "\n";
-            } else if constexpr (std::is_same_v<T, Ret>) {
-                output += "    ret\n";
-            }
+        std::visit(Overload{
+            [&output](const Mov& m) {
+                auto operand_str = [](const Operand& o) -> std::string {
+                    return std::visit(Overload{
+                        [](const Imm& i) -> std::string { return "$" + std::to_string(i.value); },
+                        [](const Register&) -> std::string { return "%eax"; },
+                    }, o);
+                };
+                output += "    movl " + operand_str(m.src) + ", " + operand_str(m.dst) + "\n";
+            },
+            [&output](const Ret&) { output += "    ret\n"; },
         }, instr);
     }
 

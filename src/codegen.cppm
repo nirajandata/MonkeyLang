@@ -64,10 +64,21 @@ export AsmProgram codegen(const Program& program) {
     return {gen_function(program.function)};
 }
 
+static std::string platform_prefix() {
+#if defined(__APPLE__)
+    return "_";
+#else
+    return "";
+#endif
+}
+
 export void emit_asm(const AsmProgram& program, std::string& output) {
+    auto prefix = platform_prefix();
+    auto& name = program.function.name;
+
     output += "    .text\n";
-    output += "    .globl " + program.function.name + "\n";
-    output += program.function.name + ":\n";
+    output += "    .globl " + prefix + name + "\n";
+    output += prefix + name + ":\n";
 
     for (const auto& instr : program.function.instructions) {
         std::visit([&output](const auto& i) {
@@ -97,4 +108,8 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
             }
         }, instr);
     }
+
+#if defined(__linux__)
+    output += "\n    .section .note.GNU-stack,\"\",@progbits\n";
+#endif
 }

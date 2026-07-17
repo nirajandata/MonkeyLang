@@ -1,6 +1,7 @@
 module;
 
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <variant>
 #include <utility>
@@ -17,7 +18,22 @@ export struct Constant {
     uint32_t line;
 };
 
-export using Exp = std::variant<Constant>;
+export struct Complement {};
+export struct Negate {};
+
+export using UnaryOp = std::variant<Complement, Negate>;
+
+export struct Exp;
+
+export struct Unary {
+    UnaryOp op;
+    std::unique_ptr<Exp> exp;
+    uint32_t line;
+};
+
+export struct Exp {
+    std::variant<Constant, Unary> value;
+};
 
 export struct Return {
     Exp value;

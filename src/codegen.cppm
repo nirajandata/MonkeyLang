@@ -25,7 +25,11 @@ export struct Mov {
 
 export struct Ret {};
 
-export using Instruction = std::variant<Mov, Ret>;
+export struct Notl {};
+
+export struct Negl {};
+
+export using Instruction = std::variant<Mov, Ret, Notl, Negl>;
 
 export struct AsmFunction {
     std::string name;
@@ -36,17 +40,33 @@ export struct AsmProgram {
     AsmFunction function;
 };
 
-export Operand gen_exp(const Exp& exp) {
+export std::vector<Instruction> gen_exp(const Exp& exp) {
     return std::visit(Overload{
-        [](const Constant& c) -> Operand { return Imm{c.value}; },
-    }, exp);
+        [](const Constant& c) -> std::vector<Instruction> {
+            return {Mov{Imm{c.value}, Register{}}};
+        },
+        [](const Unary& u) -> std::vector<Instruction> {
+            auto inner = gen_exp(*u.exp);
+            return std::visit(Overload{
+                [&inner](const Complement&) -> std::vector<Instruction> {
+                    inner.push_back(Notl{});
+                    return inner;
+                },
+                [&inner](const Negate&) -> std::vector<Instruction> {
+                    inner.push_back(Negl{});
+                    return inner;
+                },
+            }, u.op);
+        },
+    }, exp.value);
 }
 
 export std::vector<Instruction> gen_statement(const Statement& stmt) {
     return std::visit(Overload{
         [](const Return& r) -> std::vector<Instruction> {
-            auto operand = gen_exp(r.value);
-            return {Mov{operand, Register{}}, Ret{}};
+            auto instructions = gen_exp(r.value);
+            instructions.push_back(Ret{});
+            return instructions;
         },
     }, stmt);
 }
@@ -88,6 +108,8 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
                 output += "    movl " + operand_str(m.src) + ", " + operand_str(m.dst) + "\n";
             },
             [&output](const Ret&) { output += "    ret\n"; },
+            [&output](const Notl&) { output += "    notl %eax\n"; },
+            [&output](const Negl&) { output += "    negl %eax\n"; },
         }, instr);
     }
 

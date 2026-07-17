@@ -1,5 +1,7 @@
 module;
 
+#include <charconv>
+#include <memory>
 #include <string_view>
 #include <vector>
 #include <print>
@@ -52,7 +54,41 @@ export class Parser {
     }
 
     Exp parse_exp() {
-        return parse_constant();
+        auto tok = peek();
+
+        if (tok.type == TokenType::Constant) {
+            return Exp{parse_constant()};
+        }
+
+        if (tok.type == TokenType::Tilde || tok.type == TokenType::Hyphen) {
+            advance();
+            uint32_t line = tok.line;
+            UnaryOp op = (tok.type == TokenType::Tilde)
+                ? UnaryOp{Complement{}}
+                : UnaryOp{Negate{}};
+            auto inner = parse_exp();
+            return Exp{Unary{std::move(op), std::make_unique<Exp>(std::move(inner)), line}};
+        }
+
+        if (tok.type == TokenType::LParen) {
+            advance();
+            auto inner = parse_exp();
+            expect(TokenType::RParen, "\")\"");
+            return inner;
+        }
+
+        if (tok.type == TokenType::Decrement) {
+            std::println("error:{}: Unexpected '--'", tok.line);
+            had_error_ = true;
+            advance();
+            return Exp{Constant{0, tok.line}};
+        }
+
+        std::println("error:{}: Expected expression but found '{}'",
+                     tok.line, tok.text);
+        had_error_ = true;
+        advance();
+        return Exp{Constant{0, tok.line}};
     }
 
     Return parse_return() {

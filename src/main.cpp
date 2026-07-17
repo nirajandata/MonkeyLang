@@ -36,6 +36,25 @@ static void print_tokens(const std::vector<Token>& tokens) {
     }
 }
 
+static void pretty_print(const Exp& exp, int indent = 0) {
+    std::string pad(indent * 2, ' ');
+    std::visit(Overload{
+        [&](const Constant& c) {
+            std::println("{}Constant({})", pad, c.value);
+        },
+        [&](const Unary& u) {
+            std::string op_name = std::visit(Overload{
+                [](const Complement&) -> std::string { return "Complement"; },
+                [](const Negate&) -> std::string { return "Negate"; },
+            }, u.op);
+            std::println("{}Unary(", pad);
+            std::println("{}  {},", pad, op_name);
+            pretty_print(*u.exp, indent + 2);
+            std::println("{})", pad);
+        },
+    }, exp.value);
+}
+
 static void pretty_print(const Program& program, int indent = 0) {
     std::string pad(indent * 2, ' ');
     std::println("{}Program(", pad);
@@ -43,10 +62,9 @@ static void pretty_print(const Program& program, int indent = 0) {
     std::println("{}    name=\"{}\",", pad, program.function.name);
 
     const auto& ret = std::get<Return>(program.function.body);
-    const auto& constant = std::get<Constant>(ret.value);
 
     std::println("{}    body=Return(", pad);
-    std::println("{}      Constant({})", pad, constant.value);
+    pretty_print(ret.value, indent + 4);
     std::println("{}    )", pad);
     std::println("{}  )", pad);
     std::println("{})", pad);

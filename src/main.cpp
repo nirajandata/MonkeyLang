@@ -13,11 +13,12 @@ import lexer;
 import parser;
 import codegen;
 
-enum class Stage : std::uint8_t { Lex, Parse, CodeGen, EmitAsm, Run };
+enum class Stage : std::uint8_t { Lex, Parse, Tacky, CodeGen, EmitAsm, Run };
 
 static std::optional<Stage> parse_stage(std::string_view arg) {
     if (arg == "--lex")     return Stage::Lex;
     if (arg == "--parse")   return Stage::Parse;
+    if (arg == "--tacky")   return Stage::Tacky;
     if (arg == "--codegen") return Stage::CodeGen;
     if (arg == "-S")        return Stage::EmitAsm;
     return std::nullopt;
@@ -72,7 +73,7 @@ static void pretty_print(const Program& program, int indent = 0) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2 || argc > 3) {
-        std::println("Usage: mcc [--lex | --parse | --codegen | -S] <file.c>");
+        std::println("Usage: mcc [--lex | --parse | --tacky | --codegen | -S] <file.c>");
         return 1;
     }
 
@@ -114,6 +115,16 @@ int main(int argc, char *argv[]) {
             auto program = parser.parse();
             if (!program) return 1;
             pretty_print(*program);
+            return 0;
+    }
+    case Tacky: {
+            Lexer lexer(source_path);
+            lexer.lex();
+            if (!lexer.ok()) return 1;
+            Parser parser(lexer.get_tokens(), source_path.string());
+            auto program = parser.parse();
+            if (!program) return 1;
+            emit_tacky(*program);
             return 0;
     }
     case CodeGen: {

@@ -3,6 +3,7 @@ module;
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -94,64 +95,89 @@ export TackyProgram emit_tacky(const Program& program) {
 
 // ── Assembly AST ────────────────────────────────────────────────────
 
-export struct Register {};
+export enum class RegId : uint8_t { AX, R10 };
+
+export struct Reg {
+    RegId id;
+};
 
 export struct Imm {
     int32_t value;
 };
 
-export using Operand = std::variant<Imm, Register>;
+export struct Pseudo {
+    std::string name;
+};
+
+export struct Stack {
+    int offset;
+};
+
+export using Operand = std::variant<Imm, Reg, Pseudo, Stack>;
 
 export struct Mov {
     Operand src;
     Operand dst;
 };
 
+export struct AsmNeg {};
+export struct AsmNot {};
+
+export using AsmUnaryOp = std::variant<AsmNeg, AsmNot>;
+
+export struct AsmUnary {
+    AsmUnaryOp op;
+    Operand operand;
+};
+
+export struct AllocateStack {
+    int bytes;
+};
+
 export struct Ret {};
 
-export struct Notl {};
-
-export struct Negl {};
-
-export using Instruction = std::variant<Mov, Ret, Notl, Negl>;
+export using AsmInstruction = std::variant<Mov, AsmUnary, AllocateStack, Ret>;
 
 export struct AsmFunction {
     std::string name;
-    std::vector<Instruction> instructions;
+    std::vector<AsmInstruction> instructions;
 };
 
 export struct AsmProgram {
     AsmFunction function;
 };
 
-// ── TACKY → Assembly ───────────────────────────────────────────────
+// ── Pass 1: TACKY → Assembly (with Pseudo operands) ────────────────
 
 static Operand tacky_val_to_operand(const TackyVal& val) {
     return std::visit(Overload{
         [](const TackyConstant& c) -> Operand { return Imm{c.value}; },
-        [](const TackyVar&) -> Operand { return Register{}; },
+        [](const TackyVar& v) -> Operand { return Pseudo{v.name}; },
     }, val);
 }
 
+static AsmUnaryOp convert_unop(const TackyUnaryOp& op) {
+    return std::visit(Overload{
+        [](const TackyComplement&) -> AsmUnaryOp { return AsmNot{}; },
+        [](const TackyNegate&) -> AsmUnaryOp { return AsmNeg{}; },
+    }, op);
+}
+
 static AsmFunction tacky_to_asm(const TackyFunction& func) {
-    std::vector<Instruction> instructions;
+    std::vector<AsmInstruction> instructions;
 
     for (const auto& instr : func.instructions) {
         std::visit(Overload{
             [&](const TackyReturn& r) {
-                if (std::holds_alternative<TackyConstant>(r.val)) {
-                    instructions.push_back(Mov{tacky_val_to_operand(r.val), Register{}});
-                }
+                instructions.push_back(Mov{tacky_val_to_operand(r.val),
+                                           Reg{RegId::AX}});
                 instructions.push_back(Ret{});
             },
             [&](const TackyUnary& u) {
-                if (std::holds_alternative<TackyConstant>(u.src)) {
-                    instructions.push_back(Mov{tacky_val_to_operand(u.src), Register{}});
-                }
-                std::visit(Overload{
-                    [&](const TackyComplement&) { instructions.push_back(Notl{}); },
-                    [&](const TackyNegate&) { instructions.push_back(Negl{}); },
-                }, u.op);
+                auto src = tacky_val_to_operand(u.src);
+                auto dst = tacky_val_to_operand(u.dst);
+                instructions.push_back(Mov{src, dst});
+                instructions.push_back(AsmUnary{convert_unop(u.op), dst});
             },
         }, instr);
     }
@@ -159,15 +185,116 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
     return {func.name, std::move(instructions)};
 }
 
-export AsmProgram tacky_to_asm(const TackyProgram& program) {
-    return {tacky_to_asm(program.function)};
+// ── Pass 2: Replace pseudoregisters with stack locations ────────────
+
+static AsmInstruction replace_pseudo(AsmInstruction instr,
+                                      std::unordered_map<std::string, int>& offsets,
+                                      int& next_offset) {
+    return std::visit(Overload{
+        [&](Mov m) -> AsmInstruction {
+            auto fix = [&](Operand o) -> Operand {
+                return std::visit(Overload{
+                    [&](Pseudo& p) -> Operand {
+                        auto it = offsets.find(p.name);
+                        if (it == offsets.end()) {
+                            next_offset -= 4;
+                            offsets[p.name] = next_offset;
+                            return Stack{next_offset};
+                        }
+                        return Stack{it->second};
+                    },
+                    [&](auto& other) -> Operand { return other; },
+                }, o);
+            };
+            return Mov{fix(m.src), fix(m.dst)};
+        },
+        [&](AsmUnary u) -> AsmInstruction {
+            auto fix = [&](Operand o) -> Operand {
+                return std::visit(Overload{
+                    [&](Pseudo& p) -> Operand {
+                        auto it = offsets.find(p.name);
+                        if (it == offsets.end()) {
+                            next_offset -= 4;
+                            offsets[p.name] = next_offset;
+                            return Stack{next_offset};
+                        }
+                        return Stack{it->second};
+                    },
+                    [&](auto& other) -> Operand { return other; },
+                }, o);
+            };
+            return AsmUnary{u.op, fix(u.operand)};
+        },
+        [](auto other) -> AsmInstruction { return other; },
+    }, instr);
 }
 
-// ── Full pipeline: AST → TACKY → ASM ───────────────────────────────
+static AsmFunction replace_pseudos(const AsmFunction& func) {
+    std::unordered_map<std::string, int> offsets;
+    int next_offset = 0;
+
+    std::vector<AsmInstruction> instructions;
+    for (auto& instr : func.instructions) {
+        instructions.push_back(replace_pseudo(instr, offsets, next_offset));
+    }
+
+    return {func.name, std::move(instructions)};
+}
+
+// ── Pass 3: Fix up invalid instructions ─────────────────────────────
+
+static bool is_memory_operand(const Operand& o) {
+    return std::holds_alternative<Stack>(o);
+}
+
+static AsmFunction fix_up(const AsmFunction& func) {
+    int stack_bytes = 0;
+
+    std::vector<AsmInstruction> fixed;
+    for (const auto& instr : func.instructions) {
+        std::visit(Overload{
+            [&](const Mov& m) {
+                if (is_memory_operand(m.src) && is_memory_operand(m.dst)) {
+                    fixed.push_back(Mov{m.src, Reg{RegId::R10}});
+                    fixed.push_back(Mov{Reg{RegId::R10}, m.dst});
+                } else {
+                    fixed.push_back(m);
+                }
+                auto update = [&](const Operand& o) {
+                    if (auto* s = std::get_if<Stack>(&o)) {
+                        stack_bytes = std::max(stack_bytes, -s->offset);
+                    }
+                };
+                update(m.src);
+                update(m.dst);
+            },
+            [&](const AsmUnary& u) {
+                if (auto* s = std::get_if<Stack>(&u.operand)) {
+                    stack_bytes = std::max(stack_bytes, -s->offset);
+                }
+                fixed.push_back(u);
+            },
+            [&](const auto& other) { fixed.push_back(other); },
+        }, instr);
+    }
+
+    std::vector<AsmInstruction> result;
+    if (stack_bytes > 0) {
+        result.push_back(AllocateStack{stack_bytes});
+    }
+    std::move(fixed.begin(), fixed.end(), std::back_inserter(result));
+
+    return {func.name, std::move(result)};
+}
+
+// ── Full pipeline ───────────────────────────────────────────────────
 
 export AsmProgram codegen(const Program& program) {
     auto tacky = emit_tacky(program);
-    return tacky_to_asm(tacky);
+    auto asm_func = tacky_to_asm(tacky.function);
+    asm_func = replace_pseudos(asm_func);
+    asm_func = fix_up(asm_func);
+    return {std::move(asm_func)};
 }
 
 // ── Assembly → Text ─────────────────────────────────────────────────
@@ -180,6 +307,23 @@ static std::string platform_prefix() {
 #endif
 }
 
+static std::string operand_str(const Operand& o) {
+    return std::visit(Overload{
+        [](const Imm& i) -> std::string { return "$" + std::to_string(i.value); },
+        [](const Reg& r) -> std::string {
+            switch (r.id) {
+                case RegId::AX:  return "%eax";
+                case RegId::R10: return "%r10d";
+            }
+            return "%eax";
+        },
+        [](const Stack& s) -> std::string {
+            return std::to_string(s.offset) + "(%rbp)";
+        },
+        [](const Pseudo&) -> std::string { return "<pseudo>"; },
+    }, o);
+}
+
 export void emit_asm(const AsmProgram& program, std::string& output) {
     auto prefix = platform_prefix();
     auto& name = program.function.name;
@@ -188,20 +332,31 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
     output += "    .globl " + prefix + name + "\n";
     output += prefix + name + ":\n";
 
+    // Prologue
+    output += "    pushq %rbp\n";
+    output += "    movq %rsp, %rbp\n";
+
     for (const auto& instr : program.function.instructions) {
         std::visit(Overload{
             [&output](const Mov& m) {
-                auto operand_str = [](const Operand& o) -> std::string {
-                    return std::visit(Overload{
-                        [](const Imm& i) -> std::string { return "$" + std::to_string(i.value); },
-                        [](const Register&) -> std::string { return "%eax"; },
-                    }, o);
-                };
                 output += "    movl " + operand_str(m.src) + ", " + operand_str(m.dst) + "\n";
             },
-            [&output](const Ret&) { output += "    ret\n"; },
-            [&output](const Notl&) { output += "    notl %eax\n"; },
-            [&output](const Negl&) { output += "    negl %eax\n"; },
+            [&output](const AsmUnary& u) {
+                auto op_name = std::visit(Overload{
+                    [](const AsmNeg&) -> std::string { return "negl"; },
+                    [](const AsmNot&) -> std::string { return "notl"; },
+                }, u.op);
+                output += "    " + op_name + " " + operand_str(u.operand) + "\n";
+            },
+            [&output](const AllocateStack& a) {
+                output += "    subq $" + std::to_string(a.bytes) + ", %rsp\n";
+            },
+            [&output](const Ret&) {
+                // Epilogue
+                output += "    movq %rbp, %rsp\n";
+                output += "    popq %rbp\n";
+                output += "    ret\n";
+            },
         }, instr);
     }
 

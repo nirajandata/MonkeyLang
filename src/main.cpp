@@ -77,11 +77,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    Stage stage;
+    Stage stage = Stage::Run;
     std::filesystem::path source_path;
 
     if (argc == 2) {
-        stage = Stage::Run;
         source_path = argv[1];
     } else {
         auto s = parse_stage(argv[1]);
@@ -98,84 +97,57 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    switch (stage) {
-        using enum Stage;
-    case Lex: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            print_tokens(lexer.get_tokens());
-            return 0;
+    Lexer lexer(source_path);
+    lexer.lex();
+    if (!lexer.ok()) return 1;
+
+    if (stage == Stage::Lex) {
+        print_tokens(lexer.get_tokens());
+        return 0;
     }
-    case Parse: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            Parser parser(lexer.get_tokens(), source_path.string());
-            auto program = parser.parse();
-            if (!program) return 1;
-            pretty_print(*program);
-            return 0;
+
+    Parser parser(lexer.get_tokens(), source_path.string());
+    auto program = parser.parse();
+    if (!program) return 1;
+
+    if (stage == Stage::Parse) {
+        pretty_print(*program);
+        return 0;
     }
-    case Tacky: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            Parser parser(lexer.get_tokens(), source_path.string());
-            auto program = parser.parse();
-            if (!program) return 1;
-            emit_tacky(*program);
-            return 0;
+
+    if (stage == Stage::Tacky) {
+        emit_tacky(*program);
+        return 0;
     }
-    case CodeGen: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            Parser parser(lexer.get_tokens(), source_path.string());
-            auto program = parser.parse();
-            if (!program) return 1;
-            codegen(*program);
-            return 0;
+
+    auto asm_program = codegen(*program);
+
+    if (stage == Stage::CodeGen) {
+        return 0;
     }
-    case EmitAsm: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            Parser parser(lexer.get_tokens(), source_path.string());
-            auto program = parser.parse();
-            if (!program) return 1;
-            auto asm_program = codegen(*program);
-            std::string output;
-            emit_asm(asm_program, output);
-            auto asm_path = source_path.parent_path()
-                          / (source_path.stem().string() + ".s");
-            std::ofstream ofs(asm_path);
-            ofs << output;
-            return 0;
+
+    std::string output;
+    emit_asm(asm_program, output);
+
+    auto stem = source_path.stem();
+    auto dir = source_path.parent_path();
+    auto asm_path = dir / (stem.string() + ".s");
+
+    {
+        std::ofstream ofs(asm_path);
+        ofs << output;
     }
-    case Run: {
-            Lexer lexer(source_path);
-            lexer.lex();
-            if (!lexer.ok()) return 1;
-            Parser parser(lexer.get_tokens(), source_path.string());
-            auto program = parser.parse();
-            if (!program) return 1;
-            auto asm_program = codegen(*program);
-            std::string output;
-            emit_asm(asm_program, output);
-            auto stem = source_path.stem();
-            auto dir = source_path.parent_path();
-            auto asm_path = dir / (stem.string() + ".s");
-            auto exe_path = dir / stem;
-            {
-                std::ofstream ofs(asm_path);
-                ofs << output;
-            }
-            std::string cmd = "gcc -D SUPPRESS_WARNINGS " + asm_path.string()
-                            + " -o " + exe_path.string() + " 2>/dev/null";
-            int rc = std::system(cmd.c_str());
-            std::filesystem::remove(asm_path);
-            return rc;
+
+    if (stage == Stage::EmitAsm) {
+        return 0;
     }
-    }
+
+    auto exe_path = dir / stem;
+    std::string cmd = "gcc -D SUPPRESS_WARNINGS " + asm_path.string()
+                    + " -o " + exe_path.string() + " 2>/dev/null";
+
+    int rc = std::system(cmd.c_str());
+    //std::filesystem::remove(asm_path);
+    return rc;
 }
+

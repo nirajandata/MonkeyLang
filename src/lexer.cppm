@@ -221,6 +221,9 @@ export class Lexer
         case '}': return {TokenType::RBrace, std::string_view(start, 1), current_line_};
         case ';': return {TokenType::Semicolon, std::string_view(start, 1), current_line_};
         case '~': return {TokenType::Tilde, std::string_view(start, 1), current_line_};
+        case '+': return {TokenType::Plus, std::string_view(start, 1), current_line_};
+        case '*': return {TokenType::Star, std::string_view(start, 1), current_line_};
+        case '%': return {TokenType::Percent, std::string_view(start, 1), current_line_};
         default:
             had_error_ = true;
             return {TokenType::Error, std::string_view(start, 1), current_line_};

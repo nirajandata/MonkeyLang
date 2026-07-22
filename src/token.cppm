@@ -20,6 +20,9 @@ export enum class TokenType : uint32_t {
     Tilde,
     Hyphen,
     Decrement,
+    Plus,
+    Star,
+    Percent,
     Error,
     Eof
 };

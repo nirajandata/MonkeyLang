@@ -53,7 +53,7 @@ export class Parser {
         return {.value = value, .line = tok.line};
     }
 
-    Exp parse_exp() {
+    Exp parse_primary() {
         auto tok = peek();
 
         if (tok.type == TokenType::Constant) {
@@ -66,13 +66,13 @@ export class Parser {
             UnaryOp op = (tok.type == TokenType::Tilde)
                 ? UnaryOp{Complement{}}
                 : UnaryOp{Negate{}};
-            auto inner = parse_exp();
+            auto inner = parse_primary();
             return Exp{Unary{std::move(op), std::make_unique<Exp>(std::move(inner)), line}};
         }
 
         if (tok.type == TokenType::LParen) {
             advance();
-            auto inner = parse_exp();
+            auto inner = parse_exp(1);
             expect(TokenType::RParen, "\")\"");
             return inner;
         }
@@ -91,10 +91,55 @@ export class Parser {
         return Exp{Constant{0, tok.line}};
     }
 
+    static int binary_prec(TokenType type) {
+        switch (type) {
+            case TokenType::Plus:
+            case TokenType::Hyphen:
+                return 1;
+            case TokenType::Star:
+            case TokenType::Slash:
+            case TokenType::Percent:
+                return 2;
+            default:
+                return 0;
+        }
+    }
+
+    static BinaryOp token_to_binop(TokenType type) {
+        switch (type) {
+            case TokenType::Plus:    return BinaryOp{Add{}};
+            case TokenType::Hyphen:  return BinaryOp{Subtract{}};
+            case TokenType::Star:    return BinaryOp{Multiply{}};
+            case TokenType::Slash:   return BinaryOp{Divide{}};
+            case TokenType::Percent: return BinaryOp{Remainder{}};
+            default:                 return BinaryOp{Add{}};
+        }
+    }
+
+    Exp parse_exp(int min_prec) {
+        auto left = parse_primary();
+
+        while (true) {
+            int prec = binary_prec(peek().type);
+            if (prec < min_prec) break;
+
+            auto tok = advance();
+            auto op = token_to_binop(tok.type);
+            auto right = parse_exp(prec + 1);
+
+            left = Exp{Binary{std::move(op),
+                              std::make_unique<Exp>(std::move(left)),
+                              std::make_unique<Exp>(std::move(right)),
+                              tok.line}};
+        }
+
+        return left;
+    }
+
     Return parse_return() {
         uint32_t line = peek().line;
         expect(TokenType::Return, "\"return\"");
-        auto val = parse_exp();
+        auto val = parse_exp(1);
         expect(TokenType::Semicolon, "\";\"");
         return {std::move(val), line};
     }

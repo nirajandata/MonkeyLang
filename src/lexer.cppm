@@ -347,6 +347,10 @@ public:
             {
                 tokens_.push_back(read_constant());
             }
+            else if (*cursor_ == '#')
+            {
+                skip_line_comment();
+            }
             else if (*cursor_ == '/')
             {
                 const char* start = cursor_;
@@ -378,6 +382,93 @@ public:
                 else
                 {
                     tokens_.push_back({TokenType::Hyphen, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '!')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '=')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::BangEq, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    tokens_.push_back({TokenType::Bang, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '&')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '&')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::AmpAmp, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    had_error_ = true;
+                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '|')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '|')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::BarBar, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    had_error_ = true;
+                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '=')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '=')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::EqEq, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    had_error_ = true;
+                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '<')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '=')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::LtEq, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    tokens_.push_back({TokenType::Lt, std::string_view(start, 1), current_line_});
+                }
+            }
+            else if (*cursor_ == '>')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                if (cursor_ < limit_ && *cursor_ == '=')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::GtEq, std::string_view(start, 2), current_line_});
+                }
+                else
+                {
+                    tokens_.push_back({TokenType::Gt, std::string_view(start, 1), current_line_});
                 }
             }
             else

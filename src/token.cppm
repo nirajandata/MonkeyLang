@@ -23,6 +23,15 @@ export enum class TokenType : uint32_t {
     Plus,
     Star,
     Percent,
+    Bang,
+    AmpAmp,
+    BarBar,
+    EqEq,
+    BangEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
     Error,
     Eof
 };

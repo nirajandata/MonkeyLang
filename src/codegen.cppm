@@ -28,6 +28,15 @@ export struct TackyNegate {};
 
 export using TackyUnaryOp = std::variant<TackyComplement, TackyNegate>;
 
+export struct TackyAdd {};
+export struct TackySubtract {};
+export struct TackyMultiply {};
+export struct TackyDivide {};
+export struct TackyRemainder {};
+
+export using TackyBinaryOp = std::variant<TackyAdd, TackySubtract, TackyMultiply,
+                                           TackyDivide, TackyRemainder>;
+
 export struct TackyReturn {
     TackyVal val;
 };
@@ -38,7 +47,14 @@ export struct TackyUnary {
     TackyVal dst;
 };
 
-export using TackyInstruction = std::variant<TackyReturn, TackyUnary>;
+export struct TackyBinary {
+    TackyBinaryOp op;
+    TackyVal src1;
+    TackyVal src2;
+    TackyVal dst;
+};
+
+export using TackyInstruction = std::variant<TackyReturn, TackyUnary, TackyBinary>;
 
 export struct TackyFunction {
     std::string name;
@@ -74,6 +90,21 @@ static TackyVal emit_tacky_val(const Exp& exp,
             instructions.push_back(TackyUnary{tacky_op, src, dst});
             return dst;
         },
+        [&](const Binary& b) -> TackyVal {
+            auto left = emit_tacky_val(*b.left, instructions);
+            auto right = emit_tacky_val(*b.right, instructions);
+            auto dst_name = make_temporary();
+            TackyVal dst = TackyVar{std::move(dst_name)};
+            auto tacky_op = std::visit(Overload{
+                [](const Add&) -> TackyBinaryOp { return TackyAdd{}; },
+                [](const Subtract&) -> TackyBinaryOp { return TackySubtract{}; },
+                [](const Multiply&) -> TackyBinaryOp { return TackyMultiply{}; },
+                [](const Divide&) -> TackyBinaryOp { return TackyDivide{}; },
+                [](const Remainder&) -> TackyBinaryOp { return TackyRemainder{}; },
+            }, b.op);
+            instructions.push_back(TackyBinary{tacky_op, left, right, dst});
+            return dst;
+        },
     }, exp.value);
 }
 
@@ -95,7 +126,7 @@ export TackyProgram emit_tacky(const Program& program) {
 
 // ── Assembly AST ────────────────────────────────────────────────────
 
-export enum class RegId : uint8_t { AX, R10 };
+export enum class RegId : uint8_t { AX, DX, R10 };
 
 export struct Reg {
     RegId id;
@@ -130,13 +161,35 @@ export struct AsmUnary {
     Operand operand;
 };
 
+export struct Addl {
+    Operand src;
+    Operand dst;
+};
+
+export struct Subl {
+    Operand src;
+    Operand dst;
+};
+
+export struct Imull {
+    Operand src;
+    Operand dst;
+};
+
+export struct Idivl {
+    Operand operand;
+};
+
+export struct Cdq {};
+
 export struct AllocateStack {
     int bytes;
 };
 
 export struct Ret {};
 
-export using AsmInstruction = std::variant<Mov, AsmUnary, AllocateStack, Ret>;
+export using AsmInstruction = std::variant<Mov, AsmUnary, Addl, Subl, Imull,
+                                           Idivl, Cdq, AllocateStack, Ret>;
 
 export struct AsmFunction {
     std::string name;
@@ -179,6 +232,49 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
                 instructions.push_back(Mov{src, dst});
                 instructions.push_back(AsmUnary{convert_unop(u.op), dst});
             },
+            [&](const TackyBinary& b) {
+                auto src1 = tacky_val_to_operand(b.src1);
+                auto src2 = tacky_val_to_operand(b.src2);
+                auto dst = tacky_val_to_operand(b.dst);
+
+                std::visit(Overload{
+                    [&](const TackyAdd&) {
+                        instructions.push_back(Mov{src1, dst});
+                        instructions.push_back(Mov{src2, Reg{RegId::R10}});
+                        instructions.push_back(Addl{Reg{RegId::R10}, dst});
+                    },
+                    [&](const TackySubtract&) {
+                        instructions.push_back(Mov{src1, dst});
+                        instructions.push_back(Mov{src2, Reg{RegId::R10}});
+                        instructions.push_back(Subl{Reg{RegId::R10}, dst});
+                    },
+                    [&](const TackyMultiply&) {
+                        instructions.push_back(Mov{src1, dst});
+                        instructions.push_back(Mov{src2, Reg{RegId::R10}});
+                        instructions.push_back(Imull{Reg{RegId::R10}, dst});
+                    },
+                    [&](const TackyDivide&) {
+                        instructions.push_back(Mov{src1, Reg{RegId::AX}});
+                        instructions.push_back(Cdq{});
+                        if (!std::holds_alternative<Reg>(src2) ||
+                            std::get<Reg>(src2).id != RegId::R10) {
+                            instructions.push_back(Mov{src2, Reg{RegId::R10}});
+                        }
+                        instructions.push_back(Idivl{Reg{RegId::R10}});
+                        instructions.push_back(Mov{Reg{RegId::AX}, dst});
+                    },
+                    [&](const TackyRemainder&) {
+                        instructions.push_back(Mov{src1, Reg{RegId::AX}});
+                        instructions.push_back(Cdq{});
+                        if (!std::holds_alternative<Reg>(src2) ||
+                            std::get<Reg>(src2).id != RegId::R10) {
+                            instructions.push_back(Mov{src2, Reg{RegId::R10}});
+                        }
+                        instructions.push_back(Idivl{Reg{RegId::R10}});
+                        instructions.push_back(Mov{Reg{RegId::DX}, dst});
+                    },
+                }, b.op);
+            },
         }, instr);
     }
 
@@ -187,46 +283,21 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
 
 // ── Pass 2: Replace pseudoregisters with stack locations ────────────
 
-static AsmInstruction replace_pseudo(AsmInstruction instr,
-                                      std::unordered_map<std::string, int>& offsets,
-                                      int& next_offset) {
+static Operand fix_pseudo(Operand o,
+                           std::unordered_map<std::string, int>& offsets,
+                           int& next_offset) {
     return std::visit(Overload{
-        [&](Mov m) -> AsmInstruction {
-            auto fix = [&](Operand o) -> Operand {
-                return std::visit(Overload{
-                    [&](Pseudo& p) -> Operand {
-                        auto it = offsets.find(p.name);
-                        if (it == offsets.end()) {
-                            next_offset -= 4;
-                            offsets[p.name] = next_offset;
-                            return Stack{next_offset};
-                        }
-                        return Stack{it->second};
-                    },
-                    [&](auto& other) -> Operand { return other; },
-                }, o);
-            };
-            return Mov{fix(m.src), fix(m.dst)};
+        [&](Pseudo& p) -> Operand {
+            auto it = offsets.find(p.name);
+            if (it == offsets.end()) {
+                next_offset -= 4;
+                offsets[p.name] = next_offset;
+                return Stack{next_offset};
+            }
+            return Stack{it->second};
         },
-        [&](AsmUnary u) -> AsmInstruction {
-            auto fix = [&](Operand o) -> Operand {
-                return std::visit(Overload{
-                    [&](Pseudo& p) -> Operand {
-                        auto it = offsets.find(p.name);
-                        if (it == offsets.end()) {
-                            next_offset -= 4;
-                            offsets[p.name] = next_offset;
-                            return Stack{next_offset};
-                        }
-                        return Stack{it->second};
-                    },
-                    [&](auto& other) -> Operand { return other; },
-                }, o);
-            };
-            return AsmUnary{u.op, fix(u.operand)};
-        },
-        [](auto other) -> AsmInstruction { return other; },
-    }, instr);
+        [&](auto& other) -> Operand { return other; },
+    }, o);
 }
 
 static AsmFunction replace_pseudos(const AsmFunction& func) {
@@ -235,7 +306,31 @@ static AsmFunction replace_pseudos(const AsmFunction& func) {
 
     std::vector<AsmInstruction> instructions;
     for (auto& instr : func.instructions) {
-        instructions.push_back(replace_pseudo(instr, offsets, next_offset));
+        instructions.push_back(std::visit(Overload{
+            [&](Mov m) -> AsmInstruction {
+                return Mov{fix_pseudo(m.src, offsets, next_offset),
+                           fix_pseudo(m.dst, offsets, next_offset)};
+            },
+            [&](AsmUnary u) -> AsmInstruction {
+                return AsmUnary{u.op, fix_pseudo(u.operand, offsets, next_offset)};
+            },
+            [&](Addl a) -> AsmInstruction {
+                return Addl{fix_pseudo(a.src, offsets, next_offset),
+                            fix_pseudo(a.dst, offsets, next_offset)};
+            },
+            [&](Subl s) -> AsmInstruction {
+                return Subl{fix_pseudo(s.src, offsets, next_offset),
+                            fix_pseudo(s.dst, offsets, next_offset)};
+            },
+            [&](Imull m) -> AsmInstruction {
+                return Imull{fix_pseudo(m.src, offsets, next_offset),
+                             fix_pseudo(m.dst, offsets, next_offset)};
+            },
+            [&](Idivl d) -> AsmInstruction {
+                return Idivl{fix_pseudo(d.operand, offsets, next_offset)};
+            },
+            [](auto other) -> AsmInstruction { return other; },
+        }, instr));
     }
 
     return {func.name, std::move(instructions)};
@@ -261,18 +356,68 @@ static AsmFunction fix_up(const AsmFunction& func) {
                     fixed.push_back(m);
                 }
                 auto update = [&](const Operand& o) {
-                    if (auto* s = std::get_if<Stack>(&o)) {
+                    if (auto* s = std::get_if<Stack>(&o))
                         stack_bytes = std::max(stack_bytes, -s->offset);
-                    }
                 };
                 update(m.src);
                 update(m.dst);
             },
             [&](const AsmUnary& u) {
-                if (auto* s = std::get_if<Stack>(&u.operand)) {
+                if (auto* s = std::get_if<Stack>(&u.operand))
                     stack_bytes = std::max(stack_bytes, -s->offset);
-                }
                 fixed.push_back(u);
+            },
+            [&](const Addl& a) {
+                if (is_memory_operand(a.src) && is_memory_operand(a.dst)) {
+                    fixed.push_back(Mov{a.src, Reg{RegId::R10}});
+                    fixed.push_back(Addl{Reg{RegId::R10}, a.dst});
+                } else {
+                    fixed.push_back(a);
+                }
+                auto update = [&](const Operand& o) {
+                    if (auto* s = std::get_if<Stack>(&o))
+                        stack_bytes = std::max(stack_bytes, -s->offset);
+                };
+                update(a.src);
+                update(a.dst);
+            },
+            [&](const Subl& s) {
+                if (is_memory_operand(s.src) && is_memory_operand(s.dst)) {
+                    fixed.push_back(Mov{s.src, Reg{RegId::R10}});
+                    fixed.push_back(Subl{Reg{RegId::R10}, s.dst});
+                } else {
+                    fixed.push_back(s);
+                }
+                auto update = [&](const Operand& o) {
+                    if (auto* s = std::get_if<Stack>(&o))
+                        stack_bytes = std::max(stack_bytes, -s->offset);
+                };
+                update(s.src);
+                update(s.dst);
+            },
+            [&](const Imull& m) {
+                if (is_memory_operand(m.dst)) {
+                    fixed.push_back(Mov{m.src, Reg{RegId::AX}});
+                    fixed.push_back(Mov{m.dst, Reg{RegId::R10}});
+                    fixed.push_back(Imull{Reg{RegId::AX}, Reg{RegId::R10}});
+                    fixed.push_back(Mov{Reg{RegId::R10}, m.dst});
+                } else if (is_memory_operand(m.src) && is_memory_operand(m.dst)) {
+                    fixed.push_back(Mov{m.src, Reg{RegId::R10}});
+                    fixed.push_back(Imull{Reg{RegId::R10}, m.dst});
+                } else {
+                    fixed.push_back(m);
+                }
+                auto update = [&](const Operand& o) {
+                    if (auto* s = std::get_if<Stack>(&o))
+                        stack_bytes = std::max(stack_bytes, -s->offset);
+                };
+                update(m.src);
+                update(m.dst);
+            },
+            [&](const Idivl& d) {
+                if (auto* s = std::get_if<Stack>(&d.operand))
+                    stack_bytes = std::max(stack_bytes, -s->offset);
+                fixed.push_back(d);
             },
             [&](const auto& other) { fixed.push_back(other); },
         }, instr);
@@ -313,6 +458,7 @@ static std::string operand_str(const Operand& o) {
         [](const Reg& r) -> std::string {
             switch (r.id) {
                 case RegId::AX:  return "%eax";
+                case RegId::DX:  return "%edx";
                 case RegId::R10: return "%r10d";
             }
             return "%eax";
@@ -348,11 +494,25 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
                 }, u.op);
                 output += "    " + op_name + " " + operand_str(u.operand) + "\n";
             },
+            [&output](const Addl& a) {
+                output += "    addl " + operand_str(a.src) + ", " + operand_str(a.dst) + "\n";
+            },
+            [&output](const Subl& s) {
+                output += "    subl " + operand_str(s.src) + ", " + operand_str(s.dst) + "\n";
+            },
+            [&output](const Imull& m) {
+                output += "    imull " + operand_str(m.src) + ", " + operand_str(m.dst) + "\n";
+            },
+            [&output](const Idivl& d) {
+                output += "    idivl " + operand_str(d.operand) + "\n";
+            },
+            [&output](const Cdq&) {
+                output += "    cdq\n";
+            },
             [&output](const AllocateStack& a) {
                 output += "    subq $" + std::to_string(a.bytes) + ", %rsp\n";
             },
             [&output](const Ret&) {
-                // Epilogue
                 output += "    movq %rbp, %rsp\n";
                 output += "    popq %rbp\n";
                 output += "    ret\n";

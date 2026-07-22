@@ -53,6 +53,20 @@ static void pretty_print(const Exp& exp, int indent = 0) {
             pretty_print(*u.exp, indent + 2);
             std::println("{})", pad);
         },
+        [&](const Binary& b) {
+            std::string op_name = std::visit(Overload{
+                [](const Add&) -> std::string { return "Add"; },
+                [](const Subtract&) -> std::string { return "Subtract"; },
+                [](const Multiply&) -> std::string { return "Multiply"; },
+                [](const Divide&) -> std::string { return "Divide"; },
+                [](const Remainder&) -> std::string { return "Remainder"; },
+            }, b.op);
+            std::println("{}Binary(", pad);
+            std::println("{}  {},", pad, op_name);
+            pretty_print(*b.left, indent + 2);
+            pretty_print(*b.right, indent + 2);
+            std::println("{})", pad);
+        },
     }, exp.value);
 }
 

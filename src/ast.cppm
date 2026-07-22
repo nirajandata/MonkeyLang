@@ -23,6 +23,14 @@ export struct Negate {};
 
 export using UnaryOp = std::variant<Complement, Negate>;
 
+export struct Add {};
+export struct Subtract {};
+export struct Multiply {};
+export struct Divide {};
+export struct Remainder {};
+
+export using BinaryOp = std::variant<Add, Subtract, Multiply, Divide, Remainder>;
+
 export struct Exp;
 
 export struct Unary {
@@ -31,8 +39,15 @@ export struct Unary {
     uint32_t line;
 };
 
+export struct Binary {
+    BinaryOp op;
+    std::unique_ptr<Exp> left;
+    std::unique_ptr<Exp> right;
+    uint32_t line;
+};
+
 export struct Exp {
-    std::variant<Constant, Unary> value;
+    std::variant<Constant, Unary, Binary> value;
 };
 
 export struct Return {

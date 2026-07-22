@@ -60,19 +60,22 @@ export class Parser {
             return Exp{parse_constant()};
         }
 
-        if (tok.type == TokenType::Tilde || tok.type == TokenType::Hyphen) {
+        if (tok.type == TokenType::Tilde || tok.type == TokenType::Hyphen
+            || tok.type == TokenType::Bang) {
             advance();
             uint32_t line = tok.line;
             UnaryOp op = (tok.type == TokenType::Tilde)
                 ? UnaryOp{Complement{}}
-                : UnaryOp{Negate{}};
+                : (tok.type == TokenType::Hyphen)
+                    ? UnaryOp{Negate{}}
+                    : UnaryOp{Not{}};
             auto inner = parse_primary();
             return Exp{Unary{std::move(op), std::make_unique<Exp>(std::move(inner)), line}};
         }
 
         if (tok.type == TokenType::LParen) {
             advance();
-            auto inner = parse_exp(1);
+            auto inner = parse_exp(0);
             expect(TokenType::RParen, "\")\"");
             return inner;
         }
@@ -93,15 +96,20 @@ export class Parser {
 
     static int binary_prec(TokenType type) {
         switch (type) {
+            case TokenType::BarBar:                   return 5;
+            case TokenType::AmpAmp:                   return 10;
+            case TokenType::EqEq:
+            case TokenType::BangEq:                   return 30;
+            case TokenType::Lt:
+            case TokenType::LtEq:
+            case TokenType::Gt:
+            case TokenType::GtEq:                     return 35;
             case TokenType::Plus:
-            case TokenType::Hyphen:
-                return 1;
+            case TokenType::Hyphen:                   return 45;
             case TokenType::Star:
             case TokenType::Slash:
-            case TokenType::Percent:
-                return 2;
-            default:
-                return 0;
+            case TokenType::Percent:                  return 50;
+            default:                                  return 0;
         }
     }
 
@@ -112,6 +120,14 @@ export class Parser {
             case TokenType::Star:    return BinaryOp{Multiply{}};
             case TokenType::Slash:   return BinaryOp{Divide{}};
             case TokenType::Percent: return BinaryOp{Remainder{}};
+            case TokenType::AmpAmp:  return BinaryOp{And{}};
+            case TokenType::BarBar:  return BinaryOp{Or{}};
+            case TokenType::EqEq:    return BinaryOp{Equal{}};
+            case TokenType::BangEq:  return BinaryOp{NotEqual{}};
+            case TokenType::Lt:      return BinaryOp{LessThan{}};
+            case TokenType::LtEq:    return BinaryOp{LessOrEqual{}};
+            case TokenType::Gt:      return BinaryOp{GreaterThan{}};
+            case TokenType::GtEq:    return BinaryOp{GreaterOrEqual{}};
             default:                 return BinaryOp{Add{}};
         }
     }
@@ -121,7 +137,7 @@ export class Parser {
 
         while (true) {
             int prec = binary_prec(peek().type);
-            if (prec < min_prec) break;
+            if (prec == 0 || prec < min_prec) break;
 
             auto tok = advance();
             auto op = token_to_binop(tok.type);
@@ -139,7 +155,7 @@ export class Parser {
     Return parse_return() {
         uint32_t line = peek().line;
         expect(TokenType::Return, "\"return\"");
-        auto val = parse_exp(1);
+        auto val = parse_exp(0);
         expect(TokenType::Semicolon, "\";\"");
         return {std::move(val), line};
     }

@@ -20,16 +20,27 @@ export struct Constant {
 
 export struct Complement {};
 export struct Negate {};
+export struct Not {};
 
-export using UnaryOp = std::variant<Complement, Negate>;
+export using UnaryOp = std::variant<Complement, Negate, Not>;
 
 export struct Add {};
 export struct Subtract {};
 export struct Multiply {};
 export struct Divide {};
 export struct Remainder {};
+export struct And {};
+export struct Or {};
+export struct Equal {};
+export struct NotEqual {};
+export struct LessThan {};
+export struct LessOrEqual {};
+export struct GreaterThan {};
+export struct GreaterOrEqual {};
 
-export using BinaryOp = std::variant<Add, Subtract, Multiply, Divide, Remainder>;
+export using BinaryOp = std::variant<Add, Subtract, Multiply, Divide, Remainder,
+                                     And, Or, Equal, NotEqual, LessThan,
+                                     LessOrEqual, GreaterThan, GreaterOrEqual>;
 
 export struct Exp;
 

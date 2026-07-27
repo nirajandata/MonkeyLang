@@ -47,6 +47,7 @@ static void pretty_print(const Exp& exp, int indent = 0) {
             std::string op_name = std::visit(Overload{
                 [](const Complement&) -> std::string { return "Complement"; },
                 [](const Negate&) -> std::string { return "Negate"; },
+                [](const Not&) -> std::string { return "Not"; },
             }, u.op);
             std::println("{}Unary(", pad);
             std::println("{}  {},", pad, op_name);
@@ -60,6 +61,14 @@ static void pretty_print(const Exp& exp, int indent = 0) {
                 [](const Multiply&) -> std::string { return "Multiply"; },
                 [](const Divide&) -> std::string { return "Divide"; },
                 [](const Remainder&) -> std::string { return "Remainder"; },
+                [](const And&) -> std::string { return "And"; },
+                [](const Or&) -> std::string { return "Or"; },
+                [](const Equal&) -> std::string { return "Equal"; },
+                [](const NotEqual&) -> std::string { return "NotEqual"; },
+                [](const LessThan&) -> std::string { return "LessThan"; },
+                [](const LessOrEqual&) -> std::string { return "LessOrEqual"; },
+                [](const GreaterThan&) -> std::string { return "GreaterThan"; },
+                [](const GreaterOrEqual&) -> std::string { return "GreaterOrEqual"; },
             }, b.op);
             std::println("{}Binary(", pad);
             std::println("{}  {},", pad, op_name);

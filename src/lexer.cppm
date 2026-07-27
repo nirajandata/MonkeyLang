@@ -409,8 +409,7 @@ public:
                 }
                 else
                 {
-                    had_error_ = true;
-                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::Amp, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '|')
@@ -424,9 +423,14 @@ public:
                 }
                 else
                 {
-                    had_error_ = true;
-                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::Bar, std::string_view(start, 1), current_line_});
                 }
+            }
+            else if (*cursor_ == '^')
+            {
+                const char* start = cursor_;
+                cursor_++;
+                tokens_.push_back({TokenType::Caret, std::string_view(start, 1), current_line_});
             }
             else if (*cursor_ == '=')
             {
@@ -452,6 +456,11 @@ public:
                     cursor_++;
                     tokens_.push_back({TokenType::LtEq, std::string_view(start, 2), current_line_});
                 }
+                else if (cursor_ < limit_ && *cursor_ == '<')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::LtLt, std::string_view(start, 2), current_line_});
+                }
                 else
                 {
                     tokens_.push_back({TokenType::Lt, std::string_view(start, 1), current_line_});
@@ -465,6 +474,11 @@ public:
                 {
                     cursor_++;
                     tokens_.push_back({TokenType::GtEq, std::string_view(start, 2), current_line_});
+                }
+                else if (cursor_ < limit_ && *cursor_ == '>')
+                {
+                    cursor_++;
+                    tokens_.push_back({TokenType::GtGt, std::string_view(start, 2), current_line_});
                 }
                 else
                 {

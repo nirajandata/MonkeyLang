@@ -11,6 +11,7 @@ import token;
 import ast;
 import lexer;
 import parser;
+import tacky;
 import codegen;
 
 enum class Stage : std::uint8_t { Lex, Parse, Tacky, CodeGen, EmitAsm, Run };
@@ -69,6 +70,11 @@ static void pretty_print(const Exp& exp, int indent = 0) {
                 [](const LessOrEqual&) -> std::string { return "LessOrEqual"; },
                 [](const GreaterThan&) -> std::string { return "GreaterThan"; },
                 [](const GreaterOrEqual&) -> std::string { return "GreaterOrEqual"; },
+                [](const BitwiseAnd&) -> std::string { return "BitwiseAnd"; },
+                [](const BitwiseOr&) -> std::string { return "BitwiseOr"; },
+                [](const BitwiseXor&) -> std::string { return "BitwiseXor"; },
+                [](const ShiftLeft&) -> std::string { return "ShiftLeft"; },
+                [](const ShiftRight&) -> std::string { return "ShiftRight"; },
             }, b.op);
             std::println("{}Binary(", pad);
             std::println("{}  {},", pad, op_name);

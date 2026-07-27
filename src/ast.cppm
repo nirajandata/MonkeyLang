@@ -37,10 +37,17 @@ export struct LessThan {};
 export struct LessOrEqual {};
 export struct GreaterThan {};
 export struct GreaterOrEqual {};
+export struct BitwiseAnd {};
+export struct BitwiseOr {};
+export struct BitwiseXor {};
+export struct ShiftLeft {};
+export struct ShiftRight {};
 
 export using BinaryOp = std::variant<Add, Subtract, Multiply, Divide, Remainder,
                                      And, Or, Equal, NotEqual, LessThan,
-                                     LessOrEqual, GreaterThan, GreaterOrEqual>;
+                                     LessOrEqual, GreaterThan, GreaterOrEqual,
+                                     BitwiseAnd, BitwiseOr, BitwiseXor,
+                                     ShiftLeft, ShiftRight>;
 
 export struct Exp;
 

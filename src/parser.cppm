@@ -98,12 +98,17 @@ export class Parser {
         switch (type) {
             case TokenType::BarBar:                   return 5;
             case TokenType::AmpAmp:                   return 10;
+            case TokenType::Bar:                      return 15;
+            case TokenType::Caret:                    return 20;
+            case TokenType::Amp:                      return 25;
             case TokenType::EqEq:
             case TokenType::BangEq:                   return 30;
             case TokenType::Lt:
             case TokenType::LtEq:
             case TokenType::Gt:
             case TokenType::GtEq:                     return 35;
+            case TokenType::LtLt:
+            case TokenType::GtGt:                     return 40;
             case TokenType::Plus:
             case TokenType::Hyphen:                   return 45;
             case TokenType::Star:
@@ -128,6 +133,11 @@ export class Parser {
             case TokenType::LtEq:    return BinaryOp{LessOrEqual{}};
             case TokenType::Gt:      return BinaryOp{GreaterThan{}};
             case TokenType::GtEq:    return BinaryOp{GreaterOrEqual{}};
+            case TokenType::Amp:     return BinaryOp{BitwiseAnd{}};
+            case TokenType::Bar:     return BinaryOp{BitwiseOr{}};
+            case TokenType::Caret:   return BinaryOp{BitwiseXor{}};
+            case TokenType::LtLt:    return BinaryOp{ShiftLeft{}};
+            case TokenType::GtGt:    return BinaryOp{ShiftRight{}};
             default:                 return BinaryOp{Add{}};
         }
     }

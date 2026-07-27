@@ -10,139 +10,10 @@ module;
 export module codegen;
 
 import ast;
+import tacky;
 
-// ── TACKY IR ────────────────────────────────────────────────────────
 
-export struct TackyConstant { int32_t value; };
-export struct TackyVar      { std::string name; };
-export using TackyVal = std::variant<TackyConstant, TackyVar>;
-
-export enum class TackyUnaryOp : uint8_t { Complement, Negate, Not };
-export enum class TackyBinaryOp : uint8_t {
-    Add, Subtract, Multiply, Divide, Remainder,
-    Equal, NotEqual, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual
-};
-
-export struct TackyReturn   { TackyVal val; };
-export struct TackyUnary    { TackyUnaryOp op; TackyVal src; TackyVal dst; };
-export struct TackyBinary   { TackyBinaryOp op; TackyVal src1; TackyVal src2; TackyVal dst; };
-export struct TackyCopy     { TackyVal src; TackyVal dst; };
-export struct TackyJump     { std::string target; };
-export struct TackyJumpIfZero    { TackyVal condition; std::string target; };
-export struct TackyJumpIfNotZero { TackyVal condition; std::string target; };
-export struct TackyLabel    { std::string name; };
-
-export using TackyInstruction = std::variant<TackyReturn, TackyUnary, TackyBinary,
-                                              TackyCopy, TackyJump, TackyJumpIfZero,
-                                              TackyJumpIfNotZero, TackyLabel>;
-
-export struct TackyFunction { std::string name; std::vector<TackyInstruction> instructions; };
-export struct TackyProgram  { TackyFunction function; };
-
-// ── TACKY generation (AST -> TACKY) ─────────────────────────────────
-
-static int temp_counter = 0;
-static int label_counter = 0;
-
-static std::string make_temporary() {
-    return "tmp." + std::to_string(temp_counter++);
-}
-
-static std::string make_label(std::string_view prefix) {
-    return std::string(prefix) + "." + std::to_string(label_counter++);
-}
-
-static TackyUnaryOp convert_ast_unop(const UnaryOp& op) {
-    if (std::holds_alternative<Complement>(op)) return TackyUnaryOp::Complement;
-    if (std::holds_alternative<Negate>(op))     return TackyUnaryOp::Negate;
-    return TackyUnaryOp::Not;
-}
-
-static TackyBinaryOp convert_ast_binop(const BinaryOp& op) {
-    if (std::holds_alternative<Add>(op))              return TackyBinaryOp::Add;
-    if (std::holds_alternative<Subtract>(op))         return TackyBinaryOp::Subtract;
-    if (std::holds_alternative<Multiply>(op))         return TackyBinaryOp::Multiply;
-    if (std::holds_alternative<Divide>(op))           return TackyBinaryOp::Divide;
-    if (std::holds_alternative<Remainder>(op))        return TackyBinaryOp::Remainder;
-    if (std::holds_alternative<Equal>(op))            return TackyBinaryOp::Equal;
-    if (std::holds_alternative<NotEqual>(op))         return TackyBinaryOp::NotEqual;
-    if (std::holds_alternative<LessThan>(op))         return TackyBinaryOp::LessThan;
-    if (std::holds_alternative<LessOrEqual>(op))      return TackyBinaryOp::LessOrEqual;
-    if (std::holds_alternative<GreaterThan>(op))      return TackyBinaryOp::GreaterThan;
-    return TackyBinaryOp::GreaterOrEqual;
-}
-
-static TackyVal emit_tacky_val(const Exp& exp,
-                                std::vector<TackyInstruction>& instructions) {
-    return std::visit(Overload{
-        [](const Constant& c) -> TackyVal {
-            return TackyConstant{c.value};
-        },
-        [&](const Unary& u) -> TackyVal {
-            auto src = emit_tacky_val(*u.exp, instructions);
-            TackyVal dst = TackyVar{make_temporary()};
-            instructions.push_back(TackyUnary{convert_ast_unop(u.op), src, dst});
-            return dst;
-        },
-        [&](const Binary& b) -> TackyVal {
-            bool is_and = std::holds_alternative<And>(b.op);
-            bool is_or  = std::holds_alternative<Or>(b.op);
-
-            if (!is_and && !is_or) {
-                auto left  = emit_tacky_val(*b.left, instructions);
-                auto right = emit_tacky_val(*b.right, instructions);
-                TackyVal dst = TackyVar{make_temporary()};
-                instructions.push_back(TackyBinary{convert_ast_binop(b.op), left, right, dst});
-                return dst;
-            }
-
-            TackyVal dst = TackyVar{make_temporary()};
-            auto left = emit_tacky_val(*b.left, instructions);
-            auto false_label = make_label(is_and ? "and_false" : "or_false");
-            auto end_label   = make_label(is_and ? "and_end"   : "or_end");
-
-            if (is_and) {
-                instructions.push_back(TackyJumpIfZero{left, false_label});
-                auto right = emit_tacky_val(*b.right, instructions);
-                instructions.push_back(TackyJumpIfZero{right, false_label});
-                instructions.push_back(TackyCopy{TackyConstant{1}, dst});
-                instructions.push_back(TackyJump{end_label});
-                instructions.push_back(TackyLabel{false_label});
-                instructions.push_back(TackyCopy{TackyConstant{0}, dst});
-            } else {
-                instructions.push_back(TackyJumpIfNotZero{left, false_label});
-                auto right = emit_tacky_val(*b.right, instructions);
-                instructions.push_back(TackyJumpIfNotZero{right, false_label});
-                instructions.push_back(TackyCopy{TackyConstant{0}, dst});
-                instructions.push_back(TackyJump{end_label});
-                instructions.push_back(TackyLabel{false_label});
-                instructions.push_back(TackyCopy{TackyConstant{1}, dst});
-            }
-            instructions.push_back(TackyLabel{end_label});
-            return dst;
-        },
-    }, exp.value);
-}
-
-static TackyFunction emit_tacky_function(const Function& func) {
-    std::vector<TackyInstruction> instructions;
-    std::visit(Overload{
-        [&](const Return& r) {
-            instructions.push_back(TackyReturn{emit_tacky_val(r.value, instructions)});
-        },
-    }, func.body);
-    return {std::string(func.name), std::move(instructions)};
-}
-
-export TackyProgram emit_tacky(const Program& program) {
-    temp_counter = 0;
-    label_counter = 0;
-    return {emit_tacky_function(program.function)};
-}
-
-// ── Assembly AST ────────────────────────────────────────────────────
-
-export enum class RegId : uint8_t { AX, DX, R10, R11 };
+export enum class RegId : uint8_t { AX, CX, DX, R10, R11 };
 
 export struct Reg    { RegId id; };
 export struct Imm    { int32_t value; };
@@ -158,6 +29,11 @@ export struct Imull    { Operand src; Operand dst; };
 export struct Idivl    { Operand operand; };
 export struct Cdq      {};
 export struct Cmpl     { Operand src; Operand dst; };
+export struct Andl     { Operand src; Operand dst; };
+export struct Orl      { Operand src; Operand dst; };
+export struct Xorl     { Operand src; Operand dst; };
+export struct Shll     { Operand operand; };
+export struct Sarl     { Operand operand; };
 
 export enum class AsmUnaryOp : uint8_t { Neg, Not };
 
@@ -171,13 +47,13 @@ export struct AllocateStack { int bytes; };
 export struct Ret {};
 
 export using AsmInstruction = std::variant<Mov, AsmUnary, Addl, Subl, Imull,
-                                           Idivl, Cdq, Cmpl, Jmp, JmpCC,
+                                           Idivl, Cdq, Cmpl, Andl, Orl, Xorl,
+                                           Shll, Sarl, Jmp, JmpCC,
                                            SetCC, AsmLabel, AllocateStack, Ret>;
 
 export struct AsmFunction { std::string name; std::vector<AsmInstruction> instructions; };
 export struct AsmProgram  { AsmFunction function; };
 
-// ── Helpers ─────────────────────────────────────────────────────────
 
 static Operand tacky_val_to_operand(const TackyVal& val) {
     return std::visit(Overload{
@@ -200,7 +76,6 @@ static void track_stack_ops(const Operand& a, const Operand& b, int& sb) {
     track_stack(b, sb);
 }
 
-// ── Pass 1: TACKY -> Assembly (with Pseudo operands) ───────────────
 
 static CondCode convert_relational(TackyBinaryOp op) {
     switch (op) {
@@ -215,7 +90,9 @@ static CondCode convert_relational(TackyBinaryOp op) {
 }
 
 static bool is_relational(TackyBinaryOp op) {
-    return op >= TackyBinaryOp::Equal;
+    return op == TackyBinaryOp::Equal || op == TackyBinaryOp::NotEqual ||
+           op == TackyBinaryOp::LessThan || op == TackyBinaryOp::LessOrEqual ||
+           op == TackyBinaryOp::GreaterThan || op == TackyBinaryOp::GreaterOrEqual;
 }
 
 static AsmFunction tacky_to_asm(const TackyFunction& func) {
@@ -264,13 +141,26 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
 
                 switch (b.op) {
                     case TackyBinaryOp::Add:
-                    case TackyBinaryOp::Subtract:
-                    case TackyBinaryOp::Multiply: {
+                    case TackyBinaryOp::BitwiseAnd:
+                    case TackyBinaryOp::BitwiseOr:
+                    case TackyBinaryOp::BitwiseXor: {
                         instructions.push_back(Mov{src1, dst});
                         ensure_r10(src2);
                         if (b.op == TackyBinaryOp::Add)
                             instructions.push_back(Addl{Reg{RegId::R10}, dst});
-                        else if (b.op == TackyBinaryOp::Subtract)
+                        else if (b.op == TackyBinaryOp::BitwiseAnd)
+                            instructions.push_back(Andl{Reg{RegId::R10}, dst});
+                        else if (b.op == TackyBinaryOp::BitwiseOr)
+                            instructions.push_back(Orl{Reg{RegId::R10}, dst});
+                        else
+                            instructions.push_back(Xorl{Reg{RegId::R10}, dst});
+                        break;
+                    }
+                    case TackyBinaryOp::Subtract:
+                    case TackyBinaryOp::Multiply: {
+                        instructions.push_back(Mov{src1, dst});
+                        ensure_r10(src2);
+                        if (b.op == TackyBinaryOp::Subtract)
                             instructions.push_back(Subl{Reg{RegId::R10}, dst});
                         else
                             instructions.push_back(Imull{Reg{RegId::R10}, dst});
@@ -285,6 +175,16 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
                         auto result_reg = (b.op == TackyBinaryOp::Divide)
                             ? Reg{RegId::AX} : Reg{RegId::DX};
                         instructions.push_back(Mov{result_reg, dst});
+                        break;
+                    }
+                    case TackyBinaryOp::ShiftLeft:
+                    case TackyBinaryOp::ShiftRight: {
+                        instructions.push_back(Mov{src2, Reg{RegId::CX}});
+                        instructions.push_back(Mov{src1, dst});
+                        if (b.op == TackyBinaryOp::ShiftLeft)
+                            instructions.push_back(Shll{dst});
+                        else
+                            instructions.push_back(Sarl{dst});
                         break;
                     }
                     default: break;
@@ -314,7 +214,6 @@ static AsmFunction tacky_to_asm(const TackyFunction& func) {
     return {func.name, std::move(instructions)};
 }
 
-// ── Pass 2: Replace pseudoregisters with stack locations ────────────
 
 static Operand fix_operand(Operand o,
                            std::unordered_map<std::string, int>& offsets,
@@ -359,6 +258,24 @@ static AsmInstruction replace_pseudo(AsmInstruction instr,
             return Cmpl{fix_operand(c.src, offsets, next_offset),
                         fix_operand(c.dst, offsets, next_offset)};
         },
+        [&](Andl a) -> AsmInstruction {
+            return Andl{fix_operand(a.src, offsets, next_offset),
+                        fix_operand(a.dst, offsets, next_offset)};
+        },
+        [&](Orl o) -> AsmInstruction {
+            return Orl{fix_operand(o.src, offsets, next_offset),
+                       fix_operand(o.dst, offsets, next_offset)};
+        },
+        [&](Xorl x) -> AsmInstruction {
+            return Xorl{fix_operand(x.src, offsets, next_offset),
+                        fix_operand(x.dst, offsets, next_offset)};
+        },
+        [&](Shll s) -> AsmInstruction {
+            return Shll{fix_operand(s.operand, offsets, next_offset)};
+        },
+        [&](Sarl s) -> AsmInstruction {
+            return Sarl{fix_operand(s.operand, offsets, next_offset)};
+        },
         [&](SetCC s) -> AsmInstruction {
             return SetCC{s.cc, fix_operand(s.operand, offsets, next_offset)};
         },
@@ -377,7 +294,6 @@ static AsmFunction replace_pseudos(const AsmFunction& func) {
     return {func.name, std::move(instructions)};
 }
 
-// ── Pass 3: Fix up invalid instructions ─────────────────────────────
 
 static AsmFunction fix_up(const AsmFunction& func) {
     int stack_bytes = 0;
@@ -415,6 +331,41 @@ static AsmFunction fix_up(const AsmFunction& func) {
                     fixed.push_back(s);
                 }
                 track_stack_ops(s.src, s.dst, stack_bytes);
+            },
+            [&](const Andl& a) {
+                if (is_memory(a.src) && is_memory(a.dst)) {
+                    fixed.push_back(Mov{a.src, Reg{RegId::R10}});
+                    fixed.push_back(Andl{Reg{RegId::R10}, a.dst});
+                } else {
+                    fixed.push_back(a);
+                }
+                track_stack_ops(a.src, a.dst, stack_bytes);
+            },
+            [&](const Orl& o) {
+                if (is_memory(o.src) && is_memory(o.dst)) {
+                    fixed.push_back(Mov{o.src, Reg{RegId::R10}});
+                    fixed.push_back(Orl{Reg{RegId::R10}, o.dst});
+                } else {
+                    fixed.push_back(o);
+                }
+                track_stack_ops(o.src, o.dst, stack_bytes);
+            },
+            [&](const Xorl& x) {
+                if (is_memory(x.src) && is_memory(x.dst)) {
+                    fixed.push_back(Mov{x.src, Reg{RegId::R10}});
+                    fixed.push_back(Xorl{Reg{RegId::R10}, x.dst});
+                } else {
+                    fixed.push_back(x);
+                }
+                track_stack_ops(x.src, x.dst, stack_bytes);
+            },
+            [&](const Shll& s) {
+                track_stack(s.operand, stack_bytes);
+                fixed.push_back(s);
+            },
+            [&](const Sarl& s) {
+                track_stack(s.operand, stack_bytes);
+                fixed.push_back(s);
             },
             [&](const Imull& m) {
                 if (is_memory(m.dst)) {
@@ -462,7 +413,6 @@ static AsmFunction fix_up(const AsmFunction& func) {
     return {func.name, std::move(result)};
 }
 
-// ── Full pipeline ───────────────────────────────────────────────────
 
 export AsmProgram codegen(const Program& program) {
     auto tacky = emit_tacky(program);
@@ -472,7 +422,6 @@ export AsmProgram codegen(const Program& program) {
     return {std::move(asm_func)};
 }
 
-// ── Assembly -> Text ────────────────────────────────────────────────
 
 static std::string platform_prefix() {
 #if defined(__APPLE__)
@@ -488,6 +437,7 @@ static std::string operand_str(const Operand& o) {
         [](const Reg& r) -> std::string {
             switch (r.id) {
                 case RegId::AX:  return "%eax";
+                case RegId::CX:  return "%ecx";
                 case RegId::DX:  return "%edx";
                 case RegId::R10: return "%r10d";
                 case RegId::R11: return "%r11d";
@@ -507,6 +457,7 @@ static std::string operand_byte_str(const Operand& o) {
         [](const Reg& r) -> std::string {
             switch (r.id) {
                 case RegId::AX:  return "%al";
+                case RegId::CX:  return "%cl";
                 case RegId::DX:  return "%dl";
                 case RegId::R10: return "%r10b";
                 case RegId::R11: return "%r11b";
@@ -568,6 +519,21 @@ export void emit_asm(const AsmProgram& program, std::string& output) {
             },
             [&output](const Cmpl& c) {
                 output += "    cmpl " + operand_str(c.src) + ", " + operand_str(c.dst) + "\n";
+            },
+            [&output](const Andl& a) {
+                output += "    andl " + operand_str(a.src) + ", " + operand_str(a.dst) + "\n";
+            },
+            [&output](const Orl& o) {
+                output += "    orl " + operand_str(o.src) + ", " + operand_str(o.dst) + "\n";
+            },
+            [&output](const Xorl& x) {
+                output += "    xorl " + operand_str(x.src) + ", " + operand_str(x.dst) + "\n";
+            },
+            [&output](const Shll& s) {
+                output += "    shll %cl, " + operand_str(s.operand) + "\n";
+            },
+            [&output](const Sarl& s) {
+                output += "    sarl %cl, " + operand_str(s.operand) + "\n";
             },
             [&output](const Jmp& j) {
                 output += "    jmp " + j.target + "\n";

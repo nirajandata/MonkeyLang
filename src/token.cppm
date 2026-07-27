@@ -32,6 +32,11 @@ export enum class TokenType : uint32_t {
     Gt,
     LtEq,
     GtEq,
+    Amp,
+    Bar,
+    Caret,
+    LtLt,
+    GtGt,
     Error,
     Eof
 };

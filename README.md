@@ -1,2 +1,3 @@
 # Monkey
-a compiler project
+C compiler written in C++ 
+

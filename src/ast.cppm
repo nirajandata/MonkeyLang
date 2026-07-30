@@ -4,83 +4,101 @@ module;
 #include <memory>
 #include <string_view>
 #include <variant>
-#include <utility>
 
 export module ast;
 
-export template <typename... Ts>
-struct Overload : Ts... {
+export {
+  template <typename... Ts> struct Overload : Ts... {
     using Ts::operator()...;
-};
+  };
 
-export struct Constant {
+  struct Constant {
     int32_t value;
     uint32_t line;
-};
+  };
 
-export struct Complement {};
-export struct Negate {};
-export struct Not {};
+  struct Complement {};
 
-export using UnaryOp = std::variant<Complement, Negate, Not>;
+  struct Negate {};
 
-export struct Add {};
-export struct Subtract {};
-export struct Multiply {};
-export struct Divide {};
-export struct Remainder {};
-export struct And {};
-export struct Or {};
-export struct Equal {};
-export struct NotEqual {};
-export struct LessThan {};
-export struct LessOrEqual {};
-export struct GreaterThan {};
-export struct GreaterOrEqual {};
-export struct BitwiseAnd {};
-export struct BitwiseOr {};
-export struct BitwiseXor {};
-export struct ShiftLeft {};
-export struct ShiftRight {};
+  struct Not {};
 
-export using BinaryOp = std::variant<Add, Subtract, Multiply, Divide, Remainder,
-                                     And, Or, Equal, NotEqual, LessThan,
-                                     LessOrEqual, GreaterThan, GreaterOrEqual,
-                                     BitwiseAnd, BitwiseOr, BitwiseXor,
-                                     ShiftLeft, ShiftRight>;
+  using UnaryOp = std::variant<Complement, Negate, Not>;
 
-export struct Exp;
+  struct Add {};
 
-export struct Unary {
+  struct Subtract {};
+
+  struct Multiply {};
+
+  struct Divide {};
+
+  struct Remainder {};
+
+  struct And {};
+
+  struct Or {};
+
+  struct Equal {};
+
+  struct NotEqual {};
+
+  struct LessThan {};
+
+  struct LessOrEqual {};
+
+  struct GreaterThan {};
+
+  struct GreaterOrEqual {};
+
+  struct BitwiseAnd {};
+
+  struct BitwiseOr {};
+
+  struct BitwiseXor {};
+
+  struct ShiftLeft {};
+
+  struct ShiftRight {};
+
+  using BinaryOp =
+      std::variant<Add, Subtract, Multiply, Divide, Remainder, And, Or, Equal,
+                   NotEqual, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual,
+                   BitwiseAnd, BitwiseOr, BitwiseXor, ShiftLeft, ShiftRight>;
+
+  struct Exp;
+
+  struct Unary {
     UnaryOp op;
     std::unique_ptr<Exp> exp;
     uint32_t line;
-};
+  };
 
-export struct Binary {
+  struct Binary {
     BinaryOp op;
     std::unique_ptr<Exp> left;
     std::unique_ptr<Exp> right;
     uint32_t line;
-};
+  };
 
-export struct Exp {
+  struct Exp {
     std::variant<Constant, Unary, Binary> value;
-};
+  };
 
-export struct Return {
+  struct Return {
     Exp value;
     uint32_t line;
-};
+  };
 
-export using Statement = std::variant<Return>;
+  using Statement = std::variant<Return>;
 
-export struct Function {
+  struct Function {
     std::string_view name;
     Statement body;
     uint32_t line;
-};
+  };
 
-export struct Program {
+  struct Program {
     Function function;
-};
+  };
+}

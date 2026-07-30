@@ -213,20 +213,24 @@ export class Lexer
         const char* start = cursor_;
         cursor_++;
 
+        auto make_token = [&](TokenType type) {
+            return Token{type, std::string_view(start, 1), current_line_};
+        };
+
         switch (c)
         {
-        case '(': return {TokenType::LParen, std::string_view(start, 1), current_line_};
-        case ')': return {TokenType::RParen, std::string_view(start, 1), current_line_};
-        case '{': return {TokenType::LBrace, std::string_view(start, 1), current_line_};
-        case '}': return {TokenType::RBrace, std::string_view(start, 1), current_line_};
-        case ';': return {TokenType::Semicolon, std::string_view(start, 1), current_line_};
-        case '~': return {TokenType::Tilde, std::string_view(start, 1), current_line_};
-        case '+': return {TokenType::Plus, std::string_view(start, 1), current_line_};
-        case '*': return {TokenType::Star, std::string_view(start, 1), current_line_};
-        case '%': return {TokenType::Percent, std::string_view(start, 1), current_line_};
+        case '(': return make_token(TokenType::LParen);
+        case ')': return make_token(TokenType::RParen);
+        case '{': return make_token(TokenType::LBrace);
+        case '}': return make_token(TokenType::RBrace);
+        case ';': return make_token(TokenType::Semicolon);
+        case '~': return make_token(TokenType::Tilde);
+        case '+': return make_token(TokenType::Plus);
+        case '*': return make_token(TokenType::Star);
+        case '%': return make_token(TokenType::Percent);
         default:
             had_error_ = true;
-            return {TokenType::Error, std::string_view(start, 1), current_line_};
+            return make_token(TokenType::Error);
         }
     }
 
@@ -259,7 +263,7 @@ public:
         map_size_ = (file_pages + 1) * page_size;
 
         map_base_ = mmap(nullptr, map_size_, PROT_READ,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (map_base_ == MAP_FAILED)
         {
             close(fd_);
@@ -273,8 +277,8 @@ public:
         if (size > 0)
         {
             void* filemap = mmap(map_base_, size, PROT_READ,
-                                  MAP_PRIVATE | MAP_FIXED | MAP_POPULATE,
-                                  fd_, 0);
+                                 MAP_PRIVATE | MAP_FIXED | MAP_POPULATE,
+                                 fd_, 0);
             if (filemap == MAP_FAILED)
             {
                 munmap(map_base_, map_size_);

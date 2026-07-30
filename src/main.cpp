@@ -6,6 +6,7 @@
 #include <print>
 #include <cstdlib>
 #include <variant>
+#include <meta>
 
 import token;
 import ast;
@@ -38,66 +39,51 @@ static void print_tokens(const std::vector<Token>& tokens) {
     }
 }
 
+constexpr auto get_type_name = [](const auto& node) -> std::string_view {
+  using T = std::remove_cvref_t<decltype(node)>;
+  return std::meta::identifier_of(^^T);
+};
+
 static void pretty_print(const Exp& exp, int indent = 0) {
-    std::string pad(indent * 2, ' ');
-    std::visit(Overload{
-        [&](const Constant& c) {
-            std::println("{}Constant({})", pad, c.value);
-        },
-        [&](const Unary& u) {
-            std::string op_name = std::visit(Overload{
-                [](const Complement&) -> std::string { return "Complement"; },
-                [](const Negate&) -> std::string { return "Negate"; },
-                [](const Not&) -> std::string { return "Not"; },
-            }, u.op);
-            std::println("{}Unary(", pad);
-            std::println("{}  {},", pad, op_name);
-            pretty_print(*u.exp, indent + 2);
-            std::println("{})", pad);
-        },
-        [&](const Binary& b) {
-            std::string op_name = std::visit(Overload{
-                [](const Add&) -> std::string { return "Add"; },
-                [](const Subtract&) -> std::string { return "Subtract"; },
-                [](const Multiply&) -> std::string { return "Multiply"; },
-                [](const Divide&) -> std::string { return "Divide"; },
-                [](const Remainder&) -> std::string { return "Remainder"; },
-                [](const And&) -> std::string { return "And"; },
-                [](const Or&) -> std::string { return "Or"; },
-                [](const Equal&) -> std::string { return "Equal"; },
-                [](const NotEqual&) -> std::string { return "NotEqual"; },
-                [](const LessThan&) -> std::string { return "LessThan"; },
-                [](const LessOrEqual&) -> std::string { return "LessOrEqual"; },
-                [](const GreaterThan&) -> std::string { return "GreaterThan"; },
-                [](const GreaterOrEqual&) -> std::string { return "GreaterOrEqual"; },
-                [](const BitwiseAnd&) -> std::string { return "BitwiseAnd"; },
-                [](const BitwiseOr&) -> std::string { return "BitwiseOr"; },
-                [](const BitwiseXor&) -> std::string { return "BitwiseXor"; },
-                [](const ShiftLeft&) -> std::string { return "ShiftLeft"; },
-                [](const ShiftRight&) -> std::string { return "ShiftRight"; },
-            }, b.op);
-            std::println("{}Binary(", pad);
-            std::println("{}  {},", pad, op_name);
-            pretty_print(*b.left, indent + 2);
-            pretty_print(*b.right, indent + 2);
-            std::println("{})", pad);
-        },
-    }, exp.value);
+  std::string pad(indent * 2, ' ');
+  std::visit(Overload{
+      [&](const Constant& c) {
+          std::println("{}{}({})", pad, std::meta::identifier_of(^^Constant), c.value);
+      },
+      [&](const Unary& u) {
+          std::string_view op_name = std::visit(get_type_name, u.op);
+
+          std::println("{}{}(", pad, std::meta::identifier_of(^^Unary));
+          std::println("{}  {},", pad, op_name);
+          pretty_print(*u.exp, indent + 2);
+          std::println("{})", pad);
+      },
+      [&](const Binary& b) {
+          std::string_view op_name = std::visit(get_type_name, b.op);
+
+          std::println("{}{}(", pad, std::meta::identifier_of(^^Binary));
+          std::println("{}  {},", pad, op_name);
+          pretty_print(*b.left, indent + 2);
+          pretty_print(*b.right, indent + 2);
+          std::println("{})", pad);
+      },
+  }, exp.value);
 }
 
 static void pretty_print(const Program& program, int indent = 0) {
-    std::string pad(indent * 2, ' ');
-    std::println("{}Program(", pad);
-    std::println("{}  Function(", pad);
-    std::println("{}    name=\"{}\",", pad, program.function.name);
+  std::string pad(indent * 2, ' ');
 
-    const auto& ret = std::get<Return>(program.function.body);
+  std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
+  std::println("{}  {}(", pad, std::meta::identifier_of(^^Function));
+  std::println("{}    name=\"{}\",", pad, program.function.name);
 
-    std::println("{}    body=Return(", pad);
-    pretty_print(ret.value, indent + 4);
-    std::println("{}    )", pad);
-    std::println("{}  )", pad);
-    std::println("{})", pad);
+  const auto& ret = std::get<Return>(program.function.body);
+
+  std::println("{}    body={}(", pad, std::meta::identifier_of(^^Return));
+  pretty_print(ret.value, indent + 4);
+  std::println("{}    )", pad);
+  std::println("{}  )", pad);
+  std::println("{})", pad);
 }
 
 int main(int argc, char *argv[]) {

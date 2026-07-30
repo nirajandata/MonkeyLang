@@ -18,4 +18,4 @@ target_sources(Monkey PRIVATE
     src/codegen.cppm
 )
 
-target_compile_options(Monkey PRIVATE -march=native -O3)
+target_compile_options(Monkey PRIVATE -march=native -O3 -freflection)

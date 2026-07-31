@@ -1,8 +1,11 @@
 module;
 
 #include <cstdint>
+#include <meta>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -85,128 +88,143 @@ export {
   };
 }
 
-static int temp_counter = 0;
-static int label_counter = 0;
+template <typename AST_Node, typename TargetEnum>
+consteval std::meta::info reflect_enum_info() {
+  std::string_view ast_name = std::meta::identifier_of(^^AST_Node);
 
-static std::string make_temporary() {
-  return "tmp." + std::to_string(temp_counter++);
+  for (std::meta::info e : std::meta::enumerators_of(^^TargetEnum)) {
+    if (std::meta::identifier_of(e) == ast_name) {
+      return e;
+    }
+  }
+
+  throw "AST Node does not match any TargetEnum member!";
 }
 
-static std::string make_label(std::string_view prefix) {
-  return std::string(prefix) + "." + std::to_string(label_counter++);
+template <typename AST_Node, typename TargetEnum>
+consteval TargetEnum reflect_to_enum() {
+  return [:reflect_enum_info<AST_Node, TargetEnum>():];
 }
 
-static TackyUnaryOp convert_ast_unop(const UnaryOp &op) {
-  if (std::holds_alternative<Complement>(op))
-    return TackyUnaryOp::Complement;
-  if (std::holds_alternative<Negate>(op))
-    return TackyUnaryOp::Negate;
-  return TackyUnaryOp::Not;
-}
+class TackyEmitter {
+  int temp_counter = 0;
+  int label_counter = 0;
 
-static TackyBinaryOp convert_ast_binop(const BinaryOp &op) {
-  if (std::holds_alternative<Add>(op))
-    return TackyBinaryOp::Add;
-  if (std::holds_alternative<Subtract>(op))
-    return TackyBinaryOp::Subtract;
-  if (std::holds_alternative<Multiply>(op))
-    return TackyBinaryOp::Multiply;
-  if (std::holds_alternative<Divide>(op))
-    return TackyBinaryOp::Divide;
-  if (std::holds_alternative<Remainder>(op))
-    return TackyBinaryOp::Remainder;
-  if (std::holds_alternative<Equal>(op))
-    return TackyBinaryOp::Equal;
-  if (std::holds_alternative<NotEqual>(op))
-    return TackyBinaryOp::NotEqual;
-  if (std::holds_alternative<LessThan>(op))
-    return TackyBinaryOp::LessThan;
-  if (std::holds_alternative<LessOrEqual>(op))
-    return TackyBinaryOp::LessOrEqual;
-  if (std::holds_alternative<GreaterThan>(op))
-    return TackyBinaryOp::GreaterThan;
-  if (std::holds_alternative<BitwiseAnd>(op))
-    return TackyBinaryOp::BitwiseAnd;
-  if (std::holds_alternative<BitwiseOr>(op))
-    return TackyBinaryOp::BitwiseOr;
-  if (std::holds_alternative<BitwiseXor>(op))
-    return TackyBinaryOp::BitwiseXor;
-  if (std::holds_alternative<ShiftLeft>(op))
-    return TackyBinaryOp::ShiftLeft;
-  if (std::holds_alternative<ShiftRight>(op))
-    return TackyBinaryOp::ShiftRight;
-  return TackyBinaryOp::GreaterOrEqual;
-}
+  std::string make_temporary() {
+    return "tmp." + std::to_string(temp_counter++);
+  }
 
-static TackyVal emit_tacky_val(const Exp &exp,
-                               std::vector<TackyInstruction> &instructions) {
-  return std::visit(
-      Overload{
-          [](const Constant &c) -> TackyVal { return TackyConstant{c.value}; },
-          [&](const Unary &u) -> TackyVal {
-            auto src = emit_tacky_val(*u.exp, instructions);
-            TackyVal dst = TackyVar{make_temporary()};
-            instructions.push_back(
-                TackyUnary{convert_ast_unop(u.op), src, dst});
-            return dst;
-          },
-          [&](const Binary &b) -> TackyVal {
-            bool is_and = std::holds_alternative<And>(b.op);
-            bool is_or = std::holds_alternative<Or>(b.op);
+  std::string make_label(std::string_view prefix) {
+    return std::string(prefix) + "." + std::to_string(label_counter++);
+  }
 
-            if (!is_and && !is_or) {
-              auto left = emit_tacky_val(*b.left, instructions);
-              auto right = emit_tacky_val(*b.right, instructions);
-              TackyVal dst = TackyVar{make_temporary()};
-              instructions.push_back(
-                  TackyBinary{convert_ast_binop(b.op), left, right, dst});
-              return dst;
-            }
+  TackyVal emit_and(const Binary &b,
+                    std::vector<TackyInstruction> &instructions) {
+    TackyVal dst = TackyVar{make_temporary()};
+    auto false_label = make_label("and_false");
+    auto end_label = make_label("and_end");
 
-            TackyVal dst = TackyVar{make_temporary()};
-            auto left = emit_tacky_val(*b.left, instructions);
-            auto false_label = make_label(is_and ? "and_false" : "or_false");
-            auto end_label = make_label(is_and ? "and_end" : "or_end");
+    auto left = emit_val(*b.left, instructions);
+    instructions.push_back(TackyJumpIfZero{left, false_label});
 
-            if (is_and) {
-              instructions.push_back(TackyJumpIfZero{left, false_label});
-              auto right = emit_tacky_val(*b.right, instructions);
-              instructions.push_back(TackyJumpIfZero{right, false_label});
-              instructions.push_back(TackyCopy{TackyConstant{1}, dst});
-              instructions.push_back(TackyJump{end_label});
-              instructions.push_back(TackyLabel{false_label});
-              instructions.push_back(TackyCopy{TackyConstant{0}, dst});
-            } else {
-              instructions.push_back(TackyJumpIfNotZero{left, false_label});
-              auto right = emit_tacky_val(*b.right, instructions);
-              instructions.push_back(TackyJumpIfNotZero{right, false_label});
-              instructions.push_back(TackyCopy{TackyConstant{0}, dst});
-              instructions.push_back(TackyJump{end_label});
-              instructions.push_back(TackyLabel{false_label});
-              instructions.push_back(TackyCopy{TackyConstant{1}, dst});
-            }
-            instructions.push_back(TackyLabel{end_label});
-            return dst;
-          },
-      },
-      exp.value);
-}
+    auto right = emit_val(*b.right, instructions);
+    instructions.push_back(TackyJumpIfZero{right, false_label});
 
-static TackyFunction emit_tacky_function(const Function &func) {
-  std::vector<TackyInstruction> instructions;
-  std::visit(
-      Overload{
-          [&](const Return &r) {
-            instructions.push_back(
-                TackyReturn{emit_tacky_val(r.value, instructions)});
-          },
-      },
-      func.body);
-  return {std::string(func.name), std::move(instructions)};
-}
+    instructions.push_back(TackyCopy{TackyConstant{1}, dst});
+    instructions.push_back(TackyJump{end_label});
+    instructions.push_back(TackyLabel{false_label});
+    instructions.push_back(TackyCopy{TackyConstant{0}, dst});
+    instructions.push_back(TackyLabel{end_label});
+
+    return dst;
+  }
+
+  TackyVal emit_or(const Binary &b,
+                   std::vector<TackyInstruction> &instructions) {
+    TackyVal dst = TackyVar{make_temporary()};
+    auto true_label = make_label("or_true");
+    auto end_label = make_label("or_end");
+
+    auto left = emit_val(*b.left, instructions);
+    instructions.push_back(TackyJumpIfNotZero{left, true_label});
+
+    auto right = emit_val(*b.right, instructions);
+    instructions.push_back(TackyJumpIfNotZero{right, true_label});
+
+    instructions.push_back(TackyCopy{TackyConstant{0}, dst});
+    instructions.push_back(TackyJump{end_label});
+    instructions.push_back(TackyLabel{true_label});
+    instructions.push_back(TackyCopy{TackyConstant{1}, dst});
+    instructions.push_back(TackyLabel{end_label});
+
+    return dst;
+  }
+
+  TackyVal emit_val(const Exp &exp,
+                    std::vector<TackyInstruction> &instructions) {
+    return std::visit(
+        Overload{[](const Constant &c) -> TackyVal {
+                   return TackyConstant{c.value};
+                 },
+
+                 [&](const Unary &u) -> TackyVal {
+                   return std::visit(
+                       [&](const auto &op) -> TackyVal {
+                         using OpType = std::decay_t<decltype(op)>;
+
+                         auto src = emit_val(*u.exp, instructions);
+                         TackyVal dst = TackyVar{make_temporary()};
+                         instructions.push_back(
+                             TackyUnary{reflect_to_enum<OpType, TackyUnaryOp>(),
+                                        std::move(src), dst});
+                         return dst;
+                       },
+                       u.op);
+                 },
+
+                 [&](const Binary &b) -> TackyVal {
+                   return std::visit(
+                       [&](const auto &op) -> TackyVal {
+                         using OpType = std::decay_t<decltype(op)>;
+
+                         if constexpr (std::is_same_v<OpType, And>) {
+                           return emit_and(b, instructions);
+                         } else if constexpr (std::is_same_v<OpType, Or>) {
+                           return emit_or(b, instructions);
+                         } else {
+                           auto left = emit_val(*b.left, instructions);
+                           auto right = emit_val(*b.right, instructions);
+                           TackyVal dst = TackyVar{make_temporary()};
+
+                           instructions.push_back(TackyBinary{
+                               reflect_to_enum<OpType, TackyBinaryOp>(),
+                               std::move(left), std::move(right), dst});
+                           return dst;
+                         }
+                       },
+                       b.op);
+                 }},
+        exp.value);
+  }
+
+  TackyFunction emit_function(const Function &func) {
+    std::vector<TackyInstruction> instructions;
+    std::visit(Overload{[&](const Return &r) {
+                 instructions.push_back(
+                     TackyReturn{emit_val(r.value, instructions)});
+               }},
+               func.body);
+
+    return {std::string(func.name), std::move(instructions)};
+  }
+
+public:
+  TackyProgram emit_program(const Program &program) {
+    return {emit_function(program.function)};
+  }
+};
 
 export TackyProgram emit_tacky(const Program &program) {
-  temp_counter = 0;
-  label_counter = 0;
-  return {emit_tacky_function(program.function)};
+  TackyEmitter emitter;
+  return emitter.emit_program(program);
 }

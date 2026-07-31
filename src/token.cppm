@@ -6,43 +6,43 @@ module;
 export module token;
 
 export enum class TokenType : uint32_t {
-    Identifier = 1,
-    Constant,
-    Int,
-    Void,
-    Return,
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    Semicolon,
-    Slash,
-    Tilde,
-    Hyphen,
-    Decrement,
-    Plus,
-    Star,
-    Percent,
-    Bang,
-    AmpAmp,
-    BarBar,
-    EqEq,
-    BangEq,
-    Lt,
-    Gt,
-    LtEq,
-    GtEq,
-    Amp,
-    Bar,
-    Caret,
-    LtLt,
-    GtGt,
-    Error,
-    Eof
+  Identifier = 1,
+  Constant,
+  Int,
+  Void,
+  Return,
+  LParen,
+  RParen,
+  LBrace,
+  RBrace,
+  Semicolon,
+  Divide,
+  Complement,
+  Subtract,
+  Decrement,
+  Add,
+  Multiply,
+  Remainder,
+  Not,
+  And,
+  Or,
+  Equal,
+  NotEqual,
+  LessThan,
+  GreaterThan,
+  LessOrEqual,
+  GreaterOrEqual,
+  BitwiseAnd,
+  BitwiseOr,
+  BitwiseXor,
+  ShiftLeft,
+  ShiftRight,
+  Error,
+  Eof
 };
 
 export struct Token {
-    TokenType type;
-    std::string_view text;
-    uint32_t line;
+  TokenType type;
+  std::string_view text;
+  uint32_t line;
 };

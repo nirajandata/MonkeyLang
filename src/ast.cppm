@@ -2,7 +2,7 @@ module;
 
 #include <cstdint>
 #include <memory>
-#include <string_view>
+#include <string>
 #include <variant>
 
 export module ast;
@@ -93,7 +93,7 @@ export {
   using Statement = std::variant<Return>;
 
   struct Function {
-    std::string_view name;
+    std::string name;
     Statement body;
     uint32_t line;
   };

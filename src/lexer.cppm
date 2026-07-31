@@ -224,10 +224,10 @@ export class Lexer
         case '{': return make_token(TokenType::LBrace);
         case '}': return make_token(TokenType::RBrace);
         case ';': return make_token(TokenType::Semicolon);
-        case '~': return make_token(TokenType::Tilde);
-        case '+': return make_token(TokenType::Plus);
-        case '*': return make_token(TokenType::Star);
-        case '%': return make_token(TokenType::Percent);
+        case '~': return make_token(TokenType::Complement);
+        case '+': return make_token(TokenType::Add);
+        case '*': return make_token(TokenType::Multiply);
+        case '%': return make_token(TokenType::Remainder);
         default:
             had_error_ = true;
             return make_token(TokenType::Error);
@@ -371,7 +371,7 @@ public:
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Slash, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::Divide, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '-')
@@ -385,7 +385,7 @@ public:
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Hyphen, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::Subtract, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '!')
@@ -395,11 +395,11 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '=')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::BangEq, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::NotEqual, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Bang, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::Not, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '&')
@@ -409,11 +409,11 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '&')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::AmpAmp, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::And, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Amp, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::BitwiseAnd, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '|')
@@ -423,18 +423,18 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '|')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::BarBar, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::Or, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Bar, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::BitwiseOr, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '^')
             {
                 const char* start = cursor_;
                 cursor_++;
-                tokens_.push_back({TokenType::Caret, std::string_view(start, 1), current_line_});
+                tokens_.push_back({TokenType::BitwiseXor, std::string_view(start, 1), current_line_});
             }
             else if (*cursor_ == '=')
             {
@@ -443,7 +443,7 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '=')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::EqEq, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::Equal, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
@@ -458,16 +458,16 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '=')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::LtEq, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::LessOrEqual, std::string_view(start, 2), current_line_});
                 }
                 else if (cursor_ < limit_ && *cursor_ == '<')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::LtLt, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::ShiftLeft, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Lt, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::LessThan, std::string_view(start, 1), current_line_});
                 }
             }
             else if (*cursor_ == '>')
@@ -477,16 +477,16 @@ public:
                 if (cursor_ < limit_ && *cursor_ == '=')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::GtEq, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::GreaterOrEqual, std::string_view(start, 2), current_line_});
                 }
                 else if (cursor_ < limit_ && *cursor_ == '>')
                 {
                     cursor_++;
-                    tokens_.push_back({TokenType::GtGt, std::string_view(start, 2), current_line_});
+                    tokens_.push_back({TokenType::ShiftRight, std::string_view(start, 2), current_line_});
                 }
                 else
                 {
-                    tokens_.push_back({TokenType::Gt, std::string_view(start, 1), current_line_});
+                    tokens_.push_back({TokenType::GreaterThan, std::string_view(start, 1), current_line_});
                 }
             }
             else

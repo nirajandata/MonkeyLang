@@ -1,503 +1,404 @@
 module;
 
-#include <string_view>
-#include <vector>
+#include <bit>
+#include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <immintrin.h>
-#include <bit>
-#include <fcntl.h>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 export module lexer;
 
 import token;
 import ascii;
 
-export class Lexer
-{
-    void* map_base_ = nullptr;
-    size_t map_size_ = 0;
-    int fd_ = -1;
+export class Lexer {
+private:
+  struct MMapHandle {
+    void *map_base = nullptr;
+    size_t map_size = 0;
 
-    const char* cursor_;
-    const char* limit_;
-    std::vector<Token> tokens_;
-    uint32_t current_line_ = 1;
-    bool had_error_ = false;
-    bool open_ok_ = false;
-
-    inline uint64_t tail_mask() const
-    {
-        uint64_t remaining = static_cast<uint64_t>(limit_ - cursor_);
-        return remaining >= 64 ? ~0ULL : ((1ULL << remaining) - 1);
+    MMapHandle() = default;
+    MMapHandle(void *base, size_t size) : map_base(base), map_size(size) {}
+    ~MMapHandle() {
+      if (map_base)
+        munmap(map_base, map_size);
     }
 
-    void skip_whitespace()
-    {
-        while (cursor_ < limit_)
-        {
-            __m512i chars = _mm512_loadu_si512(cursor_);
-            uint64_t mask = tail_mask();
+    MMapHandle(const MMapHandle &) = delete;
+    MMapHandle &operator=(const MMapHandle &) = delete;
 
-            uint64_t ws = ascii::is_space_512(chars) & mask;
-            uint64_t nl = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'))) & mask;
-            uint64_t not_ws = (~ws) & mask;
+    MMapHandle(MMapHandle &&other) noexcept
+        : map_base(std::exchange(other.map_base, nullptr)),
+          map_size(std::exchange(other.map_size, 0)) {}
 
-            if (not_ws == 0)
-            {
-                current_line_ += std::popcount(nl);
-                cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
-            }
-            else
-            {
-                int offset = std::countr_zero(not_ws);
-                uint64_t nl_skipped = nl & ((1ULL << offset) - 1);
-                current_line_ += std::popcount(nl_skipped);
-                cursor_ += offset;
-                return;
-            }
-        }
+    MMapHandle &operator=(MMapHandle &&other) noexcept {
+      if (this != &other) {
+        if (map_base)
+          munmap(map_base, map_size);
+        map_base = std::exchange(other.map_base, nullptr);
+        map_size = std::exchange(other.map_size, 0);
+      }
+      return *this;
+    }
+  };
+
+  MMapHandle mmap_handle_{};
+  const char *cursor_ = nullptr;
+  const char *limit_ = nullptr;
+  std::vector<Token> tokens_{};
+  uint32_t current_line_ = 1;
+  bool had_error_ = false;
+  bool open_ok_ = false;
+
+  inline uint64_t tail_mask() const noexcept {
+    uint64_t remaining = static_cast<uint64_t>(limit_ - cursor_);
+    return remaining >= 64 ? ~0ULL : ((1ULL << remaining) - 1);
+  }
+
+  void skip_whitespace() {
+    while (cursor_ < limit_) {
+      __m512i chars = _mm512_loadu_si512(cursor_);
+      uint64_t mask = tail_mask();
+
+      uint64_t ws = ascii::is_space_512(chars) & mask;
+      uint64_t nl =
+          _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n')) & mask;
+      uint64_t not_ws = (~ws) & mask;
+
+      if (not_ws == 0) {
+        current_line_ += std::popcount(nl);
+        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      } else {
+        int offset = std::countr_zero(not_ws);
+        uint64_t nl_skipped = nl & ((1ULL << offset) - 1);
+        current_line_ += std::popcount(nl_skipped);
+        cursor_ += offset;
+        return;
+      }
+    }
+  }
+
+  void skip_line_comment() {
+    while (cursor_ < limit_) {
+      __m512i chars = _mm512_loadu_si512(cursor_);
+      uint64_t mask = tail_mask();
+      uint64_t nl =
+          _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n')) & mask;
+
+      if (nl == 0) {
+        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      } else {
+        cursor_ += std::countr_zero(nl);
+        return;
+      }
+    }
+  }
+
+  void skip_block_comment() {
+    while (cursor_ + 64 <= limit_) {
+      __m512i chars = _mm512_loadu_si512(cursor_);
+      uint64_t star = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('*'));
+      uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
+
+      if (star == 0) {
+        current_line_ += std::popcount(nl);
+        cursor_ += 64;
+      } else
+        break;
     }
 
-    void skip_line_comment()
-    {
-        while (cursor_ < limit_)
-        {
-            __m512i chars = _mm512_loadu_si512(cursor_);
-            uint64_t mask = tail_mask();
-            uint64_t nl = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'))) & mask;
+    while (cursor_ < limit_) {
+      if (*cursor_ == '\n')
+        current_line_++;
 
-            if (nl == 0)
-            {
-                cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
-            }
-            else
-            {
-                int offset = std::countr_zero(nl);
-                cursor_ += offset;
-                return;
-            }
-        }
-    }
-
-    void skip_block_comment()
-    {
-        while (cursor_ + 64 <= limit_)
-        {
-            __m512i chars = _mm512_loadu_si512(cursor_);
-            __mmask64 star = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('*'));
-            __mmask64 nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
-
-            if (star == 0)
-            {
-                current_line_ += std::popcount(static_cast<uint64_t>(nl));
-                cursor_ += 64;
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        while (cursor_ < limit_)
-        {
-            if (*cursor_ == '\n')
-            {
-                current_line_++;
-            }
-
-            if (*cursor_ == '*')
-            {
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '/')
-                {
-                    cursor_++;
-                    return;
-                }
-            }
-            else
-            {
-                cursor_++;
-            }
-        }
-
-        had_error_ = true;
-    }
-
-    Token read_identifier_or_keyword()
-    {
-        const char* start = cursor_;
-
-        while (cursor_ < limit_)
-        {
-            __m512i chars = _mm512_loadu_si512(cursor_);
-            uint64_t mask = tail_mask();
-
-            uint64_t is_under = static_cast<uint64_t>(_mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('_')));
-            uint64_t valid = (ascii::is_alnum_512(chars) | is_under) & mask;
-
-            if (valid == mask)
-            {
-                cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
-            }
-            else
-            {
-                int offset = std::countr_zero(~valid);
-                cursor_ += offset;
-                break;
-            }
-        }
-
-        std::string_view text(start, cursor_ - start);
-        TokenType type = TokenType::Identifier;
-
-        switch (text.size())
-        {
-        case 3:
-            if (text == "int") type = TokenType::Int;
-            break;
-        case 4:
-            if (text == "void") type = TokenType::Void;
-            break;
-        case 6:
-            if (text == "return") type = TokenType::Return;
-            break;
-        default:
-            break;
-        }
-
-        return {type, text, current_line_};
-    }
-
-    Token read_constant()
-    {
-        const char* start = cursor_;
-
-        while (cursor_ < limit_)
-        {
-            __m512i chars = _mm512_loadu_si512(cursor_);
-            uint64_t mask = tail_mask();
-
-            uint64_t is_digit = ascii::is_digit_512(chars) & mask;
-
-            if (is_digit == mask)
-            {
-                cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
-            }
-            else
-            {
-                int offset = std::countr_zero(~is_digit);
-                cursor_ += offset;
-                break;
-            }
-        }
-
-        if (cursor_ < limit_ && (ascii::is_alpha(*cursor_) || *cursor_ == '_'))
-        {
-            had_error_ = true;
-            while (cursor_ < limit_ && (ascii::is_alnum(*cursor_) || *cursor_ == '_'))
-            {
-                cursor_++;
-            }
-            return {TokenType::Error, std::string_view(start, cursor_ - start), current_line_};
-        }
-
-        return {TokenType::Constant, std::string_view(start, cursor_ - start), current_line_};
-    }
-
-    Token read_single_char()
-    {
-        char c = *cursor_;
-        const char* start = cursor_;
+      if (*cursor_ == '*') {
         cursor_++;
-
-        auto make_token = [&](TokenType type) {
-            return Token{type, std::string_view(start, 1), current_line_};
-        };
-
-        switch (c)
-        {
-        case '(': return make_token(TokenType::LParen);
-        case ')': return make_token(TokenType::RParen);
-        case '{': return make_token(TokenType::LBrace);
-        case '}': return make_token(TokenType::RBrace);
-        case ';': return make_token(TokenType::Semicolon);
-        case '~': return make_token(TokenType::Complement);
-        case '+': return make_token(TokenType::Add);
-        case '*': return make_token(TokenType::Multiply);
-        case '%': return make_token(TokenType::Remainder);
-        default:
-            had_error_ = true;
-            return make_token(TokenType::Error);
+        if (cursor_ < limit_ && *cursor_ == '/') {
+          cursor_++;
+          return;
         }
+      } else
+        cursor_++;
     }
+
+    had_error_ = true;
+  }
+
+  Token read_identifier_or_keyword() {
+    const char *start = cursor_;
+
+    while (cursor_ < limit_) {
+      __m512i chars = _mm512_loadu_si512(cursor_);
+      uint64_t mask = tail_mask();
+
+      uint64_t is_under = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('_'));
+      uint64_t valid = (ascii::is_alnum_512(chars) | is_under) & mask;
+
+      if (valid == mask) {
+        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      } else {
+        cursor_ += std::countr_zero(~valid);
+        break;
+      }
+    }
+
+    std::string_view text(start, cursor_ - start);
+    TokenType type = TokenType::Identifier;
+
+    if (text.size() == 3 && text == "int")
+      type = TokenType::Int;
+    else if (text.size() == 4 && text == "void")
+      type = TokenType::Void;
+    else if (text.size() == 6 && text == "return")
+      type = TokenType::Return;
+
+    return {type, text, current_line_};
+  }
+
+  Token read_constant() {
+    const char *start = cursor_;
+
+    while (cursor_ < limit_) {
+      __m512i chars = _mm512_loadu_si512(cursor_);
+      uint64_t mask = tail_mask();
+      uint64_t is_digit = ascii::is_digit_512(chars) & mask;
+
+      if (is_digit == mask) {
+        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      } else {
+        cursor_ += std::countr_zero(~is_digit);
+        break;
+      }
+    }
+
+    if (cursor_ < limit_ && (ascii::is_alpha(*cursor_) || *cursor_ == '_')) {
+      had_error_ = true;
+      while (cursor_ < limit_ && (ascii::is_alnum(*cursor_) || *cursor_ == '_'))
+        cursor_++;
+      return {TokenType::Error, std::string_view(start, cursor_ - start),
+              current_line_};
+    }
+
+    return {TokenType::Constant, std::string_view(start, cursor_ - start),
+            current_line_};
+  }
 
 public:
-    Lexer(const std::filesystem::path& path) : cursor_{nullptr}, limit_{nullptr}
-    {
-        fd_ = open(path.c_str(), O_RDONLY);
-        if (fd_ < 0)
-        {
-            cursor_ = nullptr;
-            limit_ = nullptr;
-            return;
-        }
+  explicit Lexer(const std::filesystem::path &path) {
+    struct UniqueFd {
+      int fd;
+      explicit UniqueFd(int f) : fd(f) {}
+      ~UniqueFd() {
+        if (fd >= 0)
+          close(fd);
+      }
+      operator int() const { return fd; }
+    };
 
-        struct stat st{};
-        if (fstat(fd_, &st) != 0 || st.st_size < 0)
-        {
-            close(fd_);
-            fd_ = -1;
-            cursor_ = nullptr;
-            limit_ = nullptr;
-            return;
-        }
+    UniqueFd fd{open(path.c_str(), O_RDONLY)};
+    if (fd < 0)
+      return;
 
-        size_t size = static_cast<size_t>(st.st_size);
-        long page_size_l = sysconf(_SC_PAGESIZE);
-        size_t page_size = page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size < 0)
+      return;
 
-        size_t file_pages = (size + page_size - 1) / page_size;
-        map_size_ = (file_pages + 1) * page_size;
+    size_t size = static_cast<size_t>(st.st_size);
+    long page_size_l = sysconf(_SC_PAGESIZE);
+    size_t page_size =
+        page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
 
-        map_base_ = mmap(nullptr, map_size_, PROT_READ,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (map_base_ == MAP_FAILED)
-        {
-            close(fd_);
-            fd_ = -1;
-            map_base_ = nullptr;
-            cursor_ = nullptr;
-            limit_ = nullptr;
-            return;
-        }
+    size_t file_pages = (size + page_size - 1) / page_size;
+    size_t map_size = (file_pages + 1) * page_size;
 
-        if (size > 0)
-        {
-            void* filemap = mmap(map_base_, size, PROT_READ,
-                                 MAP_PRIVATE | MAP_FIXED | MAP_POPULATE,
-                                 fd_, 0);
-            if (filemap == MAP_FAILED)
-            {
-                munmap(map_base_, map_size_);
-                close(fd_);
-                fd_ = -1;
-                map_base_ = nullptr;
-                cursor_ = nullptr;
-                limit_ = nullptr;
-                return;
-            }
-        }
+    void *base =
+        mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED)
+      return;
 
-        madvise(map_base_, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+    mmap_handle_ = MMapHandle{base, map_size};
 
-        cursor_ = static_cast<const char*>(map_base_);
-        limit_ = cursor_ + size;
-        open_ok_ = true;
-
-        close(fd_);
-        fd_ = -1;
+    if (size > 0) {
+      void *filemap = mmap(base, size, PROT_READ,
+                           MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0);
+      if (filemap == MAP_FAILED) {
+        mmap_handle_ = MMapHandle{};
+        return;
+      }
     }
 
-    ~Lexer()
-    {
-        if (map_base_)
-        {
-            munmap(map_base_, map_size_);
+    madvise(base, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+    cursor_ = static_cast<const char *>(base);
+    limit_ = cursor_ + size;
+    open_ok_ = true;
+  }
+
+  Lexer(const Lexer &) = delete;
+  Lexer &operator=(const Lexer &) = delete;
+
+  Lexer(Lexer &&other) noexcept
+      : mmap_handle_(std::move(other.mmap_handle_)),
+        cursor_(std::exchange(other.cursor_, nullptr)),
+        limit_(std::exchange(other.limit_, nullptr)),
+        tokens_(std::move(other.tokens_)),
+        current_line_(std::exchange(other.current_line_, 1)),
+        had_error_(std::exchange(other.had_error_, false)),
+        open_ok_(std::exchange(other.open_ok_, false)) {}
+
+  Lexer &operator=(Lexer &&other) noexcept {
+    if (this != &other) {
+      mmap_handle_ = std::move(other.mmap_handle_);
+      cursor_ = std::exchange(other.cursor_, nullptr);
+      limit_ = std::exchange(other.limit_, nullptr);
+      tokens_ = std::move(other.tokens_);
+      current_line_ = std::exchange(other.current_line_, 1);
+      had_error_ = std::exchange(other.had_error_, false);
+      open_ok_ = std::exchange(other.open_ok_, false);
+    }
+    return *this;
+  }
+
+  void lex() {
+    tokens_.clear();
+    tokens_.reserve(static_cast<size_t>(limit_ - cursor_) / 3 + 16);
+
+    had_error_ = false;
+    current_line_ = 1;
+    cursor_ = static_cast<const char *>(mmap_handle_.map_base);
+
+    auto emit = [&](TokenType type, size_t len) {
+      tokens_.emplace_back(type, std::string_view(cursor_, len), current_line_);
+      cursor_ += len;
+    };
+
+    auto match = [&](char expected) -> bool {
+      return (cursor_ + 1 < limit_ && cursor_[1] == expected);
+    };
+
+    while (cursor_ < limit_) {
+      skip_whitespace();
+      if (cursor_ >= limit_)
+        break;
+
+      char c = *cursor_;
+
+      if (ascii::is_alpha(c) || c == '_') {
+        tokens_.emplace_back(read_identifier_or_keyword());
+      } else if (ascii::is_digit(c)) {
+        tokens_.emplace_back(read_constant());
+      } else {
+        switch (c) {
+        case '#':
+          skip_line_comment();
+          break;
+        case '/':
+          if (match('/')) {
+            cursor_ += 2;
+            skip_line_comment();
+          } else if (match('*')) {
+            cursor_ += 2;
+            skip_block_comment();
+          } else
+            emit(TokenType::Divide, 1);
+          break;
+        case '-':
+          if (match('-'))
+            emit(TokenType::Decrement, 2);
+          else
+            emit(TokenType::Subtract, 1);
+          break;
+        case '!':
+          if (match('='))
+            emit(TokenType::NotEqual, 2);
+          else
+            emit(TokenType::Not, 1);
+          break;
+        case '&':
+          if (match('&'))
+            emit(TokenType::And, 2);
+          else
+            emit(TokenType::BitwiseAnd, 1);
+          break;
+        case '|':
+          if (match('|'))
+            emit(TokenType::Or, 2);
+          else
+            emit(TokenType::BitwiseOr, 1);
+          break;
+        case '=':
+          if (match('='))
+            emit(TokenType::Equal, 2);
+          else {
+            had_error_ = true;
+            emit(TokenType::Error, 1);
+          }
+          break;
+        case '<':
+          if (match('='))
+            emit(TokenType::LessOrEqual, 2);
+          else if (match('<'))
+            emit(TokenType::ShiftLeft, 2);
+          else
+            emit(TokenType::LessThan, 1);
+          break;
+        case '>':
+          if (match('='))
+            emit(TokenType::GreaterOrEqual, 2);
+          else if (match('>'))
+            emit(TokenType::ShiftRight, 2);
+          else
+            emit(TokenType::GreaterThan, 1);
+          break;
+        case '^':
+          emit(TokenType::BitwiseXor, 1);
+          break;
+        case '(':
+          emit(TokenType::LParen, 1);
+          break;
+        case ')':
+          emit(TokenType::RParen, 1);
+          break;
+        case '{':
+          emit(TokenType::LBrace, 1);
+          break;
+        case '}':
+          emit(TokenType::RBrace, 1);
+          break;
+        case ';':
+          emit(TokenType::Semicolon, 1);
+          break;
+        case '~':
+          emit(TokenType::Complement, 1);
+          break;
+        case '+':
+          emit(TokenType::Add, 1);
+          break;
+        case '*':
+          emit(TokenType::Multiply, 1);
+          break;
+        case '%':
+          emit(TokenType::Remainder, 1);
+          break;
+        default:
+          had_error_ = true;
+          emit(TokenType::Error, 1);
+          break;
         }
-        if (fd_ >= 0)
-        {
-            close(fd_);
-        }
+      }
     }
 
-    Lexer(const Lexer&) = delete;
-    Lexer& operator=(const Lexer&) = delete;
+    tokens_.emplace_back(TokenType::Eof, std::string_view{}, current_line_);
+  }
 
-    Lexer(Lexer&& other) noexcept
-        : map_base_(other.map_base_), map_size_(other.map_size_), fd_(other.fd_),
-          cursor_(other.cursor_), limit_(other.limit_),
-          tokens_(std::move(other.tokens_)), current_line_(other.current_line_),
-          had_error_(other.had_error_), open_ok_(other.open_ok_)
-    {
-        other.map_base_ = nullptr;
-        other.map_size_ = 0;
-        other.fd_ = -1;
-        other.cursor_ = nullptr;
-        other.limit_ = nullptr;
-    }
-
-    void lex()
-    {
-        tokens_.clear();
-        tokens_.reserve(static_cast<size_t>(limit_ - cursor_) / 3 + 16);
-
-        had_error_ = false;
-        current_line_ = 1;
-        cursor_ = static_cast<const char*>(map_base_);
-
-        while (cursor_ < limit_)
-        {
-            skip_whitespace();
-            if (cursor_ >= limit_) break;
-
-            if (ascii::is_alpha(*cursor_) || *cursor_ == '_')
-            {
-                tokens_.push_back(read_identifier_or_keyword());
-            }
-            else if (ascii::is_digit(*cursor_))
-            {
-                tokens_.push_back(read_constant());
-            }
-            else if (*cursor_ == '#')
-            {
-                skip_line_comment();
-            }
-            else if (*cursor_ == '/')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '/')
-                {
-                    cursor_++;
-                    skip_line_comment();
-                }
-                else if (cursor_ < limit_ && *cursor_ == '*')
-                {
-                    cursor_++;
-                    skip_block_comment();
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::Divide, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '-')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '-')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::Decrement, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::Subtract, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '!')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '=')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::NotEqual, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::Not, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '&')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '&')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::And, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::BitwiseAnd, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '|')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '|')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::Or, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::BitwiseOr, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '^')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                tokens_.push_back({TokenType::BitwiseXor, std::string_view(start, 1), current_line_});
-            }
-            else if (*cursor_ == '=')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '=')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::Equal, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    had_error_ = true;
-                    tokens_.push_back({TokenType::Error, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '<')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '=')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::LessOrEqual, std::string_view(start, 2), current_line_});
-                }
-                else if (cursor_ < limit_ && *cursor_ == '<')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::ShiftLeft, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::LessThan, std::string_view(start, 1), current_line_});
-                }
-            }
-            else if (*cursor_ == '>')
-            {
-                const char* start = cursor_;
-                cursor_++;
-                if (cursor_ < limit_ && *cursor_ == '=')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::GreaterOrEqual, std::string_view(start, 2), current_line_});
-                }
-                else if (cursor_ < limit_ && *cursor_ == '>')
-                {
-                    cursor_++;
-                    tokens_.push_back({TokenType::ShiftRight, std::string_view(start, 2), current_line_});
-                }
-                else
-                {
-                    tokens_.push_back({TokenType::GreaterThan, std::string_view(start, 1), current_line_});
-                }
-            }
-            else
-            {
-                tokens_.push_back(read_single_char());
-            }
-        }
-
-        tokens_.push_back({TokenType::Eof, "", current_line_});
-    }
-
-    bool ok() const { return !had_error_ && open_ok_; }
-    const std::vector<Token>& get_tokens() const { return tokens_; }
+  [[nodiscard]] bool ok() const noexcept { return !had_error_ && open_ok_; }
+  [[nodiscard]] const std::vector<Token> &get_tokens() const noexcept {
+    return tokens_;
+  }
 };

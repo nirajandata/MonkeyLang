@@ -26,6 +26,7 @@ export enum class TokenType : uint32_t {
   Not,
   And,
   Or,
+  Assign,
   Equal,
   NotEqual,
   LessThan,

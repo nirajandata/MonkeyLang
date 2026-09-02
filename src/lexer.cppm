@@ -336,8 +336,7 @@ public:
           if (match('='))
             emit(TokenType::Equal, 2);
           else {
-            had_error_ = true;
-            emit(TokenType::Error, 1);
+            emit(TokenType::Assign,1);
           }
           break;
         case '<':

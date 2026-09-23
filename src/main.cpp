@@ -12,15 +12,15 @@ import token;
 import ast;
 import lexer;
 import parser;
-import tacky;
+import nir;
 import codegen;
 
-enum class Stage : std::uint8_t { Lex, Parse, Tacky, CodeGen, EmitAsm, Run };
+enum class Stage : std::uint8_t { Lex, Parse, Nir, CodeGen, EmitAsm, Run };
 
 static std::optional<Stage> parse_stage(std::string_view arg) {
     if (arg == "--lex")     return Stage::Lex;
     if (arg == "--parse")   return Stage::Parse;
-    if (arg == "--tacky")   return Stage::Tacky;
+    if (arg == "--nir")   return Stage::Nir;
     if (arg == "--codegen") return Stage::CodeGen;
     if (arg == "-S")        return Stage::EmitAsm;
     return std::nullopt;
@@ -39,16 +39,28 @@ static void print_tokens(const std::vector<Token>& tokens) {
     }
 }
 
-constexpr auto get_type_name = [](const auto& node) -> std::string_view {
-  using T = std::remove_cvref_t<decltype(node)>;
-  return std::meta::identifier_of(^^T);
+struct GetTypeName {
+  template <typename T>
+  constexpr std::string_view operator()(const T&) const {
+    return std::meta::identifier_of(^^T);
+  }
 };
+constexpr GetTypeName get_type_name{};
 
 static void pretty_print(const Exp& exp, int indent = 0) {
   std::string pad(indent * 2, ' ');
   std::visit(Overload{
       [&](const Constant& c) {
           std::println("{}{}({})", pad, std::meta::identifier_of(^^Constant), c.value);
+      },
+      [&](const Var& v) {
+          std::println("{}{}({})", pad, std::meta::identifier_of(^^Var), v.name);
+      },
+      [&](const Assignment& a) {
+          std::println("{}{}(", pad, std::meta::identifier_of(^^Assignment));
+          pretty_print(*a.left, indent + 2);
+          pretty_print(*a.right, indent + 2);
+          std::println("{})", pad);
       },
       [&](const Unary& u) {
           std::string_view op_name = std::visit(get_type_name, u.op);
@@ -76,19 +88,43 @@ static void pretty_print(const Program& program, int indent = 0) {
   std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
   std::println("{}  {}(", pad, std::meta::identifier_of(^^Function));
   std::println("{}    name=\"{}\",", pad, program.function.name);
+  std::println("{}    body=[", pad);
 
-  const auto& ret = std::get<Return>(program.function.body);
+  for (const auto& item : program.function.body) {
+    std::visit(Overload{
+        [&](const Statement& s) {
+          std::visit(Overload{
+              [&](const Return& r) {
+                std::println("{}      {}(", pad, std::meta::identifier_of(^^Return));
+                pretty_print(r.value, indent + 4);
+                std::println("{}      )", pad);
+              },
+              [&](const Expression& e) {
+                std::println("{}      {}(", pad, std::meta::identifier_of(^^Expression));
+                pretty_print(e.value, indent + 4);
+                std::println("{}      )", pad);
+              },
+              [&](const Null&) {
+                std::println("{}      {}", pad, std::meta::identifier_of(^^Null));
+              },
+          }, s);
+        },
+        [&](const Declaration& d) {
+          std::println("{}      {}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);
+          if (d.init) pretty_print(*d.init, indent + 4);
+          std::println("{}      )", pad);
+        },
+    }, item);
+  }
 
-  std::println("{}    body={}(", pad, std::meta::identifier_of(^^Return));
-  pretty_print(ret.value, indent + 4);
-  std::println("{}    )", pad);
+  std::println("{}    ]", pad);
   std::println("{}  )", pad);
   std::println("{})", pad);
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2 || argc > 3) {
-        std::println("Usage: mcc [--lex | --parse | --tacky | --codegen | -S] <file.c>");
+        std::println("Usage: mcc [--lex | --parse | --nir | --codegen | -S] <file.c>");
         return 1;
     }
 
@@ -130,8 +166,8 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (stage == Stage::Tacky) {
-        emit_tacky(*program);
+    if (stage == Stage::Nir) {
+        emit_nir(*program);
         return 0;
     }
 

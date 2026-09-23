@@ -2,8 +2,10 @@ module;
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 export module ast;
 
@@ -68,6 +70,11 @@ export {
 
   struct Exp;
 
+  struct Var {
+    std::string name;
+    uint32_t line;
+  };
+
   struct Unary {
     UnaryOp op;
     std::unique_ptr<Exp> exp;
@@ -81,8 +88,14 @@ export {
     uint32_t line;
   };
 
+  struct Assignment {
+    std::unique_ptr<Exp> left;
+    std::unique_ptr<Exp> right;
+    uint32_t line;
+  };
+
   struct Exp {
-    std::variant<Constant, Unary, Binary> value;
+    std::variant<Constant, Var, Unary, Binary, Assignment> value;
   };
 
   struct Return {
@@ -90,11 +103,26 @@ export {
     uint32_t line;
   };
 
-  using Statement = std::variant<Return>;
+  struct Expression {
+    Exp value;
+    uint32_t line;
+  };
+
+  struct Null {};
+
+  using Statement = std::variant<Return, Expression, Null>;
+
+  struct Declaration {
+    std::string name;
+    std::optional<Exp> init;
+    uint32_t line;
+  };
+
+  using BlockItem = std::variant<Statement, Declaration>;
 
   struct Function {
     std::string name;
-    Statement body;
+    std::vector<BlockItem> body;
     uint32_t line;
   };
 

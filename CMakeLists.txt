@@ -14,7 +14,7 @@ target_sources(Monkey PRIVATE
     src/ast.cppm
     src/lexer.cppm
     src/parser.cppm
-    src/tacky.cppm
+    src/nir.cppm
     src/codegen.cppm
 )
 

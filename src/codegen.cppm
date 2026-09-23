@@ -15,7 +15,7 @@ module;
 export module codegen;
 
 import ast;
-import tacky;
+import nir;
 
 export {
   enum class RegId : uint8_t { AX, CX, DX, R10, R11 };
@@ -71,10 +71,10 @@ export {
   };
 }
 
-static Operand tacky_val_to_operand(const TackyVal &val) {
+static Operand nir_val_to_operand(const NirVal &val) {
   return std::visit(Overload{
-      [](const TackyConstant &c) -> Operand { return Imm{c.value}; },
-      [](const TackyVar &v) -> Operand { return Pseudo{v.name}; }
+      [](const NirConstant &c) -> Operand { return Imm{c.value}; },
+      [](const NirVar &v) -> Operand { return Pseudo{v.name}; }
   }, val);
 }
 
@@ -93,36 +93,36 @@ static void track_stack_ops(const Operand &a, const Operand &b, int &sb) {
   track_stack(b, sb);
 }
 
-static bool is_relational(TackyBinaryOp op) {
-  return op == TackyBinaryOp::Equal || op == TackyBinaryOp::NotEqual ||
-         op == TackyBinaryOp::LessThan || op == TackyBinaryOp::LessOrEqual ||
-         op == TackyBinaryOp::GreaterThan || op == TackyBinaryOp::GreaterOrEqual;
+static bool is_relational(NirBinaryOp op) {
+  return op == NirBinaryOp::Equal || op == NirBinaryOp::NotEqual ||
+         op == NirBinaryOp::LessThan || op == NirBinaryOp::LessOrEqual ||
+         op == NirBinaryOp::GreaterThan || op == NirBinaryOp::GreaterOrEqual;
 }
 
-static CondCode convert_relational(TackyBinaryOp op) {
+static CondCode convert_relational(NirBinaryOp op) {
   switch (op) {
-    case TackyBinaryOp::Equal: return CondCode::E;
-    case TackyBinaryOp::NotEqual: return CondCode::NE;
-    case TackyBinaryOp::LessThan: return CondCode::L;
-    case TackyBinaryOp::LessOrEqual: return CondCode::LE;
-    case TackyBinaryOp::GreaterThan: return CondCode::G;
-    case TackyBinaryOp::GreaterOrEqual: return CondCode::GE;
+    case NirBinaryOp::Equal: return CondCode::E;
+    case NirBinaryOp::NotEqual: return CondCode::NE;
+    case NirBinaryOp::LessThan: return CondCode::L;
+    case NirBinaryOp::LessOrEqual: return CondCode::LE;
+    case NirBinaryOp::GreaterThan: return CondCode::G;
+    case NirBinaryOp::GreaterOrEqual: return CondCode::GE;
     default: std::unreachable();
   }
 }
 
-static AsmFunction tacky_to_asm(const TackyFunction &func) {
+static AsmFunction nir_to_asm(const NirFunction &func) {
   std::vector<AsmInstruction> instructions;
-  auto op = tacky_val_to_operand;
+  auto op = nir_val_to_operand;
 
   for (const auto &instr : func.instructions) {
     std::visit(Overload{
-        [&](const TackyReturn &r) {
+        [&](const NirReturn &r) {
           instructions.push_back(Mov{op(r.val), Reg{RegId::AX}});
           instructions.push_back(Ret{});
         },
-        [&](const TackyUnary &u) {
-          if (u.op == TackyUnaryOp::Not) {
+        [&](const NirUnary &u) {
+          if (u.op == NirUnaryOp::Not) {
             instructions.push_back(Mov{op(u.src), Reg{RegId::R10}});
             instructions.push_back(Cmpl{Imm{0}, Reg{RegId::R10}});
             instructions.push_back(Mov{Imm{0}, Reg{RegId::R11}});
@@ -130,10 +130,10 @@ static AsmFunction tacky_to_asm(const TackyFunction &func) {
             instructions.push_back(Mov{Reg{RegId::R11}, op(u.dst)});
           } else {
             instructions.push_back(Mov{op(u.src), op(u.dst)});
-            instructions.push_back(AsmUnary{u.op == TackyUnaryOp::Negate ? AsmUnaryOp::Neg : AsmUnaryOp::Not, op(u.dst)});
+            instructions.push_back(AsmUnary{u.op == NirUnaryOp::Negate ? AsmUnaryOp::Neg : AsmUnaryOp::Not, op(u.dst)});
           }
         },
-        [&](const TackyBinary &b) {
+        [&](const NirBinary &b) {
           auto src1 = op(b.src1);
           auto src2 = op(b.src2);
           auto dst = op(b.dst);
@@ -154,41 +154,41 @@ static AsmFunction tacky_to_asm(const TackyFunction &func) {
           };
 
           switch (b.op) {
-            case TackyBinaryOp::Add: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Addl{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::BitwiseAnd: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Andl{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::BitwiseOr: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Orl{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::BitwiseXor: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Xorl{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::Subtract: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Subl{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::Multiply: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Imull{Reg{RegId::R10}, dst}); break;
-            case TackyBinaryOp::Divide:
-            case TackyBinaryOp::Remainder:
+            case NirBinaryOp::Add: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Addl{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::BitwiseAnd: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Andl{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::BitwiseOr: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Orl{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::BitwiseXor: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Xorl{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::Subtract: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Subl{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::Multiply: instructions.push_back(Mov{src1, dst}); ensure_r10(src2); instructions.push_back(Imull{Reg{RegId::R10}, dst}); break;
+            case NirBinaryOp::Divide:
+            case NirBinaryOp::Remainder:
               instructions.push_back(Mov{src1, Reg{RegId::AX}});
               instructions.push_back(Cdq{});
               ensure_r10(src2);
               instructions.push_back(Idivl{Reg{RegId::R10}});
-              instructions.push_back(Mov{b.op == TackyBinaryOp::Divide ? Reg{RegId::AX} : Reg{RegId::DX}, dst});
+              instructions.push_back(Mov{b.op == NirBinaryOp::Divide ? Reg{RegId::AX} : Reg{RegId::DX}, dst});
               break;
-            case TackyBinaryOp::ShiftLeft:
-            case TackyBinaryOp::ShiftRight:
+            case NirBinaryOp::ShiftLeft:
+            case NirBinaryOp::ShiftRight:
               instructions.push_back(Mov{src2, Reg{RegId::CX}});
               instructions.push_back(Mov{src1, dst});
-              if (b.op == TackyBinaryOp::ShiftLeft) instructions.push_back(Shll{dst});
+              if (b.op == NirBinaryOp::ShiftLeft) instructions.push_back(Shll{dst});
               else instructions.push_back(Sarl{dst});
               break;
             default: break;
           }
         },
-        [&](const TackyCopy &c) { instructions.push_back(Mov{op(c.src), op(c.dst)}); },
-        [&](const TackyJump &j) { instructions.push_back(Jmp{j.target}); },
-        [&](const TackyJumpIfZero &j) {
+        [&](const NirCopy &c) { instructions.push_back(Mov{op(c.src), op(c.dst)}); },
+        [&](const NirJump &j) { instructions.push_back(Jmp{j.target}); },
+        [&](const NirJumpIfZero &j) {
           instructions.push_back(Cmpl{op(j.condition), Imm{0}});
           instructions.push_back(JmpCC{CondCode::E, j.target});
         },
-        [&](const TackyJumpIfNotZero &j) {
+        [&](const NirJumpIfNotZero &j) {
           instructions.push_back(Cmpl{op(j.condition), Imm{0}});
           instructions.push_back(JmpCC{CondCode::NE, j.target});
         },
-        [&](const TackyLabel &l) { instructions.push_back(AsmLabel{l.name}); }
+        [&](const NirLabel &l) { instructions.push_back(AsmLabel{l.name}); }
     }, instr);
   }
   return {func.name, std::move(instructions)};
@@ -289,8 +289,8 @@ static AsmFunction fix_up(const AsmFunction &func) {
 }
 
 export AsmProgram codegen(const Program &program) {
-  auto tacky = emit_tacky(program);
-  auto asm_func = tacky_to_asm(tacky.function);
+  auto nir = emit_nir(program);
+  auto asm_func = nir_to_asm(nir.function);
   asm_func = replace_pseudos(asm_func);
   asm_func = fix_up(asm_func);
   return {std::move(asm_func)};

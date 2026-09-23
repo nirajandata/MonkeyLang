@@ -100,6 +100,11 @@ export class Parser {
       return Exp{parse_constant()};
     }
 
+    if (tok.type == TokenType::Identifier) {
+      advance();
+      return Exp{Var{std::string(tok.text), tok.line}};
+    }
+
     if (tok.type == TokenType::Complement || tok.type == TokenType::Subtract || tok.type == TokenType::Not) {
       advance();
       UnaryOp op = (tok.type == TokenType::Complement) ? UnaryOp{Complement{}}
@@ -130,6 +135,7 @@ export class Parser {
 
   static int binary_prec(TokenType type) {
     switch (type) {
+      case TokenType::Assign: return 1;
       case TokenType::Or: return 5;
       case TokenType::And: return 10;
       case TokenType::BitwiseOr: return 15;
@@ -160,12 +166,19 @@ export class Parser {
       if (prec == 0 || prec < min_prec) break;
 
       auto tok = advance();
-      left = Exp{Binary{
-          match_token_to_variant<BinaryOp>(tok.type),
-          std::make_unique<Exp>(std::move(left)),
-          std::make_unique<Exp>(parse_exp(prec + 1)),
-          tok.line
-      }};
+      if (tok.type == TokenType::Assign) {
+        auto right = parse_exp(prec);
+        left = Exp{Assignment{
+            std::make_unique<Exp>(std::move(left)),
+            std::make_unique<Exp>(std::move(right)),
+            tok.line}};
+      } else {
+        left = Exp{Binary{
+            match_token_to_variant<BinaryOp>(tok.type),
+            std::make_unique<Exp>(std::move(left)),
+            std::make_unique<Exp>(parse_exp(prec + 1)),
+            tok.line}};
+      }
     }
 
     return left;
@@ -180,7 +193,47 @@ export class Parser {
   }
 
   Statement parse_statement() {
-    return parse_return();
+    if (check(TokenType::Return)) {
+      return parse_return();
+    }
+
+    if (check(TokenType::Semicolon)) {
+      advance();
+      return Null{};
+    }
+
+    uint32_t line = peek().line;
+    auto exp = parse_exp(0);
+    expect(TokenType::Semicolon, "\";\"");
+    return Expression{std::move(exp), line};
+  }
+
+  Declaration parse_declaration() {
+    uint32_t line = peek().line;
+    expect(TokenType::Int, "\"int\"");
+
+    const Token& name_tok = advance();
+    if (name_tok.type != TokenType::Identifier) {
+      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
+      had_error_ = true;
+    }
+    std::string name(name_tok.text);
+
+    std::optional<Exp> init;
+    if (check(TokenType::Assign)) {
+      advance();
+      init = parse_exp(0);
+    }
+
+    expect(TokenType::Semicolon, "\";\"");
+    return {std::move(name), std::move(init), line};
+  }
+
+  BlockItem parse_block_item() {
+    if (check(TokenType::Int)) {
+      return parse_declaration();
+    }
+    return parse_statement();
   }
 
   Function parse_function() {
@@ -199,7 +252,10 @@ export class Parser {
     expect(TokenType::RParen, "\")\"");
     expect(TokenType::LBrace, "\"{\"");
 
-    auto body = parse_statement();
+    std::vector<BlockItem> body;
+    while (!check(TokenType::RBrace) && !check(TokenType::Eof)) {
+      body.push_back(parse_block_item());
+    }
     expect(TokenType::RBrace, "\"}\"");
 
     return {std::move(name), std::move(body), line};

@@ -68,6 +68,16 @@ export {
                    NotEqual, LessThan, LessOrEqual, GreaterThan, GreaterOrEqual,
                    BitwiseAnd, BitwiseOr, BitwiseXor, ShiftLeft, ShiftRight>;
 
+  using CompoundOp =
+      std::variant<Add, Subtract, Multiply, Divide, Remainder, BitwiseAnd,
+                   BitwiseOr, BitwiseXor, ShiftLeft, ShiftRight>;
+
+  struct Increment {};
+
+  struct Decrement {};
+
+  using IncDecOp = std::variant<Increment, Decrement>;
+
   struct Exp;
 
   struct Var {
@@ -94,8 +104,23 @@ export {
     uint32_t line;
   };
 
+  struct CompoundAssignment {
+    CompoundOp op;
+    std::unique_ptr<Exp> left;
+    std::unique_ptr<Exp> right;
+    uint32_t line;
+  };
+
+  struct IncDec {
+    IncDecOp op;
+    std::unique_ptr<Exp> exp;
+    bool postfix;
+    uint32_t line;
+  };
+
   struct Exp {
-    std::variant<Constant, Var, Unary, Binary, Assignment> value;
+    std::variant<Constant, Var, Unary, Binary, Assignment, CompoundAssignment,
+                 IncDec> value;
   };
 
   struct Return {

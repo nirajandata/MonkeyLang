@@ -53,6 +53,27 @@ Variant match_token_to_variant(TokenType type) {
   return match_token_to_variant_impl<Variant>(type, std::make_index_sequence<std::variant_size_v<Variant>>{});
 }
 
+static std::optional<CompoundOp> compound_op(TokenType type) {
+  switch (type) {
+    case TokenType::AddAssign: return CompoundOp{Add{}};
+    case TokenType::SubtractAssign: return CompoundOp{Subtract{}};
+    case TokenType::MultiplyAssign: return CompoundOp{Multiply{}};
+    case TokenType::DivideAssign: return CompoundOp{Divide{}};
+    case TokenType::RemainderAssign: return CompoundOp{Remainder{}};
+    case TokenType::BitwiseAndAssign: return CompoundOp{BitwiseAnd{}};
+    case TokenType::BitwiseOrAssign: return CompoundOp{BitwiseOr{}};
+    case TokenType::BitwiseXorAssign: return CompoundOp{BitwiseXor{}};
+    case TokenType::ShiftLeftAssign: return CompoundOp{ShiftLeft{}};
+    case TokenType::ShiftRightAssign: return CompoundOp{ShiftRight{}};
+    default: return std::nullopt;
+  }
+}
+
+static IncDecOp inc_dec_op(TokenType type) {
+  return type == TokenType::Increment ? IncDecOp{Increment{}}
+                                       : IncDecOp{Decrement{}};
+}
+
 export class Parser {
   const std::vector<Token>& tokens_;
   size_t pos_ = 0;
@@ -105,12 +126,19 @@ export class Parser {
       return Exp{Var{std::string(tok.text), tok.line}};
     }
 
+    if (tok.type == TokenType::Increment || tok.type == TokenType::Decrement) {
+      advance();
+      return Exp{IncDec{inc_dec_op(tok.type),
+                         std::make_unique<Exp>(parse_postfix()), false,
+                         tok.line}};
+    }
+
     if (tok.type == TokenType::Complement || tok.type == TokenType::Subtract || tok.type == TokenType::Not) {
       advance();
       UnaryOp op = (tok.type == TokenType::Complement) ? UnaryOp{Complement{}}
                  : (tok.type == TokenType::Subtract) ? UnaryOp{Negate{}}
                  : UnaryOp{Not{}};
-      return Exp{Unary{std::move(op), std::make_unique<Exp>(parse_primary()), tok.line}};
+      return Exp{Unary{std::move(op), std::make_unique<Exp>(parse_postfix()), tok.line}};
     }
 
     if (tok.type == TokenType::LParen) {
@@ -120,22 +148,35 @@ export class Parser {
       return inner;
     }
 
-    if (tok.type == TokenType::Decrement) {
-      std::println("error:{}: Unexpected '--'", tok.line);
-      had_error_ = true;
-      advance();
-      return Exp{Constant{0, tok.line}};
-    }
-
     std::println("error:{}: Expected expression but found '{}'", tok.line, tok.text);
     had_error_ = true;
     advance();
     return Exp{Constant{0, tok.line}};
   }
 
+  Exp parse_postfix() {
+    auto exp = parse_primary();
+    while (check(TokenType::Increment) || check(TokenType::Decrement)) {
+      auto tok = advance();
+      exp = Exp{IncDec{inc_dec_op(tok.type),
+                        std::make_unique<Exp>(std::move(exp)), true, tok.line}};
+    }
+    return exp;
+  }
+
   static int binary_prec(TokenType type) {
     switch (type) {
-      case TokenType::Assign: return 1;
+      case TokenType::Assign:
+      case TokenType::AddAssign:
+      case TokenType::SubtractAssign:
+      case TokenType::MultiplyAssign:
+      case TokenType::DivideAssign:
+      case TokenType::RemainderAssign:
+      case TokenType::BitwiseAndAssign:
+      case TokenType::BitwiseOrAssign:
+      case TokenType::BitwiseXorAssign:
+      case TokenType::ShiftLeftAssign:
+      case TokenType::ShiftRightAssign: return 1;
       case TokenType::Or: return 5;
       case TokenType::And: return 10;
       case TokenType::BitwiseOr: return 15;
@@ -159,7 +200,7 @@ export class Parser {
   }
 
   Exp parse_exp(int min_prec) {
-    auto left = parse_primary();
+    auto left = parse_postfix();
 
     while (true) {
       int prec = binary_prec(peek().type);
@@ -169,6 +210,13 @@ export class Parser {
       if (tok.type == TokenType::Assign) {
         auto right = parse_exp(prec);
         left = Exp{Assignment{
+            std::make_unique<Exp>(std::move(left)),
+            std::make_unique<Exp>(std::move(right)),
+            tok.line}};
+      } else if (auto op = compound_op(tok.type)) {
+        auto right = parse_exp(prec);
+        left = Exp{CompoundAssignment{
+            std::move(*op),
             std::make_unique<Exp>(std::move(left)),
             std::make_unique<Exp>(std::move(right)),
             tok.line}};

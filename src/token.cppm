@@ -39,7 +39,18 @@ export enum class TokenType : uint32_t {
   ShiftLeft,
   ShiftRight,
   Error,
-  Eof
+  Eof,
+  Increment,
+  AddAssign,
+  SubtractAssign,
+  MultiplyAssign,
+  DivideAssign,
+  RemainderAssign,
+  BitwiseAndAssign,
+  BitwiseOrAssign,
+  BitwiseXorAssign,
+  ShiftLeftAssign,
+  ShiftRightAssign
 };
 
 export struct Token {

@@ -282,6 +282,11 @@ public:
       return (cursor_ + 1 < limit_ && cursor_[1] == expected);
     };
 
+    auto match2 = [&](char first, char second) -> bool {
+      return limit_ - cursor_ > 2 && cursor_[1] == first &&
+             cursor_[2] == second;
+    };
+
     while (cursor_ < limit_) {
       skip_whitespace();
       if (cursor_ >= limit_)
@@ -305,14 +310,20 @@ public:
           } else if (match('*')) {
             cursor_ += 2;
             skip_block_comment();
-          } else
+          } else if (match('=')) {
+            emit(TokenType::DivideAssign, 2);
+          } else {
             emit(TokenType::Divide, 1);
+          }
           break;
         case '-':
-          if (match('-'))
+          if (match('-')) {
             emit(TokenType::Decrement, 2);
-          else
+          } else if (match('=')) {
+            emit(TokenType::SubtractAssign, 2);
+          } else {
             emit(TokenType::Subtract, 1);
+          }
           break;
         case '!':
           if (match('='))
@@ -321,16 +332,22 @@ public:
             emit(TokenType::Not, 1);
           break;
         case '&':
-          if (match('&'))
+          if (match('&')) {
             emit(TokenType::And, 2);
-          else
+          } else if (match('=')) {
+            emit(TokenType::BitwiseAndAssign, 2);
+          } else {
             emit(TokenType::BitwiseAnd, 1);
+          }
           break;
         case '|':
-          if (match('|'))
+          if (match('|')) {
             emit(TokenType::Or, 2);
-          else
+          } else if (match('=')) {
+            emit(TokenType::BitwiseOrAssign, 2);
+          } else {
             emit(TokenType::BitwiseOr, 1);
+          }
           break;
         case '=':
           if (match('='))
@@ -340,23 +357,33 @@ public:
           }
           break;
         case '<':
-          if (match('='))
+          if (match2('<', '=')) {
+            emit(TokenType::ShiftLeftAssign, 3);
+          } else if (match('=')) {
             emit(TokenType::LessOrEqual, 2);
-          else if (match('<'))
+          } else if (match('<')) {
             emit(TokenType::ShiftLeft, 2);
-          else
+          } else {
             emit(TokenType::LessThan, 1);
+          }
           break;
         case '>':
-          if (match('='))
+          if (match2('>', '=')) {
+            emit(TokenType::ShiftRightAssign, 3);
+          } else if (match('=')) {
             emit(TokenType::GreaterOrEqual, 2);
-          else if (match('>'))
+          } else if (match('>')) {
             emit(TokenType::ShiftRight, 2);
-          else
+          } else {
             emit(TokenType::GreaterThan, 1);
+          }
           break;
         case '^':
-          emit(TokenType::BitwiseXor, 1);
+          if (match('=')) {
+            emit(TokenType::BitwiseXorAssign, 2);
+          } else {
+            emit(TokenType::BitwiseXor, 1);
+          }
           break;
         case '(':
           emit(TokenType::LParen, 1);
@@ -377,13 +404,27 @@ public:
           emit(TokenType::Complement, 1);
           break;
         case '+':
-          emit(TokenType::Add, 1);
+          if (match('+')) {
+            emit(TokenType::Increment, 2);
+          } else if (match('=')) {
+            emit(TokenType::AddAssign, 2);
+          } else {
+            emit(TokenType::Add, 1);
+          }
           break;
         case '*':
-          emit(TokenType::Multiply, 1);
+          if (match('=')) {
+            emit(TokenType::MultiplyAssign, 2);
+          } else {
+            emit(TokenType::Multiply, 1);
+          }
           break;
         case '%':
-          emit(TokenType::Remainder, 1);
+          if (match('=')) {
+            emit(TokenType::RemainderAssign, 2);
+          } else {
+            emit(TokenType::Remainder, 1);
+          }
           break;
         default:
           had_error_ = true;

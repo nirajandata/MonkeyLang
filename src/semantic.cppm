@@ -23,8 +23,15 @@ class VariableResolver {
   std::unordered_map<std::string, std::string> variables_;
   bool had_error_ = false;
 
-  std::string make_unique_name(std::string_view name) {
+  static std::string make_unique_name(const std::string_view name) {
     return std::string(name) + "." + std::to_string(next_name_id());
+  }
+
+  void validate_lvalue(const Exp &exp, uint32_t line) {
+    if (!std::holds_alternative<Var>(exp.value)) {
+      std::println("error:{}: Expression is not a valid lvalue", line);
+      had_error_ = true;
+    }
   }
 
   void resolve_exp(Exp &exp) {
@@ -32,7 +39,7 @@ class VariableResolver {
         Overload{
             [](Constant &) {},
             [&](Var &v) {
-              auto it = variables_.find(v.name);
+              const auto it = variables_.find(v.name);
               if (it == variables_.end()) {
                 std::println("error:{}: Undeclared variable '{}'", v.line,
                              v.name);
@@ -41,19 +48,24 @@ class VariableResolver {
               }
               v.name = it->second;
             },
-            [&](Unary &u) { resolve_exp(*u.exp); },
-            [&](Binary &b) {
+            [&](const Unary &u) { resolve_exp(*u.exp); },
+            [&](const Binary &b) {
               resolve_exp(*b.left);
               resolve_exp(*b.right);
             },
             [&](Assignment &a) {
-              if (!std::holds_alternative<Var>(a.left->value)) {
-                std::println(
-                    "error:{}: Expression is not a valid lvalue", a.line);
-                had_error_ = true;
-              }
+              validate_lvalue(*a.left, a.line);
               resolve_exp(*a.left);
               resolve_exp(*a.right);
+            },
+            [&](CompoundAssignment &a) {
+              validate_lvalue(*a.left, a.line);
+              resolve_exp(*a.left);
+              resolve_exp(*a.right);
+            },
+            [&](IncDec &e) {
+              validate_lvalue(*e.exp, e.line);
+              resolve_exp(*e.exp);
             },
         },
         exp.value);

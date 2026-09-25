@@ -64,6 +64,22 @@ static void pretty_print(const Exp& exp, int indent = 0) {
           pretty_print(*a.right, indent + 2);
           std::println("{})", pad);
       },
+      [&](const CompoundAssignment& a) {
+          std::string_view op_name = std::visit(get_type_name, a.op);
+          std::println("{}{}(", pad, std::meta::identifier_of(^^CompoundAssignment));
+          std::println("{}  {},", pad, op_name);
+          pretty_print(*a.left, indent + 2);
+          pretty_print(*a.right, indent + 2);
+          std::println("{})", pad);
+      },
+      [&](const IncDec& e) {
+          std::string_view op_name = std::visit(get_type_name, e.op);
+          std::println("{}{}(", pad, std::meta::identifier_of(^^IncDec));
+          std::println("{}  {},", pad, op_name);
+          std::println("{}  {},", pad, e.postfix ? "postfix" : "prefix");
+          pretty_print(*e.exp, indent + 2);
+          std::println("{})", pad);
+      },
       [&](const Unary& u) {
           std::string_view op_name = std::visit(get_type_name, u.op);
 

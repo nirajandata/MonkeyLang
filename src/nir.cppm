@@ -176,6 +176,49 @@ class NirEmitter {
                    return left;
                  },
 
+                 [&](const CompoundAssignment &a) -> NirVal {
+                   auto left = emit_val(*a.left, instructions);
+                   auto old = NirVal{NirVar{make_temporary()}};
+                   instructions.push_back(NirCopy{left, old});
+                   auto right = emit_val(*a.right, instructions);
+                   auto dst = NirVal{NirVar{make_temporary()}};
+
+                   auto op = std::visit(
+                       [&](const auto &value) {
+                         using OpType = std::decay_t<decltype(value)>;
+                         return reflect_to_enum<OpType, NirBinaryOp>();
+                       },
+                       a.op);
+                   instructions.push_back(
+                       NirBinary{op, old, std::move(right), dst});
+                   instructions.push_back(NirCopy{dst, left});
+                   return left;
+                 },
+
+                 [&](const IncDec &e) -> NirVal {
+                   auto value = emit_val(*e.exp, instructions);
+                   auto next = NirVal{NirVar{make_temporary()}};
+                   auto old = e.postfix
+                                  ? NirVal{NirVar{make_temporary()}}
+                                  : NirVal{};
+                   if (e.postfix) instructions.push_back(NirCopy{value, old});
+
+                   auto op = std::visit(
+                       [&](const auto &value) {
+                         using OpType = std::decay_t<decltype(value)>;
+                         if constexpr (std::is_same_v<OpType, Increment>) {
+                           return NirBinaryOp::Add;
+                         } else {
+                           return NirBinaryOp::Subtract;
+                         }
+                       },
+                       e.op);
+                   instructions.push_back(
+                       NirBinary{op, value, NirConstant{1}, next});
+                   instructions.push_back(NirCopy{next, value});
+                   return e.postfix ? old : value;
+                 },
+
                  [&](const Unary &u) -> NirVal {
                    return std::visit(
                        [&](const auto &op) -> NirVal {

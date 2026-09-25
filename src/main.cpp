@@ -12,16 +12,18 @@ import token;
 import ast;
 import lexer;
 import parser;
+import semantic;
 import nir;
 import codegen;
 
-enum class Stage : std::uint8_t { Lex, Parse, Nir, CodeGen, EmitAsm, Run };
+enum class Stage : std::uint8_t { Lex, Parse, Validate, Nir, CodeGen, EmitAsm, Run };
 
 static std::optional<Stage> parse_stage(std::string_view arg) {
-    if (arg == "--lex")     return Stage::Lex;
-    if (arg == "--parse")   return Stage::Parse;
-    if (arg == "--nir")   return Stage::Nir;
-    if (arg == "--codegen") return Stage::CodeGen;
+    if (arg == "--lex")      return Stage::Lex;
+    if (arg == "--parse")    return Stage::Parse;
+    if (arg == "--validate") return Stage::Validate;
+    if (arg == "--tacky" || arg == "--nir") return Stage::Nir;
+    if (arg == "--codegen")  return Stage::CodeGen;
     if (arg == "-S")        return Stage::EmitAsm;
     return std::nullopt;
 }
@@ -124,7 +126,7 @@ static void pretty_print(const Program& program, int indent = 0) {
 
 int main(int argc, char *argv[]) {
     if (argc < 2 || argc > 3) {
-        std::println("Usage: mcc [--lex | --parse | --nir | --codegen | -S] <file.c>");
+        std::println("Usage: mcc [--lex | --parse | --validate | --tacky | --codegen | -S] <file.c>");
         return 1;
     }
 
@@ -165,6 +167,10 @@ int main(int argc, char *argv[]) {
         pretty_print(*program);
         return 0;
     }
+
+    if (!resolve_variables(*program)) return 1;
+
+    if (stage == Stage::Validate) return 0;
 
     if (stage == Stage::Nir) {
         emit_nir(*program);

@@ -12,6 +12,7 @@ module;
 export module nir;
 
 import ast;
+import semantic;
 
 export {
   struct NirConstant {
@@ -107,15 +108,12 @@ consteval TargetEnum reflect_to_enum() {
 }
 
 class NirEmitter {
-  int temp_counter = 0;
-  int label_counter = 0;
-
   std::string make_temporary() {
-    return "tmp." + std::to_string(temp_counter++);
+    return "tmp." + std::to_string(next_name_id());
   }
 
   std::string make_label(std::string_view prefix) {
-    return std::string(prefix) + "." + std::to_string(label_counter++);
+    return std::string(prefix) + "." + std::to_string(next_name_id());
   }
 
   NirVal emit_and(const Binary &b,
@@ -174,8 +172,7 @@ class NirEmitter {
                  [&](const Assignment &a) -> NirVal {
                    auto right = emit_val(*a.right, instructions);
                    auto left = emit_val(*a.left, instructions);
-                   instructions.push_back(
-                       NirCopy{std::move(right), std::move(left)});
+                   instructions.push_back(NirCopy{std::move(right), left});
                    return left;
                  },
 
@@ -219,27 +216,32 @@ class NirEmitter {
         exp.value);
   }
 
-  void emit_statement(const Statement &stmt,
+  bool emit_statement(const Statement &stmt,
                        std::vector<NirInstruction> &instructions) {
-    std::visit(
+    return std::visit(
         Overload{
             [&](const Return &r) {
               instructions.push_back(
                   NirReturn{emit_val(r.value, instructions)});
+              return true;
             },
-            [&](const Expression &e) { emit_val(e.value, instructions); },
-            [&](const Null &) {},
+            [&](const Expression &e) {
+              emit_val(e.value, instructions);
+              return false;
+            },
+            [&](const Null &) { return false; },
         },
         stmt);
   }
 
   NirFunction emit_function(const Function &func) {
     std::vector<NirInstruction> instructions;
+    bool has_return = false;
     for (const auto &item : func.body) {
       std::visit(
           Overload{
               [&](const Statement &stmt) {
-                emit_statement(stmt, instructions);
+                has_return |= emit_statement(stmt, instructions);
               },
               [&](const Declaration &d) {
                 if (d.init) {
@@ -250,6 +252,10 @@ class NirEmitter {
               },
           },
           item);
+    }
+
+    if (!has_return) {
+      instructions.push_back(NirReturn{NirConstant{0}});
     }
 
     return {std::string(func.name), std::move(instructions)};

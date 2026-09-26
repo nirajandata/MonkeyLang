@@ -112,7 +112,6 @@ class VariableResolver {
         Overload{
             [&](Statement &stmt) { resolve_statement(stmt); },
             [&](Declaration &d) {
-              if (d.init) resolve_exp(*d.init);
               if (scopes_.back().contains(d.name)) {
                 std::println("error:{}: Duplicate variable '{}'", d.line,
                              d.name);
@@ -122,6 +121,7 @@ class VariableResolver {
                 scopes_.back().emplace(d.name, unique_name);
                 d.name = std::move(unique_name);
               }
+              if (d.init) resolve_exp(*d.init);
             },
         },
         item);

@@ -161,6 +161,8 @@ private:
       type = TokenType::If;
     else if (text.size() == 4 && text == "else")
       type = TokenType::Else;
+    else if (text.size() == 4 && text == "goto")
+      type = TokenType::Goto;
 
     return {type, text, current_line_};
   }

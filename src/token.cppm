@@ -54,7 +54,8 @@ export enum class TokenType : uint32_t {
   If,
   Else,
   QuestionMark,
-  Colon
+  Colon,
+  Goto
 };
 
 export struct Token {

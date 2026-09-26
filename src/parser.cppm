@@ -80,7 +80,7 @@ export class Parser {
   bool had_error_ = false;
   std::string_view filename_;
 
-  const Token& peek() const { return tokens_[pos_]; }
+  const Token& peek(size_t offset = 0) const { return tokens_[pos_ + offset]; }
 
   Token advance() { return tokens_[pos_++]; }
 
@@ -269,6 +269,37 @@ export class Parser {
                        std::move(else_stmt), line}};
   }
 
+  Statement parse_goto() {
+    uint32_t line = peek().line;
+    expect(TokenType::Goto, "\"goto\"");
+
+    const Token& name_tok = advance();
+    if (name_tok.type != TokenType::Identifier) {
+      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
+      had_error_ = true;
+    }
+    std::string name(name_tok.text);
+
+    expect(TokenType::Semicolon, "\";\"");
+    return Statement{Goto{std::move(name), line}};
+  }
+
+  Statement parse_label() {
+    uint32_t line = peek().line;
+
+    const Token& name_tok = advance();
+    if (name_tok.type != TokenType::Identifier) {
+      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
+      had_error_ = true;
+    }
+    std::string name(name_tok.text);
+
+    expect(TokenType::Colon, "\":\"");
+
+    auto stmt = std::make_unique<Statement>(parse_statement());
+    return Statement{Label{std::move(name), std::move(stmt), line}};
+  }
+
   Statement parse_statement() {
     if (check(TokenType::Return)) {
       return Statement{parse_return()};
@@ -276,6 +307,14 @@ export class Parser {
 
     if (check(TokenType::If)) {
       return parse_if();
+    }
+
+    if (check(TokenType::Goto)) {
+      return parse_goto();
+    }
+
+    if (check(TokenType::Identifier) && peek(1).type == TokenType::Colon) {
+      return parse_label();
     }
 
     if (check(TokenType::Semicolon)) {

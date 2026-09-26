@@ -7,6 +7,7 @@ module;
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <vector>
 
 export module semantic;
 
@@ -87,6 +88,8 @@ class VariableResolver {
               resolve_statement(*i.then_stmt);
               if (i.else_stmt) resolve_statement(*i.else_stmt);
             },
+            [&](Goto &) {},
+            [&](Label &l) { resolve_statement(*l.stmt); },
         },
         stmt.value);
   }
@@ -117,6 +120,63 @@ public:
     return !had_error_;
   }
 };
+
+class LabelResolver {
+  std::unordered_map<std::string, std::string> labels_;
+  std::vector<Label *> defined_labels_;
+  std::vector<Goto *> gotos_;
+  bool had_error_ = false;
+
+  static std::string make_unique_name(const std::string_view name) {
+    return std::string(name) + "." + std::to_string(next_name_id());
+  }
+
+  void record_statement(Statement &stmt) {
+    if (auto *l = std::get_if<Label>(&stmt.value)) {
+      defined_labels_.push_back(l);
+      record_statement(*l->stmt);
+    } else if (auto *i = std::get_if<If>(&stmt.value)) {
+      record_statement(*i->then_stmt);
+      if (i->else_stmt) record_statement(*i->else_stmt);
+    } else if (auto *g = std::get_if<Goto>(&stmt.value)) {
+      gotos_.push_back(g);
+    }
+  }
+
+  void resolve_definitions() {
+    for (Label *l : defined_labels_) {
+      if (labels_.contains(l->name)) {
+        std::println("error:{}: Duplicate label '{}'", l->line, l->name);
+        had_error_ = true;
+      } else {
+        labels_.emplace(l->name, make_unique_name(l->name));
+      }
+      l->name = labels_.at(l->name);
+    }
+  }
+
+  void resolve_gotos() {
+    for (Goto *g : gotos_) {
+      const auto it = labels_.find(g->label);
+      if (it == labels_.end()) {
+        std::println("error:{}: Undeclared label '{}'", g->line, g->label);
+        had_error_ = true;
+      } else {
+        g->label = it->second;
+      }
+    }
+  }
+
+public:
+  bool resolve(Program &program) {
+    for (auto &item : program.function.body) {
+      if (auto *stmt = std::get_if<Statement>(&item)) record_statement(*stmt);
+    }
+    resolve_definitions();
+    resolve_gotos();
+    return !had_error_;
+  }
+};
 }
 
 export std::uint64_t next_name_id() {
@@ -125,5 +185,10 @@ export std::uint64_t next_name_id() {
 
 export bool resolve_variables(Program &program) {
   VariableResolver resolver;
+  return resolver.resolve(program);
+}
+
+export bool resolve_labels(Program &program) {
+  LabelResolver resolver;
   return resolver.resolve(program);
 }

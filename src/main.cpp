@@ -131,6 +131,14 @@ static void pretty_print(const Statement& stmt, int indent = 0) {
         if (i.else_stmt) pretty_print(*i.else_stmt, indent + 2);
         std::println("{})", pad);
       },
+      [&](const Goto& g) {
+        std::println("{}{}(\"{}\")", pad, std::meta::identifier_of(^^Goto), g.label);
+      },
+      [&](const Label& l) {
+        std::println("{}{}(\"{}\"", pad, std::meta::identifier_of(^^Label), l.name);
+        pretty_print(*l.stmt, indent + 2);
+        std::println("{})", pad);
+      },
   }, stmt.value);
 }
 
@@ -203,6 +211,8 @@ int main(int argc, char *argv[]) {
         pretty_print(*program);
         return 0;
     }
+
+    if (!resolve_labels(*program)) return 1;
 
     if (!resolve_variables(*program)) return 1;
 

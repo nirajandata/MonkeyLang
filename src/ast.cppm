@@ -151,8 +151,19 @@ export {
     uint32_t line;
   };
 
+  struct Goto {
+    std::string label;
+    uint32_t line;
+  };
+
+  struct Label {
+    std::string name;
+    std::unique_ptr<Statement> stmt;
+    uint32_t line;
+  };
+
   struct Statement {
-    std::variant<Return, Expression, Null, If> value;
+    std::variant<Return, Expression, Null, If, Goto, Label> value;
   };
 
   struct Declaration {

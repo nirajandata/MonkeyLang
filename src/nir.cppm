@@ -320,6 +320,14 @@ class NirEmitter {
               instructions.push_back(NirLabel{end_label});
               return then_returns && else_returns;
             },
+            [&](const Goto &g) {
+              instructions.push_back(NirJump{g.label});
+              return false;
+            },
+            [&](const Label &l) {
+              instructions.push_back(NirLabel{l.name});
+              return emit_statement(*l.stmt, instructions);
+            },
         },
         stmt.value);
   }

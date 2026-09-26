@@ -286,20 +286,16 @@ class NirEmitter {
         exp.value);
   }
 
-  bool emit_statement(const Statement &stmt,
-                       std::vector<NirInstruction> &instructions) {
-    return std::visit(
+  void emit_statement(const Statement &stmt,
+                      std::vector<NirInstruction> &instructions) {
+    std::visit(
         Overload{
             [&](const Return &r) {
               instructions.push_back(
                   NirReturn{emit_val(r.value, instructions)});
-              return true;
             },
-            [&](const Expression &e) {
-              emit_val(e.value, instructions);
-              return false;
-            },
-            [&](const Null &) { return false; },
+            [&](const Expression &e) { emit_val(e.value, instructions); },
+            [&](const Null &) {},
             [&](const If &i) {
               auto then_label = make_label("then");
               auto else_label = make_label("else");
@@ -309,64 +305,51 @@ class NirEmitter {
               instructions.push_back(
                   NirJumpIfZero{std::move(condition), else_label});
 
-              bool then_returns = emit_statement(*i.then_stmt, instructions);
+              emit_statement(*i.then_stmt, instructions);
               instructions.push_back(NirJump{end_label});
               instructions.push_back(NirLabel{else_label});
 
-              bool else_returns =
-                  i.else_stmt ? emit_statement(*i.else_stmt, instructions)
-                              : false;
+              if (i.else_stmt) emit_statement(*i.else_stmt, instructions);
 
               instructions.push_back(NirLabel{end_label});
-              return then_returns && else_returns;
             },
             [&](const Goto &g) {
               instructions.push_back(NirJump{g.label});
-              return false;
             },
             [&](const Label &l) {
               instructions.push_back(NirLabel{l.name});
-              return emit_statement(*l.stmt, instructions);
+              emit_statement(*l.stmt, instructions);
             },
-            [&](const Compound &c) {
-              bool returns = false;
-              for (const auto &item : c.block->items) {
-                returns |= emit_block_item(item, instructions);
-              }
-              return returns;
-            },
+            [&](const Compound &c) { emit_block(*c.block, instructions); },
         },
         stmt.value);
   }
 
-  bool emit_block_item(const BlockItem &item,
+  void emit_block_item(const BlockItem &item,
                        std::vector<NirInstruction> &instructions) {
-    return std::visit(
+    std::visit(
         Overload{
-            [&](const Statement &stmt) {
-              return emit_statement(stmt, instructions);
-            },
+            [&](const Statement &stmt) { emit_statement(stmt, instructions); },
             [&](const Declaration &d) {
               if (d.init) {
                 auto val = emit_val(*d.init, instructions);
                 instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
               }
-              return false;
             },
         },
         item);
   }
 
+  void emit_block(const Block &block,
+                  std::vector<NirInstruction> &instructions) {
+    for (const auto &item : block.items) emit_block_item(item, instructions);
+  }
+
   NirFunction emit_function(const Function &func) {
     std::vector<NirInstruction> instructions;
-    bool has_return = false;
-    for (const auto &item : func.body.items) {
-      has_return |= emit_block_item(item, instructions);
-    }
+    emit_block(func.body, instructions);
 
-    if (!has_return) {
-      instructions.push_back(NirReturn{NirConstant{0}});
-    }
+    instructions.push_back(NirReturn{NirConstant{0}});
 
     return {std::string(func.name), std::move(instructions)};
   }

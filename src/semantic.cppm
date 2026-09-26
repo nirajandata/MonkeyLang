@@ -67,6 +67,11 @@ class VariableResolver {
               validate_lvalue(*e.exp, e.line);
               resolve_exp(*e.exp);
             },
+            [&](const Conditional &c) {
+              resolve_exp(*c.condition);
+              resolve_exp(*c.then_exp);
+              resolve_exp(*c.else_exp);
+            },
         },
         exp.value);
   }
@@ -77,8 +82,13 @@ class VariableResolver {
             [&](Return &r) { resolve_exp(r.value); },
             [&](Expression &e) { resolve_exp(e.value); },
             [&](Null &) {},
+            [&](If &i) {
+              resolve_exp(i.condition);
+              resolve_statement(*i.then_stmt);
+              if (i.else_stmt) resolve_statement(*i.else_stmt);
+            },
         },
-        stmt);
+        stmt.value);
   }
 
   void resolve_block_item(BlockItem &item) {

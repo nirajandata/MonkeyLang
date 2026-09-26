@@ -118,9 +118,16 @@ export {
     uint32_t line;
   };
 
+  struct Conditional {
+    std::unique_ptr<Exp> condition;
+    std::unique_ptr<Exp> then_exp;
+    std::unique_ptr<Exp> else_exp;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<Constant, Var, Unary, Binary, Assignment, CompoundAssignment,
-                 IncDec> value;
+                 IncDec, Conditional> value;
   };
 
   struct Return {
@@ -135,7 +142,18 @@ export {
 
   struct Null {};
 
-  using Statement = std::variant<Return, Expression, Null>;
+  struct Statement;
+
+  struct If {
+    Exp condition;
+    std::unique_ptr<Statement> then_stmt;
+    std::unique_ptr<Statement> else_stmt;
+    uint32_t line;
+  };
+
+  struct Statement {
+    std::variant<Return, Expression, Null, If> value;
+  };
 
   struct Declaration {
     std::string name;

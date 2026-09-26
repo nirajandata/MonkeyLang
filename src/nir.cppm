@@ -158,6 +158,29 @@ class NirEmitter {
     return dst;
   }
 
+  NirVal emit_conditional(const Conditional &c,
+                          std::vector<NirInstruction> &instructions) {
+    NirVal dst = NirVar{make_temporary()};
+    auto then_label = make_label("then");
+    auto else_label = make_label("else");
+    auto end_label = make_label("end");
+
+    auto condition = emit_val(*c.condition, instructions);
+    instructions.push_back(NirJumpIfZero{std::move(condition), else_label});
+
+    auto then_val = emit_val(*c.then_exp, instructions);
+    instructions.push_back(NirCopy{std::move(then_val), dst});
+    instructions.push_back(NirJump{end_label});
+    instructions.push_back(NirLabel{else_label});
+
+    auto else_val = emit_val(*c.else_exp, instructions);
+    instructions.push_back(NirCopy{std::move(else_val), dst});
+
+    instructions.push_back(NirLabel{then_label});
+    instructions.push_back(NirLabel{end_label});
+    return dst;
+  }
+
   NirVal emit_val(const Exp &exp,
                     std::vector<NirInstruction> &instructions) {
     return std::visit(
@@ -255,7 +278,11 @@ class NirEmitter {
                          }
                        },
                        b.op);
-                 }},
+                  },
+
+                  [&](const Conditional &c) -> NirVal {
+                    return emit_conditional(c, instructions);
+                  }},
         exp.value);
   }
 
@@ -273,8 +300,28 @@ class NirEmitter {
               return false;
             },
             [&](const Null &) { return false; },
+            [&](const If &i) {
+              auto then_label = make_label("then");
+              auto else_label = make_label("else");
+              auto end_label = make_label("end");
+
+              auto condition = emit_val(i.condition, instructions);
+              instructions.push_back(
+                  NirJumpIfZero{std::move(condition), else_label});
+
+              bool then_returns = emit_statement(*i.then_stmt, instructions);
+              instructions.push_back(NirJump{end_label});
+              instructions.push_back(NirLabel{else_label});
+
+              bool else_returns =
+                  i.else_stmt ? emit_statement(*i.else_stmt, instructions)
+                              : false;
+
+              instructions.push_back(NirLabel{end_label});
+              return then_returns && else_returns;
+            },
         },
-        stmt);
+        stmt.value);
   }
 
   NirFunction emit_function(const Function &func) {

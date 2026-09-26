@@ -177,6 +177,7 @@ export class Parser {
       case TokenType::BitwiseXorAssign:
       case TokenType::ShiftLeftAssign:
       case TokenType::ShiftRightAssign: return 1;
+      case TokenType::QuestionMark: return 2;
       case TokenType::Or: return 5;
       case TokenType::And: return 10;
       case TokenType::BitwiseOr: return 15;
@@ -220,6 +221,15 @@ export class Parser {
             std::make_unique<Exp>(std::move(left)),
             std::make_unique<Exp>(std::move(right)),
             tok.line}};
+      } else if (tok.type == TokenType::QuestionMark) {
+        auto middle = parse_exp(0);
+        expect(TokenType::Colon, "\":\"");
+        auto right = parse_exp(prec);
+        left = Exp{Conditional{
+            std::make_unique<Exp>(std::move(left)),
+            std::make_unique<Exp>(std::move(middle)),
+            std::make_unique<Exp>(std::move(right)),
+            tok.line}};
       } else {
         left = Exp{Binary{
             match_token_to_variant<BinaryOp>(tok.type),
@@ -240,20 +250,43 @@ export class Parser {
     return {std::move(val), line};
   }
 
+  Statement parse_if() {
+    uint32_t line = peek().line;
+    expect(TokenType::If, "\"if\"");
+    expect(TokenType::LParen, "\"(\"");
+    auto condition = parse_exp(0);
+    expect(TokenType::RParen, "\")\"");
+
+    auto then_stmt = std::make_unique<Statement>(parse_statement());
+
+    std::unique_ptr<Statement> else_stmt;
+    if (check(TokenType::Else)) {
+      advance();
+      else_stmt = std::make_unique<Statement>(parse_statement());
+    }
+
+    return Statement{If{std::move(condition), std::move(then_stmt),
+                       std::move(else_stmt), line}};
+  }
+
   Statement parse_statement() {
     if (check(TokenType::Return)) {
-      return parse_return();
+      return Statement{parse_return()};
+    }
+
+    if (check(TokenType::If)) {
+      return parse_if();
     }
 
     if (check(TokenType::Semicolon)) {
       advance();
-      return Null{};
+      return Statement{Null{}};
     }
 
     uint32_t line = peek().line;
     auto exp = parse_exp(0);
     expect(TokenType::Semicolon, "\";\"");
-    return Expression{std::move(exp), line};
+    return Statement{Expression{std::move(exp), line}};
   }
 
   Declaration parse_declaration() {

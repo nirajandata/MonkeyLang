@@ -97,7 +97,41 @@ static void pretty_print(const Exp& exp, int indent = 0) {
           pretty_print(*b.right, indent + 2);
           std::println("{})", pad);
       },
+      [&](const Conditional& c) {
+          std::println("{}{}(", pad, std::meta::identifier_of(^^Conditional));
+          pretty_print(*c.condition, indent + 2);
+          pretty_print(*c.then_exp, indent + 2);
+          pretty_print(*c.else_exp, indent + 2);
+          std::println("{})", pad);
+      },
   }, exp.value);
+}
+
+static void pretty_print(const Statement& stmt, int indent = 0) {
+  std::string pad(indent * 2, ' ');
+
+  std::visit(Overload{
+      [&](const Return& r) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^Return));
+        pretty_print(r.value, indent + 2);
+        std::println("{})", pad);
+      },
+      [&](const Expression& e) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^Expression));
+        pretty_print(e.value, indent + 2);
+        std::println("{})", pad);
+      },
+      [&](const Null&) {
+        std::println("{}{}", pad, std::meta::identifier_of(^^Null));
+      },
+      [&](const If& i) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^If));
+        pretty_print(i.condition, indent + 2);
+        pretty_print(*i.then_stmt, indent + 2);
+        if (i.else_stmt) pretty_print(*i.else_stmt, indent + 2);
+        std::println("{})", pad);
+      },
+  }, stmt.value);
 }
 
 static void pretty_print(const Program& program, int indent = 0) {
@@ -111,21 +145,7 @@ static void pretty_print(const Program& program, int indent = 0) {
   for (const auto& item : program.function.body) {
     std::visit(Overload{
         [&](const Statement& s) {
-          std::visit(Overload{
-              [&](const Return& r) {
-                std::println("{}      {}(", pad, std::meta::identifier_of(^^Return));
-                pretty_print(r.value, indent + 4);
-                std::println("{}      )", pad);
-              },
-              [&](const Expression& e) {
-                std::println("{}      {}(", pad, std::meta::identifier_of(^^Expression));
-                pretty_print(e.value, indent + 4);
-                std::println("{}      )", pad);
-              },
-              [&](const Null&) {
-                std::println("{}      {}", pad, std::meta::identifier_of(^^Null));
-              },
-          }, s);
+          pretty_print(s, indent + 3);
         },
         [&](const Declaration& d) {
           std::println("{}      {}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);

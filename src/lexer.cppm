@@ -157,6 +157,10 @@ private:
       type = TokenType::Void;
     else if (text.size() == 6 && text == "return")
       type = TokenType::Return;
+    else if (text.size() == 2 && text == "if")
+      type = TokenType::If;
+    else if (text.size() == 4 && text == "else")
+      type = TokenType::Else;
 
     return {type, text, current_line_};
   }
@@ -399,6 +403,12 @@ public:
           break;
         case ';':
           emit(TokenType::Semicolon, 1);
+          break;
+        case '?':
+          emit(TokenType::QuestionMark, 1);
+          break;
+        case ':':
+          emit(TokenType::Colon, 1);
           break;
         case '~':
           emit(TokenType::Complement, 1);

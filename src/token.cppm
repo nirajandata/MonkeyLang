@@ -50,7 +50,11 @@ export enum class TokenType : uint32_t {
   BitwiseOrAssign,
   BitwiseXorAssign,
   ShiftLeftAssign,
-  ShiftRightAssign
+  ShiftRightAssign,
+  If,
+  Else,
+  QuestionMark,
+  Colon
 };
 
 export struct Token {

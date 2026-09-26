@@ -328,28 +328,40 @@ class NirEmitter {
               instructions.push_back(NirLabel{l.name});
               return emit_statement(*l.stmt, instructions);
             },
+            [&](const Compound &c) {
+              bool returns = false;
+              for (const auto &item : c.block->items) {
+                returns |= emit_block_item(item, instructions);
+              }
+              return returns;
+            },
         },
         stmt.value);
+  }
+
+  bool emit_block_item(const BlockItem &item,
+                       std::vector<NirInstruction> &instructions) {
+    return std::visit(
+        Overload{
+            [&](const Statement &stmt) {
+              return emit_statement(stmt, instructions);
+            },
+            [&](const Declaration &d) {
+              if (d.init) {
+                auto val = emit_val(*d.init, instructions);
+                instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
+              }
+              return false;
+            },
+        },
+        item);
   }
 
   NirFunction emit_function(const Function &func) {
     std::vector<NirInstruction> instructions;
     bool has_return = false;
-    for (const auto &item : func.body) {
-      std::visit(
-          Overload{
-              [&](const Statement &stmt) {
-                has_return |= emit_statement(stmt, instructions);
-              },
-              [&](const Declaration &d) {
-                if (d.init) {
-                  auto val = emit_val(*d.init, instructions);
-                  instructions.push_back(
-                      NirCopy{std::move(val), NirVar{d.name}});
-                }
-              },
-          },
-          item);
+    for (const auto &item : func.body.items) {
+      has_return |= emit_block_item(item, instructions);
     }
 
     if (!has_return) {

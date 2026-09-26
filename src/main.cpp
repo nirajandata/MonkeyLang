@@ -49,6 +49,8 @@ struct GetTypeName {
 };
 constexpr GetTypeName get_type_name{};
 
+static void pretty_print(const Block& block, int indent = 0);
+
 static void pretty_print(const Exp& exp, int indent = 0) {
   std::string pad(indent * 2, ' ');
   std::visit(Overload{
@@ -139,7 +141,31 @@ static void pretty_print(const Statement& stmt, int indent = 0) {
         pretty_print(*l.stmt, indent + 2);
         std::println("{})", pad);
       },
+      [&](const Compound& c) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^Compound));
+        pretty_print(*c.block, indent + 2);
+        std::println("{})", pad);
+      },
   }, stmt.value);
+}
+
+static void pretty_print(const Block& block, int indent) {
+  std::string pad(indent * 2, ' ');
+
+  std::println("{}{}(", pad, std::meta::identifier_of(^^Block));
+  for (const auto& item : block.items) {
+    std::visit(Overload{
+        [&](const Statement& s) {
+          pretty_print(s, indent + 1);
+        },
+        [&](const Declaration& d) {
+          std::println("{}{}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);
+          if (d.init) pretty_print(*d.init, indent + 2);
+          std::println("{})", pad);
+        },
+    }, item);
+  }
+  std::println("{})", pad);
 }
 
 static void pretty_print(const Program& program, int indent = 0) {
@@ -148,22 +174,7 @@ static void pretty_print(const Program& program, int indent = 0) {
   std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
   std::println("{}  {}(", pad, std::meta::identifier_of(^^Function));
   std::println("{}    name=\"{}\",", pad, program.function.name);
-  std::println("{}    body=[", pad);
-
-  for (const auto& item : program.function.body) {
-    std::visit(Overload{
-        [&](const Statement& s) {
-          pretty_print(s, indent + 3);
-        },
-        [&](const Declaration& d) {
-          std::println("{}      {}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);
-          if (d.init) pretty_print(*d.init, indent + 4);
-          std::println("{}      )", pad);
-        },
-    }, item);
-  }
-
-  std::println("{}    ]", pad);
+  pretty_print(program.function.body, indent + 2);
   std::println("{}  )", pad);
   std::println("{})", pad);
 }

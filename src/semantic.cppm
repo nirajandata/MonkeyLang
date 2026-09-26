@@ -21,11 +21,23 @@ export std::uint64_t next_name_id();
 
 namespace {
 class VariableResolver {
-  std::unordered_map<std::string, std::string> variables_;
+  std::vector<std::unordered_map<std::string, std::string>> scopes_;
   bool had_error_ = false;
 
   static std::string make_unique_name(const std::string_view name) {
     return std::string(name) + "." + std::to_string(next_name_id());
+  }
+
+  void enter_scope() { scopes_.emplace_back(); }
+
+  void leave_scope() { scopes_.pop_back(); }
+
+  const std::string *find_variable(const std::string &name) const {
+    for (auto scope = scopes_.rbegin(); scope != scopes_.rend(); ++scope) {
+      const auto it = scope->find(name);
+      if (it != scope->end()) return &it->second;
+    }
+    return nullptr;
   }
 
   void validate_lvalue(const Exp &exp, uint32_t line) {
@@ -40,14 +52,14 @@ class VariableResolver {
         Overload{
             [](Constant &) {},
             [&](Var &v) {
-              const auto it = variables_.find(v.name);
-              if (it == variables_.end()) {
+              const std::string *unique_name = find_variable(v.name);
+              if (!unique_name) {
                 std::println("error:{}: Undeclared variable '{}'", v.line,
                              v.name);
                 had_error_ = true;
                 return;
               }
-              v.name = it->second;
+              v.name = *unique_name;
             },
             [&](const Unary &u) { resolve_exp(*u.exp); },
             [&](const Binary &b) {
@@ -90,6 +102,7 @@ class VariableResolver {
             },
             [&](Goto &) {},
             [&](Label &l) { resolve_statement(*l.stmt); },
+            [&](Compound &c) { resolve_block(*c.block); },
         },
         stmt.value);
   }
@@ -99,24 +112,30 @@ class VariableResolver {
         Overload{
             [&](Statement &stmt) { resolve_statement(stmt); },
             [&](Declaration &d) {
-              if (variables_.contains(d.name)) {
+              if (d.init) resolve_exp(*d.init);
+              if (scopes_.back().contains(d.name)) {
                 std::println("error:{}: Duplicate variable '{}'", d.line,
                              d.name);
                 had_error_ = true;
               } else {
                 auto unique_name = make_unique_name(d.name);
-                variables_.emplace(d.name, unique_name);
+                scopes_.back().emplace(d.name, unique_name);
                 d.name = std::move(unique_name);
               }
-              if (d.init) resolve_exp(*d.init);
             },
         },
         item);
   }
 
+  void resolve_block(Block &block) {
+    enter_scope();
+    for (auto &item : block.items) resolve_block_item(item);
+    leave_scope();
+  }
+
 public:
   bool resolve(Program &program) {
-    for (auto &item : program.function.body) resolve_block_item(item);
+    resolve_block(program.function.body);
     return !had_error_;
   }
 };
@@ -138,8 +157,16 @@ class LabelResolver {
     } else if (auto *i = std::get_if<If>(&stmt.value)) {
       record_statement(*i->then_stmt);
       if (i->else_stmt) record_statement(*i->else_stmt);
+    } else if (auto *c = std::get_if<Compound>(&stmt.value)) {
+      record_block(*c->block);
     } else if (auto *g = std::get_if<Goto>(&stmt.value)) {
       gotos_.push_back(g);
+    }
+  }
+
+  void record_block(Block &block) {
+    for (auto &item : block.items) {
+      if (auto *stmt = std::get_if<Statement>(&item)) record_statement(*stmt);
     }
   }
 
@@ -169,9 +196,7 @@ class LabelResolver {
 
 public:
   bool resolve(Program &program) {
-    for (auto &item : program.function.body) {
-      if (auto *stmt = std::get_if<Statement>(&item)) record_statement(*stmt);
-    }
+    record_block(program.function.body);
     resolve_definitions();
     resolve_gotos();
     return !had_error_;

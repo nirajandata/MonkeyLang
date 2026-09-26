@@ -162,8 +162,15 @@ export {
     uint32_t line;
   };
 
+  struct Block;
+
+  struct Compound {
+    std::unique_ptr<Block> block;
+    uint32_t line;
+  };
+
   struct Statement {
-    std::variant<Return, Expression, Null, If, Goto, Label> value;
+    std::variant<Return, Expression, Null, If, Goto, Label, Compound> value;
   };
 
   struct Declaration {
@@ -174,9 +181,13 @@ export {
 
   using BlockItem = std::variant<Statement, Declaration>;
 
+  struct Block {
+    std::vector<BlockItem> items;
+  };
+
   struct Function {
     std::string name;
-    std::vector<BlockItem> body;
+    Block body;
     uint32_t line;
   };
 

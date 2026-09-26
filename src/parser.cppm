@@ -317,6 +317,10 @@ export class Parser {
       return parse_label();
     }
 
+    if (check(TokenType::LBrace)) {
+      return parse_compound_stmt();
+    }
+
     if (check(TokenType::Semicolon)) {
       advance();
       return Statement{Null{}};
@@ -356,6 +360,23 @@ export class Parser {
     return parse_statement();
   }
 
+  Block parse_block() {
+    expect(TokenType::LBrace, "\"{\"");
+
+    std::vector<BlockItem> items;
+    while (!check(TokenType::RBrace) && !check(TokenType::Eof)) {
+      items.push_back(parse_block_item());
+    }
+    expect(TokenType::RBrace, "\"}\"");
+
+    return {std::move(items)};
+  }
+
+  Statement parse_compound_stmt() {
+    uint32_t line = peek().line;
+    return Statement{Compound{std::make_unique<Block>(parse_block()), line}};
+  }
+
   Function parse_function() {
     uint32_t line = peek().line;
     expect(TokenType::Int, "\"int\"");
@@ -370,13 +391,8 @@ export class Parser {
     expect(TokenType::LParen, "\"(\"");
     expect(TokenType::Void, "\"void\"");
     expect(TokenType::RParen, "\")\"");
-    expect(TokenType::LBrace, "\"{\"");
 
-    std::vector<BlockItem> body;
-    while (!check(TokenType::RBrace) && !check(TokenType::Eof)) {
-      body.push_back(parse_block_item());
-    }
-    expect(TokenType::RBrace, "\"}\"");
+    auto body = parse_block();
 
     return {std::move(name), std::move(body), line};
   }

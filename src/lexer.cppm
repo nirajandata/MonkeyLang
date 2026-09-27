@@ -2,6 +2,7 @@ module;
 
 #include <bit>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <immintrin.h>
@@ -54,55 +55,48 @@ private:
   bool had_error_{false};
   bool open_ok_{false};
 
-  [[nodiscard]] constexpr uint64_t tail_mask() const noexcept {
-    const uint64_t remaining = static_cast<uint64_t>(limit_ - cursor_);
-    return remaining >= 64 ? ~0ULL : ((1ULL << remaining) - 1);
-  }
-
-  void skip_whitespace() {
-    while (cursor_ < limit_) {
+  inline void skip_whitespace() noexcept {
+    while (true) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t mask = tail_mask();
+      const uint64_t ws = ascii::is_space_512(chars);
 
-      const uint64_t ws = ascii::is_space_512(chars) & mask;
-      const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n')) & mask;
-      const uint64_t not_ws = (~ws) & mask;
-
-      if (not_ws == 0) {
+      if (ws == ~0ULL) {
+        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         current_line_ += std::popcount(nl);
-        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+        cursor_ += 64;
       } else {
-        const int offset = std::countr_zero(not_ws);
+        const int offset = std::countr_zero(~ws);
+        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         const uint64_t nl_skipped = nl & ((1ULL << offset) - 1);
         current_line_ += std::popcount(nl_skipped);
         cursor_ += offset;
-        return;
+        break;
       }
     }
   }
 
-  void skip_line_comment() {
+  inline void skip_line_comment() noexcept {
     while (cursor_ < limit_) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t mask = tail_mask();
-      const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n')) & mask;
+      const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
 
       if (nl == 0) {
-        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+        cursor_ += 64;
       } else {
         cursor_ += std::countr_zero(nl);
         return;
       }
     }
+    if (cursor_ > limit_) cursor_ = limit_;
   }
 
-  void skip_block_comment() {
-    while (cursor_ + 64 <= limit_) {
+  inline void skip_block_comment() noexcept {
+    while (cursor_ < limit_) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
       const uint64_t star = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('*'));
-      const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
 
       if (star == 0) {
+        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         current_line_ += std::popcount(nl);
         cursor_ += 64;
       } else {
@@ -111,19 +105,15 @@ private:
     }
 
     while (cursor_ < limit_) {
-      if (*cursor_ == '\n') current_line_++;
-
-      if (*cursor_ == '*') {
-        cursor_++;
-        if (cursor_ < limit_ && *cursor_ == '/') {
-          cursor_++;
-          return;
-        }
-      } else {
-        cursor_++;
+      if (*cursor_ == '\n') {
+        current_line_++;
+      } else if (*cursor_ == '*' && cursor_[1] == '/') {
+        cursor_ += 2;
+        return;
       }
+      cursor_++;
     }
-
+    if (cursor_ > limit_) cursor_ = limit_;
     had_error_ = true;
   }
 
@@ -131,36 +121,41 @@ private:
     switch (text.size()) {
       case 2:
         if (text == "if") return TokenType::If;
+        if (text=="do") return TokenType::Do;
         break;
       case 3:
         if (text == "int") return TokenType::Int;
+        if (text=="for") return TokenType::For;
         break;
       case 4:
         if (text == "void") return TokenType::Void;
         if (text == "else") return TokenType::Else;
         if (text == "goto") return TokenType::Goto;
         break;
+    case 5:
+      if (text=="while") return TokenType::While;
+      if (text=="break") return TokenType::Break;
+      break;
       case 6:
         if (text == "return") return TokenType::Return;
         break;
-      default:
-        break;
+      case 8:
+      if (text == "continue") return TokenType::Continue;
+      break;
     }
     return TokenType::Identifier;
   }
 
-  void read_identifier_or_keyword() {
+  inline void read_identifier_or_keyword() noexcept {
     const char* start = cursor_;
 
-    while (cursor_ < limit_) {
+    while (true) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t mask = tail_mask();
-
       const uint64_t is_under = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('_'));
-      const uint64_t valid = (ascii::is_alnum_512(chars) | is_under) & mask;
+      const uint64_t valid = ascii::is_alnum_512(chars) | is_under;
 
-      if (valid == mask) {
-        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      if (valid == ~0ULL) {
+        cursor_ += 64;
       } else {
         cursor_ += std::countr_zero(~valid);
         break;
@@ -171,25 +166,24 @@ private:
     tokens_.emplace_back(identify_keyword(text), text, current_line_);
   }
 
-  void read_constant() {
+  inline void read_constant() noexcept {
     const char* start = cursor_;
 
-    while (cursor_ < limit_) {
+    while (true) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t mask = tail_mask();
-      const uint64_t is_digit = ascii::is_digit_512(chars) & mask;
+      const uint64_t is_digit = ascii::is_digit_512(chars);
 
-      if (is_digit == mask) {
-        cursor_ += (mask == ~0ULL) ? 64 : (limit_ - cursor_);
+      if (is_digit == ~0ULL) {
+        cursor_ += 64;
       } else {
         cursor_ += std::countr_zero(~is_digit);
         break;
       }
     }
 
-    if (cursor_ < limit_ && (ascii::is_alpha(*cursor_) || *cursor_ == '_')) {
+    if (ascii::is_alpha(*cursor_) || *cursor_ == '_') {
       had_error_ = true;
-      while (cursor_ < limit_ && (ascii::is_alnum(*cursor_) || *cursor_ == '_')) {
+      while (ascii::is_alnum(*cursor_) || *cursor_ == '_') {
         cursor_++;
       }
       tokens_.emplace_back(TokenType::Error, std::string_view(start, cursor_ - start), current_line_);
@@ -199,102 +193,9 @@ private:
     tokens_.emplace_back(TokenType::Constant, std::string_view(start, cursor_ - start), current_line_);
   }
 
-  void emit(TokenType type, size_t len) {
+  inline void emit(TokenType type, size_t len) noexcept {
     tokens_.emplace_back(type, std::string_view(cursor_, len), current_line_);
     cursor_ += len;
-  }
-
-  [[nodiscard]] bool match(char expected) const noexcept {
-    return cursor_ + 1 < limit_ && cursor_[1] == expected;
-  }
-
-  [[nodiscard]] bool match2(char first, char second) const noexcept {
-    return limit_ - cursor_ > 2 && cursor_[1] == first && cursor_[2] == second;
-  }
-
-  void read_operator() {
-    switch (*cursor_) {
-      case '#':
-        skip_line_comment();
-        break;
-      case '/':
-        if (match('/')) {
-          cursor_ += 2;
-          skip_line_comment();
-        } else if (match('*')) {
-          cursor_ += 2;
-          skip_block_comment();
-        } else if (match('=')) {
-          emit(TokenType::DivideAssign, 2);
-        } else {
-          emit(TokenType::Divide, 1);
-        }
-        break;
-      case '-':
-        if (match('-')) emit(TokenType::Decrement, 2);
-        else if (match('=')) emit(TokenType::SubtractAssign, 2);
-        else emit(TokenType::Subtract, 1);
-        break;
-      case '!':
-        if (match('=')) emit(TokenType::NotEqual, 2);
-        else emit(TokenType::Not, 1);
-        break;
-      case '&':
-        if (match('&')) emit(TokenType::And, 2);
-        else if (match('=')) emit(TokenType::BitwiseAndAssign, 2);
-        else emit(TokenType::BitwiseAnd, 1);
-        break;
-      case '|':
-        if (match('|')) emit(TokenType::Or, 2);
-        else if (match('=')) emit(TokenType::BitwiseOrAssign, 2);
-        else emit(TokenType::BitwiseOr, 1);
-        break;
-      case '=':
-        if (match('=')) emit(TokenType::Equal, 2);
-        else emit(TokenType::Assign, 1);
-        break;
-      case '<':
-        if (match2('<', '=')) emit(TokenType::ShiftLeftAssign, 3);
-        else if (match('=')) emit(TokenType::LessOrEqual, 2);
-        else if (match('<')) emit(TokenType::ShiftLeft, 2);
-        else emit(TokenType::LessThan, 1);
-        break;
-      case '>':
-        if (match2('>', '=')) emit(TokenType::ShiftRightAssign, 3);
-        else if (match('=')) emit(TokenType::GreaterOrEqual, 2);
-        else if (match('>')) emit(TokenType::ShiftRight, 2);
-        else emit(TokenType::GreaterThan, 1);
-        break;
-      case '^':
-        if (match('=')) emit(TokenType::BitwiseXorAssign, 2);
-        else emit(TokenType::BitwiseXor, 1);
-        break;
-      case '(': emit(TokenType::LParen, 1); break;
-      case ')': emit(TokenType::RParen, 1); break;
-      case '{': emit(TokenType::LBrace, 1); break;
-      case '}': emit(TokenType::RBrace, 1); break;
-      case ';': emit(TokenType::Semicolon, 1); break;
-      case '?': emit(TokenType::QuestionMark, 1); break;
-      case ':': emit(TokenType::Colon, 1); break;
-      case '~': emit(TokenType::Complement, 1); break;
-      case '+':
-        if (match('+')) emit(TokenType::Increment, 2);
-        else if (match('=')) emit(TokenType::AddAssign, 2);
-        else emit(TokenType::Add, 1);
-        break;
-      case '*':
-        if (match('=')) emit(TokenType::MultiplyAssign, 2);
-        else emit(TokenType::Multiply, 1);
-        break;
-      case '%':
-        if (match('=')) emit(TokenType::RemainderAssign, 2);
-        else emit(TokenType::Remainder, 1);
-        break;
-      default:
-        had_error_ = true;
-        emit(TokenType::Error, 1);
-        break;
-    }
   }
 
 public:
@@ -374,7 +275,7 @@ public:
     current_line_ = 1;
     cursor_ = static_cast<const char*>(mmap_handle_.map_base);
 
-    while (cursor_ < limit_) {
+    while (true) {
       skip_whitespace();
       if (cursor_ >= limit_) break;
 
@@ -385,7 +286,88 @@ public:
       } else if (ascii::is_digit(c)) {
         read_constant();
       } else {
-        read_operator();
+        switch (c) {
+          case '#':
+            skip_line_comment();
+            break;
+          case '/':
+            if (cursor_[1] == '/') {
+              cursor_ += 2;
+              skip_line_comment();
+            } else if (cursor_[1] == '*') {
+              cursor_ += 2;
+              skip_block_comment();
+            } else if (cursor_[1] == '=') {
+              emit(TokenType::DivideAssign, 2);
+            } else {
+              emit(TokenType::Divide, 1);
+            }
+            break;
+          case '-':
+            if (cursor_[1] == '-') emit(TokenType::Decrement, 2);
+            else if (cursor_[1] == '=') emit(TokenType::SubtractAssign, 2);
+            else emit(TokenType::Subtract, 1);
+            break;
+          case '!':
+            if (cursor_[1] == '=') emit(TokenType::NotEqual, 2);
+            else emit(TokenType::Not, 1);
+            break;
+          case '&':
+            if (cursor_[1] == '&') emit(TokenType::And, 2);
+            else if (cursor_[1] == '=') emit(TokenType::BitwiseAndAssign, 2);
+            else emit(TokenType::BitwiseAnd, 1);
+            break;
+          case '|':
+            if (cursor_[1] == '|') emit(TokenType::Or, 2);
+            else if (cursor_[1] == '=') emit(TokenType::BitwiseOrAssign, 2);
+            else emit(TokenType::BitwiseOr, 1);
+            break;
+          case '=':
+            if (cursor_[1] == '=') emit(TokenType::Equal, 2);
+            else emit(TokenType::Assign, 1);
+            break;
+          case '<':
+            if (cursor_[1] == '<' && cursor_[2] == '=') emit(TokenType::ShiftLeftAssign, 3);
+            else if (cursor_[1] == '=') emit(TokenType::LessOrEqual, 2);
+            else if (cursor_[1] == '<') emit(TokenType::ShiftLeft, 2);
+            else emit(TokenType::LessThan, 1);
+            break;
+          case '>':
+            if (cursor_[1] == '>' && cursor_[2] == '=') emit(TokenType::ShiftRightAssign, 3);
+            else if (cursor_[1] == '=') emit(TokenType::GreaterOrEqual, 2);
+            else if (cursor_[1] == '>') emit(TokenType::ShiftRight, 2);
+            else emit(TokenType::GreaterThan, 1);
+            break;
+          case '^':
+            if (cursor_[1] == '=') emit(TokenType::BitwiseXorAssign, 2);
+            else emit(TokenType::BitwiseXor, 1);
+            break;
+          case '(': emit(TokenType::LParen, 1); break;
+          case ')': emit(TokenType::RParen, 1); break;
+          case '{': emit(TokenType::LBrace, 1); break;
+          case '}': emit(TokenType::RBrace, 1); break;
+          case ';': emit(TokenType::Semicolon, 1); break;
+          case '?': emit(TokenType::QuestionMark, 1); break;
+          case ':': emit(TokenType::Colon, 1); break;
+          case '~': emit(TokenType::Complement, 1); break;
+          case '+':
+            if (cursor_[1] == '+') emit(TokenType::Increment, 2);
+            else if (cursor_[1] == '=') emit(TokenType::AddAssign, 2);
+            else emit(TokenType::Add, 1);
+            break;
+          case '*':
+            if (cursor_[1] == '=') emit(TokenType::MultiplyAssign, 2);
+            else emit(TokenType::Multiply, 1);
+            break;
+          case '%':
+            if (cursor_[1] == '=') emit(TokenType::RemainderAssign, 2);
+            else emit(TokenType::Remainder, 1);
+            break;
+          default:
+            had_error_ = true;
+            emit(TokenType::Error, 1);
+            break;
+        }
       }
     }
 
@@ -393,7 +375,5 @@ public:
   }
 
   [[nodiscard]] bool ok() const noexcept { return !had_error_ && open_ok_; }
-  [[nodiscard]] const std::vector<Token>& get_tokens() const noexcept {
-    return tokens_;
-  }
+  [[nodiscard]] const std::vector<Token>& get_tokens() const noexcept { return tokens_; }
 };

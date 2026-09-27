@@ -55,7 +55,13 @@ export enum class TokenType : uint32_t {
   Else,
   QuestionMark,
   Colon,
-  Goto
+  Goto,
+  Do,
+  While,
+  For,
+  Break,
+  Continue,
+
 };
 
 export struct Token {

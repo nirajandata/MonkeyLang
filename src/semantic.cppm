@@ -105,12 +105,14 @@ class VariableResolver {
               resolve_exp(d.condition->value, scope);
             },
             [&](For &f) {
-              resolve_for_init(f.init, scope, local_names);
+              Scope loop_scope = scope;
+              LocalNames loop_names;
+              resolve_for_init(f.init, loop_scope, loop_names);
               if (f.condition)
-                resolve_exp(f.condition->value, scope);
+                resolve_exp(f.condition->value, loop_scope);
               if (f.post)
-                resolve_exp(f.post->value, scope);
-              resolve_statement(*f.body, scope, local_names);
+                resolve_exp(f.post->value, loop_scope);
+              resolve_statement(*f.body, loop_scope, loop_names);
             },
         },
         stmt.value);
@@ -300,7 +302,10 @@ class LoopLabeler {
     l.continue_label = current.cont_label;
     if constexpr (requires { l.init; })
       find_enclosing_loop(l.init, loop);
-    find_enclosing_loop(l.condition->value, loop);
+    if constexpr (requires { l.condition->value; })
+      find_enclosing_loop(l.condition->value, loop);
+    else if (l.condition)
+      find_enclosing_loop(l.condition->value, loop);
     if constexpr (requires { l.post; }) {
       if (l.post)
         find_enclosing_loop(l.post->value, loop);

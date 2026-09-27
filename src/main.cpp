@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -308,14 +309,21 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  auto t0 = std::chrono::steady_clock::now();
   if (!resolve_labels(*program))
     return 1;
-
+  auto t1 = std::chrono::steady_clock::now();
   if (!resolve_loops(*program))
     return 1;
-
+  auto t2 = std::chrono::steady_clock::now();
   if (!resolve_variables(*program))
     return 1;
+  auto t3 = std::chrono::steady_clock::now();
+  if (std::getenv("MCC_TIMING"))
+    std::println("labels={}us loops={}us variables={}us",
+                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+                 std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                 std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count());
 
   if (stage == Stage::Validate)
     return 0;

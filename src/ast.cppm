@@ -169,14 +169,61 @@ export {
     uint32_t line;
   };
 
-  struct Statement {
-    std::variant<Return, Expression, Null, If, Goto, Label, Compound> value;
+  struct Break {
+    std::string label;
+    uint32_t line;
+  };
+
+  struct Continue {
+    std::string label;
+    uint32_t line;
+  };
+
+  struct While {
+    std::unique_ptr<Expression> condition;
+    std::unique_ptr<Statement> body;
+    std::string break_label;
+    std::string continue_label;
+    uint32_t line;
+  };
+
+  struct DoWhile {
+    std::unique_ptr<Statement> body;
+    std::unique_ptr<Expression> condition;
+    std::string break_label;
+    std::string continue_label;
+    uint32_t line;
   };
 
   struct Declaration {
     std::string name;
     std::optional<Exp> init;
     uint32_t line;
+  };
+
+  struct InitDecl {
+    Declaration decl;
+  };
+
+  struct InitExp {
+    std::optional<Exp> exp;
+  };
+
+  using ForInit = std::variant<InitDecl, InitExp>;
+
+  struct For {
+    ForInit init;
+    std::optional<Expression> condition;
+    std::optional<Expression> post;
+    std::unique_ptr<Statement> body;
+    std::string break_label;
+    std::string continue_label;
+    uint32_t line;
+  };
+
+  struct Statement {
+    std::variant<Return, Expression, Null, If, Goto, Label, Compound, Break,
+                 Continue, While, DoWhile, For> value;
   };
 
   using BlockItem = std::variant<Statement, Declaration>;

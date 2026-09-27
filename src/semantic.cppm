@@ -103,26 +103,54 @@ class VariableResolver {
             [&](Goto &) {},
             [&](Label &l) { resolve_statement(*l.stmt); },
             [&](Compound &c) { resolve_block(*c.block); },
+            [&](Break &) {},
+            [&](Continue &) {},
+            [&](While &w) {
+              resolve_exp(w.condition->value);
+              resolve_statement(*w.body);
+            },
+            [&](DoWhile &d) {
+              resolve_statement(*d.body);
+              resolve_exp(d.condition->value);
+            },
+            [&](For &f) {
+              resolve_for_init(f.init);
+              if (f.condition) resolve_exp(f.condition->value);
+              if (f.post) resolve_exp(f.post->value);
+              resolve_statement(*f.body);
+            },
         },
         stmt.value);
+  }
+
+  void resolve_declaration(Declaration &d) {
+    if (scopes_.back().contains(d.name)) {
+      std::println("error:{}: Duplicate variable '{}'", d.line, d.name);
+      had_error_ = true;
+    } else {
+      auto unique_name = make_unique_name(d.name);
+      scopes_.back().emplace(d.name, unique_name);
+      d.name = std::move(unique_name);
+    }
+    if (d.init) resolve_exp(*d.init);
+  }
+
+  void resolve_for_init(ForInit &init) {
+    std::visit(
+        Overload{
+            [&](InitDecl &d) { resolve_declaration(d.decl); },
+            [&](InitExp &e) {
+              if (e.exp) resolve_exp(*e.exp);
+            },
+        },
+        init);
   }
 
   void resolve_block_item(BlockItem &item) {
     std::visit(
         Overload{
             [&](Statement &stmt) { resolve_statement(stmt); },
-            [&](Declaration &d) {
-              if (scopes_.back().contains(d.name)) {
-                std::println("error:{}: Duplicate variable '{}'", d.line,
-                             d.name);
-                had_error_ = true;
-              } else {
-                auto unique_name = make_unique_name(d.name);
-                scopes_.back().emplace(d.name, unique_name);
-                d.name = std::move(unique_name);
-              }
-              if (d.init) resolve_exp(*d.init);
-            },
+            [&](Declaration &d) { resolve_declaration(d); },
         },
         item);
   }
@@ -161,6 +189,12 @@ class LabelResolver {
       record_block(*c->block);
     } else if (auto *g = std::get_if<Goto>(&stmt.value)) {
       gotos_.push_back(g);
+    } else if (auto *w = std::get_if<While>(&stmt.value)) {
+      record_statement(*w->body);
+    } else if (auto *d = std::get_if<DoWhile>(&stmt.value)) {
+      record_statement(*d->body);
+    } else if (auto *f = std::get_if<For>(&stmt.value)) {
+      record_statement(*f->body);
     }
   }
 
@@ -202,6 +236,128 @@ public:
     return !had_error_;
   }
 };
+
+class LoopLabeler {
+  struct LoopLabels {
+    std::string brk_label;
+    std::string cont_label;
+  };
+
+  bool had_error_ = false;
+
+  static std::string make_unique_name(const std::string_view name) {
+    return std::string(name) + "." + std::to_string(next_name_id());
+  }
+
+  void find_enclosing_loop(Exp &exp, const LoopLabels *loop) {
+    std::visit(
+        Overload{
+            [](Constant &) {},
+            [](Var &) {},
+            [&](Unary &u) { find_enclosing_loop(*u.exp, loop); },
+            [&](Binary &b) {
+              find_enclosing_loop(*b.left, loop);
+              find_enclosing_loop(*b.right, loop);
+            },
+            [&](Assignment &a) {
+              find_enclosing_loop(*a.left, loop);
+              find_enclosing_loop(*a.right, loop);
+            },
+            [&](CompoundAssignment &a) {
+              find_enclosing_loop(*a.left, loop);
+              find_enclosing_loop(*a.right, loop);
+            },
+            [&](IncDec &e) { find_enclosing_loop(*e.exp, loop); },
+            [&](Conditional &c) {
+              find_enclosing_loop(*c.condition, loop);
+              find_enclosing_loop(*c.then_exp, loop);
+              find_enclosing_loop(*c.else_exp, loop);
+            },
+        },
+        exp.value);
+  }
+
+  void find_enclosing_loop(ForInit &init, const LoopLabels *loop) {
+    std::visit(
+        Overload{
+            [&](InitDecl &d) {
+              if (d.decl.init) find_enclosing_loop(*d.decl.init, loop);
+            },
+            [&](InitExp &e) {
+              if (e.exp) find_enclosing_loop(*e.exp, loop);
+            },
+        },
+        init);
+  }
+
+  template <typename Loop>
+  void assign_loop_labels(Loop &l, const LoopLabels *loop) {
+    LoopLabels current{make_unique_name("break"),
+                       make_unique_name("continue")};
+    l.break_label = current.brk_label;
+    l.continue_label = current.cont_label;
+    if constexpr (requires { l.init; }) find_enclosing_loop(l.init, loop);
+    find_enclosing_loop(l.condition->value, loop);
+    if constexpr (requires { l.post; }) {
+      if (l.post) find_enclosing_loop(l.post->value, loop);
+    }
+    record_break_and_continue_labels(*l.body, &current);
+  }
+
+  void record_break_and_continue_labels(Statement &stmt,
+                                        const LoopLabels *loop) {
+    std::visit(
+        Overload{
+            [&](Break &b) {
+              if (loop) {
+                b.label = loop->brk_label;
+              } else {
+                std::println("error:{}: 'break' statement not inside loop",
+                             b.line);
+                had_error_ = true;
+              }
+            },
+            [&](Continue &c) {
+              if (loop) {
+                c.label = loop->cont_label;
+              } else {
+                std::println("error:{}: 'continue' statement not inside loop",
+                             c.line);
+                had_error_ = true;
+              }
+            },
+            [&](Return &) {},
+            [&](Expression &) {},
+            [&](Null &) {},
+            [&](Goto &) {},
+            [&](Label &l) { record_break_and_continue_labels(*l.stmt, loop); },
+            [&](If &i) {
+              find_enclosing_loop(i.condition, loop);
+              record_break_and_continue_labels(*i.then_stmt, loop);
+              if (i.else_stmt) record_break_and_continue_labels(*i.else_stmt, loop);
+            },
+            [&](Compound &c) { record_block(*c.block, loop); },
+            [&](While &w) { assign_loop_labels(w, loop); },
+            [&](DoWhile &d) { assign_loop_labels(d, loop); },
+            [&](For &f) { assign_loop_labels(f, loop); },
+        },
+        stmt.value);
+  }
+
+  void record_block(Block &block, const LoopLabels *loop) {
+    for (auto &item : block.items) {
+      if (auto *stmt = std::get_if<Statement>(&item)) {
+        record_break_and_continue_labels(*stmt, loop);
+      }
+    }
+  }
+
+public:
+  bool resolve(Program &program) {
+    record_block(program.function.body, nullptr);
+    return !had_error_;
+  }
+};
 }
 
 export std::uint64_t next_name_id() {
@@ -216,4 +372,9 @@ export bool resolve_variables(Program &program) {
 export bool resolve_labels(Program &program) {
   LabelResolver resolver;
   return resolver.resolve(program);
+}
+
+export bool resolve_loops(Program &program) {
+  LoopLabeler labeler;
+  return labeler.resolve(program);
 }

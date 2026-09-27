@@ -50,8 +50,35 @@ struct GetTypeName {
 constexpr GetTypeName get_type_name{};
 
 static void pretty_print(const Block& block, int indent = 0);
+static void pretty_print(const Exp& exp, int indent = 0);
+static void pretty_print(const Declaration& d, int indent = 0);
+static void pretty_print(const ForInit& init, int indent = 0);
 
-static void pretty_print(const Exp& exp, int indent = 0) {
+static void pretty_print(const Declaration& d, int indent) {
+  std::string pad(indent * 2, ' ');
+  std::println("{}{}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);
+  if (d.init) pretty_print(*d.init, indent + 2);
+  std::println("{})", pad);
+}
+
+static void pretty_print(const ForInit& init, int indent) {
+  std::string pad(indent * 2, ' ');
+
+  std::visit(Overload{
+      [&](const InitDecl& d) {
+          std::println("{}{}(", pad, std::meta::identifier_of(^^InitDecl));
+          pretty_print(d.decl, indent + 2);
+          std::println("{})", pad);
+      },
+      [&](const InitExp& e) {
+          std::println("{}{}(", pad, std::meta::identifier_of(^^InitExp));
+          if (e.exp) pretty_print(*e.exp, indent + 2);
+          std::println("{})", pad);
+      },
+  }, init);
+}
+
+static void pretty_print(const Exp& exp, int indent) {
   std::string pad(indent * 2, ' ');
   std::visit(Overload{
       [&](const Constant& c) {
@@ -109,6 +136,10 @@ static void pretty_print(const Exp& exp, int indent = 0) {
   }, exp.value);
 }
 
+static void pretty_print(const Expression& e, int indent = 0) {
+  pretty_print(e.value, indent);
+}
+
 static void pretty_print(const Statement& stmt, int indent = 0) {
   std::string pad(indent * 2, ' ');
 
@@ -146,6 +177,32 @@ static void pretty_print(const Statement& stmt, int indent = 0) {
         pretty_print(*c.block, indent + 2);
         std::println("{})", pad);
       },
+      [&](const Break& b) {
+        std::println("{}{}(\"{}\")", pad, std::meta::identifier_of(^^Break), b.label);
+      },
+      [&](const Continue& c) {
+        std::println("{}{}(\"{}\")", pad, std::meta::identifier_of(^^Continue), c.label);
+      },
+      [&](const While& w) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^While));
+        pretty_print(*w.condition, indent + 2);
+        pretty_print(*w.body, indent + 2);
+        std::println("{})", pad);
+      },
+      [&](const DoWhile& d) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^DoWhile));
+        pretty_print(*d.body, indent + 2);
+        pretty_print(*d.condition, indent + 2);
+        std::println("{})", pad);
+      },
+      [&](const For& f) {
+        std::println("{}{}(", pad, std::meta::identifier_of(^^For));
+        pretty_print(f.init, indent + 2);
+        if (f.condition) pretty_print(*f.condition, indent + 2);
+        if (f.post) pretty_print(*f.post, indent + 2);
+        pretty_print(*f.body, indent + 2);
+        std::println("{})", pad);
+      },
   }, stmt.value);
 }
 
@@ -159,9 +216,7 @@ static void pretty_print(const Block& block, int indent) {
           pretty_print(s, indent + 1);
         },
         [&](const Declaration& d) {
-          std::println("{}{}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration), d.name);
-          if (d.init) pretty_print(*d.init, indent + 2);
-          std::println("{})", pad);
+          pretty_print(d, indent);
         },
     }, item);
   }
@@ -224,6 +279,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (!resolve_labels(*program)) return 1;
+
+    if (!resolve_loops(*program)) return 1;
 
     if (!resolve_variables(*program)) return 1;
 

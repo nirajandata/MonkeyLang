@@ -250,6 +250,87 @@ export class Parser {
     return {std::move(val), line};
   }
 
+  std::optional<Exp> parse_optional_exp(TokenType end) {
+    if (check(end) || check(TokenType::Eof)) return std::nullopt;
+    return parse_exp(0);
+  }
+
+  static std::optional<Expression> as_statement_exp(std::optional<Exp> exp,
+                                                    uint32_t line) {
+    if (!exp) return std::nullopt;
+    return Expression{std::move(*exp), line};
+  }
+
+  Statement parse_break() {
+    uint32_t line = peek().line;
+    expect(TokenType::Break, "\"break\"");
+    expect(TokenType::Semicolon, "\";\"");
+    return Statement{Break{{}, line}};
+  }
+
+  Statement parse_continue() {
+    uint32_t line = peek().line;
+    expect(TokenType::Continue, "\"continue\"");
+    expect(TokenType::Semicolon, "\";\"");
+    return Statement{Continue{{}, line}};
+  }
+
+  Statement parse_while() {
+    uint32_t line = peek().line;
+    expect(TokenType::While, "\"while\"");
+    expect(TokenType::LParen, "\"(\"");
+    uint32_t condition_line = peek().line;
+    auto condition =
+        std::make_unique<Expression>(parse_exp(0), condition_line);
+    expect(TokenType::RParen, "\")\"");
+    auto body = std::make_unique<Statement>(parse_statement());
+    return Statement{While{std::move(condition), std::move(body), {}, {},
+                          line}};
+  }
+
+  Statement parse_do_while() {
+    uint32_t line = peek().line;
+    expect(TokenType::Do, "\"do\"");
+    auto body = std::make_unique<Statement>(parse_statement());
+    expect(TokenType::While, "\"while\"");
+    expect(TokenType::LParen, "\"(\"");
+    uint32_t condition_line = peek().line;
+    auto condition =
+        std::make_unique<Expression>(parse_exp(0), condition_line);
+    expect(TokenType::RParen, "\")\"");
+    expect(TokenType::Semicolon, "\";\"");
+    return Statement{DoWhile{std::move(body), std::move(condition), {}, {},
+                             line}};
+  }
+
+  ForInit parse_for_init() {
+    if (check(TokenType::Int)) return ForInit{InitDecl{parse_declaration()}};
+    auto exp = parse_optional_exp(TokenType::Semicolon);
+    expect(TokenType::Semicolon, "\";\"");
+    return ForInit{InitExp{std::move(exp)}};
+  }
+
+  Statement parse_for() {
+    uint32_t line = peek().line;
+    expect(TokenType::For, "\"for\"");
+    expect(TokenType::LParen, "\"(\"");
+
+    auto init = parse_for_init();
+
+    uint32_t condition_line = peek().line;
+    auto condition =
+        as_statement_exp(parse_optional_exp(TokenType::Semicolon), condition_line);
+    expect(TokenType::Semicolon, "\";\"");
+
+    uint32_t post_line = peek().line;
+    auto post = as_statement_exp(parse_optional_exp(TokenType::RParen), post_line);
+    expect(TokenType::RParen, "\")\"");
+
+    auto body = std::make_unique<Statement>(parse_statement());
+    return Statement{For{std::move(init), std::move(condition),
+                         std::move(post), std::move(body), {}, {}, line}};
+  }
+
   Statement parse_if() {
     uint32_t line = peek().line;
     expect(TokenType::If, "\"if\"");
@@ -307,6 +388,26 @@ export class Parser {
 
     if (check(TokenType::If)) {
       return parse_if();
+    }
+
+    if (check(TokenType::Break)) {
+      return parse_break();
+    }
+
+    if (check(TokenType::Continue)) {
+      return parse_continue();
+    }
+
+    if (check(TokenType::While)) {
+      return parse_while();
+    }
+
+    if (check(TokenType::Do)) {
+      return parse_do_while();
+    }
+
+    if (check(TokenType::For)) {
+      return parse_for();
     }
 
     if (check(TokenType::Goto)) {

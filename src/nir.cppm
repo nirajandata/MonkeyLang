@@ -321,8 +321,67 @@ class NirEmitter {
               emit_statement(*l.stmt, instructions);
             },
             [&](const Compound &c) { emit_block(*c.block, instructions); },
+            [&](const Break &b) { instructions.push_back(NirJump{b.label}); },
+            [&](const Continue &c) { instructions.push_back(NirJump{c.label}); },
+            [&](const While &w) {
+              instructions.push_back(NirLabel{w.continue_label});
+
+              auto condition = emit_val(w.condition->value, instructions);
+              instructions.push_back(
+                  NirJumpIfZero{std::move(condition), w.break_label});
+
+              emit_statement(*w.body, instructions);
+              instructions.push_back(NirJump{w.continue_label});
+              instructions.push_back(NirLabel{w.break_label});
+            },
+            [&](const DoWhile &d) {
+              instructions.push_back(NirLabel{d.continue_label});
+
+              emit_statement(*d.body, instructions);
+
+              auto condition = emit_val(d.condition->value, instructions);
+              instructions.push_back(
+                  NirJumpIfNotZero{std::move(condition), d.continue_label});
+              instructions.push_back(NirLabel{d.break_label});
+            },
+            [&](const For &f) {
+              emit_for_init(f.init, instructions);
+
+              instructions.push_back(NirLabel{f.continue_label});
+
+              if (f.condition) {
+                auto condition = emit_val(f.condition->value, instructions);
+                instructions.push_back(
+                    NirJumpIfZero{std::move(condition), f.break_label});
+              }
+
+              emit_statement(*f.body, instructions);
+
+              if (f.post) emit_val(f.post->value, instructions);
+              instructions.push_back(NirJump{f.continue_label});
+              instructions.push_back(NirLabel{f.break_label});
+            },
         },
         stmt.value);
+  }
+
+  void emit_declaration(const Declaration &d,
+                        std::vector<NirInstruction> &instructions) {
+    if (!d.init) return;
+    auto val = emit_val(*d.init, instructions);
+    instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
+  }
+
+  void emit_for_init(const ForInit &init,
+                     std::vector<NirInstruction> &instructions) {
+    std::visit(
+        Overload{
+            [&](const InitDecl &d) { emit_declaration(d.decl, instructions); },
+            [&](const InitExp &e) {
+              if (e.exp) emit_val(*e.exp, instructions);
+            },
+        },
+        init);
   }
 
   void emit_block_item(const BlockItem &item,
@@ -330,12 +389,7 @@ class NirEmitter {
     std::visit(
         Overload{
             [&](const Statement &stmt) { emit_statement(stmt, instructions); },
-            [&](const Declaration &d) {
-              if (d.init) {
-                auto val = emit_val(*d.init, instructions);
-                instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
-              }
-            },
+            [&](const Declaration &d) { emit_declaration(d, instructions); },
         },
         item);
   }

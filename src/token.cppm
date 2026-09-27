@@ -61,7 +61,7 @@ export enum class TokenType : uint32_t {
   For,
   Break,
   Continue,
-
+  Comma,
 };
 
 export struct Token {

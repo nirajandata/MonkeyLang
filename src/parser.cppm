@@ -332,6 +332,34 @@ export class Parser {
                          std::move(post), std::move(body), {}, {}, line}};
   }
 
+  Statement parse_case() {
+    uint32_t line = peek().line;
+    expect(TokenType::Case, "\"case\"");
+    auto value = parse_exp(0);
+    expect(TokenType::Colon, "\":\"");
+    auto stmt = std::make_unique<Statement>(parse_statement());
+    return Statement{Case{std::move(value), {}, std::move(stmt), line}};
+  }
+
+  Statement parse_default() {
+    uint32_t line = peek().line;
+    expect(TokenType::Default, "\"default\"");
+    expect(TokenType::Colon, "\":\"");
+    auto stmt = std::make_unique<Statement>(parse_statement());
+    return Statement{Default{{}, std::move(stmt), line}};
+  }
+
+  Statement parse_switch() {
+    uint32_t line = peek().line;
+    expect(TokenType::Switch, "\"switch\"");
+    expect(TokenType::LParen, "\"(\"");
+    auto condition = parse_exp(0);
+    expect(TokenType::RParen, "\")\"");
+    auto body = std::make_unique<Statement>(parse_statement());
+    return Statement{Switch{std::move(condition), std::move(body), {}, {},
+                            nullptr, line}};
+  }
+
   Statement parse_if() {
     uint32_t line = peek().line;
     expect(TokenType::If, "\"if\"");
@@ -397,6 +425,18 @@ export class Parser {
 
     if (check(TokenType::Continue)) {
       return parse_continue();
+    }
+
+    if (check(TokenType::Case)) {
+      return parse_case();
+    }
+
+    if (check(TokenType::Default)) {
+      return parse_default();
+    }
+
+    if (check(TokenType::Switch)) {
+      return parse_switch();
     }
 
     if (check(TokenType::While)) {

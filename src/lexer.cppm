@@ -72,7 +72,10 @@ inline constexpr std::pair<std::string_view, TokenType> keyword_entries_[] = {
     {"for", TokenType::For},
     {"while", TokenType::While},
     {"break", TokenType::Break},
-    {"continue", TokenType::Continue}};
+    {"continue", TokenType::Continue},
+    {"switch", TokenType::Switch},
+    {"case", TokenType::Case},
+    {"default", TokenType::Default}};
 
 inline constexpr size_t keyword_count =
     sizeof(keyword_entries_) / sizeof(keyword_entries_[0]);

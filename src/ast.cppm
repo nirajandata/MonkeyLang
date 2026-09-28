@@ -221,9 +221,31 @@ export {
     uint32_t line;
   };
 
+  struct Case {
+    Exp value;
+    std::string label;
+    std::unique_ptr<Statement> stmt;
+    uint32_t line;
+  };
+
+  struct Default {
+    std::string label;
+    std::unique_ptr<Statement> stmt;
+    uint32_t line;
+  };
+
+  struct Switch {
+    Exp condition;
+    std::unique_ptr<Statement> body;
+    std::string break_label;
+    std::vector<Case *> cases;
+    Default *default_case;
+    uint32_t line;
+  };
+
   struct Statement {
     std::variant<Return, Expression, Null, If, Goto, Label, Compound, Break,
-                 Continue, While, DoWhile, For> value;
+                 Continue, Case, Default, Switch, While, DoWhile, For> value;
   };
 
   using BlockItem = std::variant<Statement, Declaration>;

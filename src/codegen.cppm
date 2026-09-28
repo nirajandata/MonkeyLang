@@ -188,6 +188,10 @@ static AsmFunction nir_to_asm(const NirFunction &func) {
           instructions.push_back(Cmpl{op(j.condition), Imm{0}});
           instructions.push_back(JmpCC{CondCode::NE, j.target});
         },
+        [&](const NirJumpIfNotEqual &j) {
+          instructions.push_back(Cmpl{op(j.value2), op(j.value1)});
+          instructions.push_back(JmpCC{CondCode::NE, j.target});
+        },
         [&](const NirLabel &l) { instructions.push_back(AsmLabel{l.name}); }
     }, instr);
   }

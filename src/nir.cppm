@@ -72,13 +72,19 @@ export {
     NirVal condition;
     std::string target;
   };
+  struct NirJumpIfNotEqual {
+    NirVal value1;
+    NirVal value2;
+    std::string target;
+  };
   struct NirLabel {
     std::string name;
   };
 
   using NirInstruction =
       std::variant<NirReturn, NirUnary, NirBinary, NirCopy, NirJump,
-                   NirJumpIfZero, NirJumpIfNotZero, NirLabel>;
+                   NirJumpIfZero, NirJumpIfNotZero, NirJumpIfNotEqual,
+                   NirLabel>;
 
   struct NirFunction {
     std::string name;
@@ -323,6 +329,44 @@ class NirEmitter {
             [&](const Compound &c) { emit_block(*c.block, instructions); },
             [&](const Break &b) { instructions.push_back(NirJump{b.label}); },
             [&](const Continue &c) { instructions.push_back(NirJump{c.label}); },
+            [&](const Case &c) {
+              instructions.push_back(NirLabel{c.label});
+              emit_statement(*c.stmt, instructions);
+            },
+            // The label for the default statement is emitted here, in the
+            // place where the default statement appears in the body. The
+            // switch statement below jumps to it when the controlling
+            // expression matches none of the case values.
+            [&](const Default &d) {
+              instructions.push_back(NirLabel{d.label});
+              emit_statement(*d.stmt, instructions);
+            },
+            [&](const Switch &s) {
+              // If the controlling expression matches none of the cases, we
+              // jump to the default statement, or past the end of the switch
+              // statement if it doesn't have one.
+              const auto &default_target =
+                  s.default_case ? s.default_case->label : s.break_label;
+
+              auto condition = emit_val(s.condition, instructions);
+
+              for (size_t i = 0; i < s.cases.size(); ++i) {
+                const bool last = (i + 1 == s.cases.size());
+                auto next_label =
+                    last ? default_target : make_label("case_next");
+
+                auto case_value = emit_val(s.cases[i]->value, instructions);
+                instructions.push_back(NirJumpIfNotEqual{
+                    condition, std::move(case_value), next_label});
+                instructions.push_back(NirJump{s.cases[i]->label});
+                if (!last) instructions.push_back(NirLabel{next_label});
+              }
+
+              instructions.push_back(NirJump{default_target});
+
+              emit_statement(*s.body, instructions);
+              instructions.push_back(NirLabel{s.break_label});
+            },
             [&](const While &w) {
               instructions.push_back(NirLabel{w.continue_label});
 
@@ -335,19 +379,25 @@ class NirEmitter {
               instructions.push_back(NirLabel{w.break_label});
             },
             [&](const DoWhile &d) {
-              instructions.push_back(NirLabel{d.continue_label});
+              auto start_label = make_label("start");
+
+              instructions.push_back(NirLabel{start_label});
 
               emit_statement(*d.body, instructions);
 
+              instructions.push_back(NirLabel{d.continue_label});
+
               auto condition = emit_val(d.condition->value, instructions);
               instructions.push_back(
-                  NirJumpIfNotZero{std::move(condition), d.continue_label});
+                  NirJumpIfNotZero{std::move(condition), start_label});
               instructions.push_back(NirLabel{d.break_label});
             },
             [&](const For &f) {
+              auto start_label = make_label("start");
+
               emit_for_init(f.init, instructions);
 
-              instructions.push_back(NirLabel{f.continue_label});
+              instructions.push_back(NirLabel{start_label});
 
               if (f.condition) {
                 auto condition = emit_val(f.condition->value, instructions);
@@ -357,8 +407,10 @@ class NirEmitter {
 
               emit_statement(*f.body, instructions);
 
+              instructions.push_back(NirLabel{f.continue_label});
+
               if (f.post) emit_val(f.post->value, instructions);
-              instructions.push_back(NirJump{f.continue_label});
+              instructions.push_back(NirJump{start_label});
               instructions.push_back(NirLabel{f.break_label});
             },
         },

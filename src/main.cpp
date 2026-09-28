@@ -211,6 +211,20 @@ static void pretty_print(const Statement &stmt, int indent = 0) {
             std::println("{}{}(\"{}\")", pad,
                          std::meta::identifier_of(^^Continue), c.label);
           },
+          [&](const Case &c) {
+            std::println("{}{}(", pad, std::meta::identifier_of(^^Case));
+            pretty_print(c.value, indent + 2);
+            std::println("{})", pad);
+          },
+          [&](const Default &) {
+            std::println("{}{}", pad, std::meta::identifier_of(^^Default));
+          },
+          [&](const Switch &s) {
+            std::println("{}{}(", pad, std::meta::identifier_of(^^Switch));
+            pretty_print(s.condition, indent + 2);
+            pretty_print(*s.body, indent + 2);
+            std::println("{})", pad);
+          },
           [&](const While &w) {
             std::println("{}{}(", pad, std::meta::identifier_of(^^While));
             pretty_print(*w.condition, indent + 2);
@@ -313,17 +327,22 @@ int main(int argc, char *argv[]) {
   if (!resolve_labels(*program))
     return 1;
   auto t1 = std::chrono::steady_clock::now();
-  if (!resolve_loops(*program))
+  if (!resolve_break_and_continue(*program))
     return 1;
   auto t2 = std::chrono::steady_clock::now();
   if (!resolve_variables(*program))
     return 1;
   auto t3 = std::chrono::steady_clock::now();
+  if (!resolve_switches(*program))
+    return 1;
+  auto t4 = std::chrono::steady_clock::now();
   if (std::getenv("MCC_TIMING"))
-    std::println("labels={}us loops={}us variables={}us",
-                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-                 std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
-                 std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count());
+    std::println(
+        "labels={}us breaks={}us variables={}us switches={}us",
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count());
 
   if (stage == Stage::Validate)
     return 0;

@@ -233,8 +233,7 @@ static AsmFunction replace_pseudos(const AsmFunction &func) {
 
   const int num_params = static_cast<int>(func.params.size());
   for (int i = 0; i < num_params; ++i)
-    offsets[func.params[i]] = -8 * (num_params - i);
-  next_offset = -8 * num_params;
+    offsets[func.params[i]] = 16 + 8 * (num_params - 1 - i);
 
   auto fix = [&](Operand o) { return fix_operand(o, offsets, next_offset); };
 

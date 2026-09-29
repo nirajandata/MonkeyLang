@@ -24,6 +24,7 @@ enum class Stage : std::uint8_t {
   Nir,
   CodeGen,
   EmitAsm,
+  Object,
   Run
 };
 
@@ -40,6 +41,8 @@ static std::optional<Stage> parse_stage(std::string_view arg) {
     return Stage::CodeGen;
   if (arg == "-S")
     return Stage::EmitAsm;
+  if (arg == "-c")
+    return Stage::Object;
   return std::nullopt;
 }
 
@@ -319,33 +322,8 @@ static void pretty_print(const Program &program, int indent = 0) {
   std::println("{})", pad);
 }
 
-int main(int argc, char *argv[]) {
-  if (argc < 2 || argc > 3) {
-    std::println("Usage: mcc [--lex | --parse | --validate | --tacky | "
-                 "--codegen | -S] <file.c>");
-    return 1;
-  }
-
-  Stage stage = Stage::Run;
-  std::filesystem::path source_path;
-
-  if (argc == 2) {
-    source_path = argv[1];
-  } else {
-    auto s = parse_stage(argv[1]);
-    if (!s) {
-      std::println("Unknown option: {}", argv[1]);
-      return 1;
-    }
-    stage = *s;
-    source_path = argv[2];
-  }
-
-  if (!std::filesystem::exists(source_path)) {
-    std::println("error: file '{}' not found", source_path.string());
-    return 1;
-  }
-
+static int compile_file(const std::filesystem::path &source_path, Stage stage,
+                        std::string &assembly) {
   Lexer lexer(source_path);
   lexer.lex();
   if (!lexer.ok())
@@ -401,27 +379,105 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  std::string output;
-  emit_asm(asm_program, output);
+  emit_asm(asm_program, assembly);
+  return 0;
+}
 
-  auto stem = source_path.stem();
-  auto dir = source_path.parent_path();
-  auto asm_path = dir / (stem.string() + ".s");
+static std::filesystem::path write_asm(const std::filesystem::path &source_path,
+                                       const std::string &assembly) {
+  auto asm_path = source_path.parent_path() /
+                  (source_path.stem().string() + ".s");
+  std::ofstream ofs(asm_path);
+  ofs << assembly;
+  return asm_path;
+}
 
-  {
-    std::ofstream ofs(asm_path);
-    ofs << output;
+static int assemble(const std::filesystem::path &asm_path,
+                    const std::filesystem::path &obj_path) {
+  std::string cmd = "gcc -c " + asm_path.string() + " -o " + obj_path.string();
+  return std::system(cmd.c_str());
+}
+
+int main(int argc, char *argv[]) {
+  Stage stage = Stage::Run;
+  std::vector<std::filesystem::path> sources;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string_view arg = argv[i];
+    if (!arg.starts_with('-')) {
+      sources.emplace_back(arg);
+      continue;
+    }
+
+    auto s = parse_stage(arg);
+    if (!s) {
+      std::println("Unknown option: {}", arg);
+      return 1;
+    }
+    stage = *s;
   }
 
-  if (stage == Stage::EmitAsm) {
+  if (sources.empty()) {
+    std::println("Usage: mcc [--lex | --parse | --validate | --tacky | "
+                 "--codegen | -S | -c] <file.c>...");
+    return 1;
+  }
+
+  for (const auto &source_path : sources) {
+    if (!std::filesystem::exists(source_path)) {
+      std::println("error: file '{}' not found", source_path.string());
+      return 1;
+    }
+  }
+
+  std::vector<std::filesystem::path> objects;
+
+  for (const auto &source_path : sources) {
+    std::string assembly;
+    if (compile_file(source_path, stage, assembly) != 0)
+      return 1;
+
+    switch (stage) {
+      case Stage::Lex:
+      case Stage::Parse:
+      case Stage::Validate:
+      case Stage::Nir:
+      case Stage::CodeGen:
+        continue;
+
+      case Stage::EmitAsm:
+        write_asm(source_path, assembly);
+        continue;
+
+      case Stage::Object: {
+        auto asm_path = write_asm(source_path, assembly);
+        auto obj_path = source_path.parent_path() /
+                        (source_path.stem().string() + ".o");
+        if (assemble(asm_path, obj_path) != 0)
+          return 1;
+        continue;
+      }
+
+      case Stage::Run: {
+        auto asm_path = write_asm(source_path, assembly);
+        auto obj_path = source_path.parent_path() /
+                        (source_path.stem().string() + ".o");
+        if (assemble(asm_path, obj_path) != 0)
+          return 1;
+        objects.push_back(obj_path);
+        continue;
+      }
+    }
+  }
+
+  if (stage != Stage::Run)
     return 0;
-  }
 
-  auto exe_path = dir / stem;
-  std::string cmd = "gcc -D SUPPRESS_WARNINGS " + asm_path.string() + " -o " +
-                    exe_path.string() + " 2>/dev/null";
+  std::string cmd = "gcc -D SUPPRESS_WARNINGS";
+  for (const auto &obj : objects)
+    cmd += " " + obj.string();
+  cmd += " -o " +
+         (sources.front().parent_path() / sources.front().stem()).string();
 
-  int rc = std::system(cmd.c_str());
-  // std::filesystem::remove(asm_path);
-  return rc;
+  return std::system(cmd.c_str());
 }

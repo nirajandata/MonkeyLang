@@ -80,18 +80,24 @@ export {
   struct NirLabel {
     std::string name;
   };
+  struct NirCall {
+    std::string name;
+    std::vector<NirVal> args;
+    NirVal dst;
+  };
 
   using NirInstruction =
       std::variant<NirReturn, NirUnary, NirBinary, NirCopy, NirJump,
                    NirJumpIfZero, NirJumpIfNotZero, NirJumpIfNotEqual,
-                   NirLabel>;
+                   NirLabel, NirCall>;
 
   struct NirFunction {
     std::string name;
+    std::vector<std::string> params;
     std::vector<NirInstruction> instructions;
   };
   struct NirProgram {
-    NirFunction function;
+    std::vector<NirFunction> functions;
   };
 }
 
@@ -278,18 +284,30 @@ class NirEmitter {
                            NirVal dst = NirVar{make_temporary()};
 
                            instructions.push_back(NirBinary{
-                               reflect_to_enum<OpType, NirBinaryOp>(),
-                               std::move(left), std::move(right), dst});
-                           return dst;
-                         }
-                       },
-                       b.op);
+                            reflect_to_enum<OpType, NirBinaryOp>(),
+                            std::move(left), std::move(right), dst});
+                            return dst;
+                          }
+                        },
+                        b.op);
                   },
 
                   [&](const Conditional &c) -> NirVal {
                     return emit_conditional(c, instructions);
+                  },
+
+                  [&](const FunctionCall &c) -> NirVal {
+                    std::vector<NirVal> args;
+                    args.reserve(c.args.size());
+                    for (const auto &arg : c.args)
+                      args.push_back(emit_val(*arg, instructions));
+
+                    NirVal dst = NirVar{make_temporary()};
+                    instructions.push_back(
+                        NirCall{c.name, std::move(args), dst});
+                    return dst;
                   }},
-        exp.value);
+         exp.value);
   }
 
   void emit_statement(const Statement &stmt,
@@ -333,18 +351,11 @@ class NirEmitter {
               instructions.push_back(NirLabel{c.label});
               emit_statement(*c.stmt, instructions);
             },
-            // The label for the default statement is emitted here, in the
-            // place where the default statement appears in the body. The
-            // switch statement below jumps to it when the controlling
-            // expression matches none of the case values.
             [&](const Default &d) {
               instructions.push_back(NirLabel{d.label});
               emit_statement(*d.stmt, instructions);
             },
             [&](const Switch &s) {
-              // If the controlling expression matches none of the cases, we
-              // jump to the default statement, or past the end of the switch
-              // statement if it doesn't have one.
               const auto &default_target =
                   s.default_case ? s.default_case->label : s.break_label;
 
@@ -417,8 +428,8 @@ class NirEmitter {
         stmt.value);
   }
 
-  void emit_declaration(const Declaration &d,
-                        std::vector<NirInstruction> &instructions) {
+  void emit_variable_declaration(const VariableDeclaration &d,
+                                 std::vector<NirInstruction> &instructions) {
     if (!d.init) return;
     auto val = emit_val(*d.init, instructions);
     instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
@@ -428,7 +439,7 @@ class NirEmitter {
                      std::vector<NirInstruction> &instructions) {
     std::visit(
         Overload{
-            [&](const InitDecl &d) { emit_declaration(d.decl, instructions); },
+            [&](const InitDecl &d) { emit_variable_declaration(d.decl, instructions); },
             [&](const InitExp &e) {
               if (e.exp) emit_val(*e.exp, instructions);
             },
@@ -441,7 +452,18 @@ class NirEmitter {
     std::visit(
         Overload{
             [&](const Statement &stmt) { emit_statement(stmt, instructions); },
-            [&](const Declaration &d) { emit_declaration(d, instructions); },
+            [&](const Declaration &d) {
+              std::visit(Overload{
+                             [&](const FunDecl &f) {
+                               if (f.decl.body)
+                                 emit_block(*f.decl.body, instructions);
+                             },
+                             [&](const VarDecl &v) {
+                               emit_variable_declaration(v.decl, instructions);
+                             },
+                         },
+                         d);
+            },
         },
         item);
   }
@@ -451,18 +473,24 @@ class NirEmitter {
     for (const auto &item : block.items) emit_block_item(item, instructions);
   }
 
-  NirFunction emit_function(const Function &func) {
+  NirFunction emit_function(const FunctionDeclaration &func) {
     std::vector<NirInstruction> instructions;
-    emit_block(func.body, instructions);
+    if (func.body) {
+      emit_block(*func.body, instructions);
+      instructions.push_back(NirReturn{NirConstant{0}});
+    }
 
-    instructions.push_back(NirReturn{NirConstant{0}});
-
-    return {std::string(func.name), std::move(instructions)};
+    return {std::string(func.name), func.params, std::move(instructions)};
   }
 
 public:
   NirProgram emit_program(const Program &program) {
-    return {emit_function(program.function)};
+    std::vector<NirFunction> functions;
+    functions.reserve(program.functions.size());
+    for (const auto &func : program.functions)
+      functions.push_back(emit_function(func));
+
+    return {std::move(functions)};
   }
 };
 

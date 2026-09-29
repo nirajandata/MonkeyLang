@@ -33,19 +33,14 @@ consteval TokenType get_token_type() {
 
 template <typename Variant, std::size_t... Is>
 Variant match_token_to_variant_impl(TokenType type, std::index_sequence<Is...>) {
-  Variant result;
-  bool matched = false;
-  ([&] {
-    if (!matched) {
-      using Alt = std::variant_alternative_t<Is, Variant>;
-      if (type == get_token_type<Alt>()) {
-        result = Alt{};
-        matched = true;
-      }
-    }
-  }(), ...);
-  if (!matched) std::unreachable();
-  return result;
+  std::optional<Variant> result;
+
+  if (!((type == get_token_type<std::variant_alternative_t<Is, Variant>>() &&
+        (result = std::variant_alternative_t<Is, Variant>{}, true)) || ...)) {
+    std::unreachable();
+  }
+
+  return *std::move(result);
 }
 
 template <typename Variant>
@@ -70,8 +65,7 @@ static std::optional<CompoundOp> compound_op(TokenType type) {
 }
 
 static IncDecOp inc_dec_op(TokenType type) {
-  return type == TokenType::Increment ? IncDecOp{Increment{}}
-                                       : IncDecOp{Decrement{}};
+  return type == TokenType::Increment ? IncDecOp{Increment{}} : IncDecOp{Decrement{}};
 }
 
 export class Parser {
@@ -84,14 +78,22 @@ export class Parser {
 
   Token advance() { return tokens_[pos_++]; }
 
-  bool check(TokenType type) const { return peek().type == type; }
+  bool check(TokenType type, size_t offset = 0) const {
+    return peek(offset).type == type;
+  }
+
+  bool match(TokenType type) {
+    if (check(type)) {
+      advance();
+      return true;
+    }
+    return false;
+  }
 
   void expect(TokenType type, std::string_view expected) {
-    if (!check(type)) {
+    if (!match(type)) {
       std::println("error:{}: Expected {} but found '{}'", peek().line, expected, peek().text);
       had_error_ = true;
-    } else {
-      advance();
     }
   }
 
@@ -114,44 +116,75 @@ export class Parser {
     return {value, tok.line};
   }
 
+  std::string parse_identifier() {
+    const Token& name_tok = advance();
+    if (name_tok.type != TokenType::Identifier) {
+      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
+      had_error_ = true;
+    }
+    return std::string(name_tok.text);
+  }
+
+  FunctionCall parse_function_call(const Token &name_tok) {
+    expect(TokenType::LParen, "\"(\"");
+
+    std::vector<std::unique_ptr<Exp>> args;
+    if (!check(TokenType::RParen)) {
+      do {
+        args.push_back(std::make_unique<Exp>(parse_exp(0)));
+      } while (match(TokenType::Comma));
+    }
+    expect(TokenType::RParen, "\")\"");
+
+    return {std::string(name_tok.text), std::move(args), name_tok.line};
+  }
+
   Exp parse_primary() {
     auto tok = peek();
 
-    if (tok.type == TokenType::Constant) {
-      return Exp{parse_constant()};
-    }
+    switch (tok.type) {
+      case TokenType::Constant:
+        return Exp{parse_constant()};
 
-    if (tok.type == TokenType::Identifier) {
-      advance();
-      return Exp{Var{std::string(tok.text), tok.line}};
-    }
+      case TokenType::Identifier: {
+        advance();
+        if (check(TokenType::LParen)) {
+          return Exp{parse_function_call(tok)};
+        }
+        return Exp{Var{std::string(tok.text), tok.line}};
+      }
 
-    if (tok.type == TokenType::Increment || tok.type == TokenType::Decrement) {
-      advance();
-      return Exp{IncDec{inc_dec_op(tok.type),
-                         std::make_unique<Exp>(parse_postfix()), false,
-                         tok.line}};
-    }
+      case TokenType::Increment:
+      case TokenType::Decrement: {
+        advance();
+        return Exp{IncDec{inc_dec_op(tok.type),
+                           std::make_unique<Exp>(parse_postfix()), false,
+                           tok.line}};
+      }
 
-    if (tok.type == TokenType::Complement || tok.type == TokenType::Subtract || tok.type == TokenType::Not) {
-      advance();
-      UnaryOp op = (tok.type == TokenType::Complement) ? UnaryOp{Complement{}}
-                 : (tok.type == TokenType::Subtract) ? UnaryOp{Negate{}}
-                 : UnaryOp{Not{}};
-      return Exp{Unary{std::move(op), std::make_unique<Exp>(parse_postfix()), tok.line}};
-    }
+      case TokenType::Complement:
+      case TokenType::Subtract:
+      case TokenType::Not: {
+        advance();
+        UnaryOp op = (tok.type == TokenType::Complement) ? UnaryOp{Complement{}}
+                   : (tok.type == TokenType::Subtract) ? UnaryOp{Negate{}}
+                   : UnaryOp{Not{}};
+        return Exp{Unary{std::move(op), std::make_unique<Exp>(parse_postfix()), tok.line}};
+      }
 
-    if (tok.type == TokenType::LParen) {
-      advance();
-      auto inner = parse_exp(0);
-      expect(TokenType::RParen, "\")\"");
-      return inner;
-    }
+      case TokenType::LParen: {
+        advance();
+        auto inner = parse_exp(0);
+        expect(TokenType::RParen, "\")\"");
+        return inner;
+      }
 
-    std::println("error:{}: Expected expression but found '{}'", tok.line, tok.text);
-    had_error_ = true;
-    advance();
-    return Exp{Constant{0, tok.line}};
+      default:
+        std::println("error:{}: Expected expression but found '{}'", tok.line, tok.text);
+        had_error_ = true;
+        advance();
+        return Exp{Constant{0, tok.line}};
+    }
   }
 
   Exp parse_postfix() {
@@ -250,14 +283,12 @@ export class Parser {
     return {std::move(val), line};
   }
 
-
   std::optional<Exp> parse_optional_exp(TokenType end) {
     if (check(end) || check(TokenType::Eof)) return std::nullopt;
     return parse_exp(0);
   }
 
-  static std::optional<Expression> as_statement_exp(std::optional<Exp> exp,
-                                                    uint32_t line) {
+  static std::optional<Expression> as_statement_exp(std::optional<Exp> exp, uint32_t line) {
     if (!exp) return std::nullopt;
     return Expression{std::move(*exp), line};
   }
@@ -281,12 +312,10 @@ export class Parser {
     expect(TokenType::While, "\"while\"");
     expect(TokenType::LParen, "\"(\"");
     uint32_t condition_line = peek().line;
-    auto condition =
-        std::make_unique<Expression>(parse_exp(0), condition_line);
+    auto condition = std::make_unique<Expression>(parse_exp(0), condition_line);
     expect(TokenType::RParen, "\")\"");
     auto body = std::make_unique<Statement>(parse_statement());
-    return Statement{While{std::move(condition), std::move(body), {}, {},
-                          line}};
+    return Statement{While{std::move(condition), std::move(body), {}, {}, line}};
   }
 
   Statement parse_do_while() {
@@ -296,16 +325,18 @@ export class Parser {
     expect(TokenType::While, "\"while\"");
     expect(TokenType::LParen, "\"(\"");
     uint32_t condition_line = peek().line;
-    auto condition =
-        std::make_unique<Expression>(parse_exp(0), condition_line);
+    auto condition = std::make_unique<Expression>(parse_exp(0), condition_line);
     expect(TokenType::RParen, "\")\"");
     expect(TokenType::Semicolon, "\";\"");
-    return Statement{DoWhile{std::move(body), std::move(condition), {}, {},
-                             line}};
+    return Statement{DoWhile{std::move(body), std::move(condition), {}, {}, line}};
   }
 
   ForInit parse_for_init() {
-    if (check(TokenType::Int)) return ForInit{InitDecl{parse_declaration()}};
+    if (check(TokenType::Int)) {
+      auto decl = parse_variable_declaration();
+      expect(TokenType::Semicolon, "\";\"");
+      return ForInit{InitDecl{std::move(decl)}};
+    }
     auto exp = parse_optional_exp(TokenType::Semicolon);
     expect(TokenType::Semicolon, "\";\"");
     return ForInit{InitExp{std::move(exp)}};
@@ -319,8 +350,7 @@ export class Parser {
     auto init = parse_for_init();
 
     uint32_t condition_line = peek().line;
-    auto condition =
-        as_statement_exp(parse_optional_exp(TokenType::Semicolon), condition_line);
+    auto condition = as_statement_exp(parse_optional_exp(TokenType::Semicolon), condition_line);
     expect(TokenType::Semicolon, "\";\"");
 
     uint32_t post_line = peek().line;
@@ -356,8 +386,7 @@ export class Parser {
     auto condition = parse_exp(0);
     expect(TokenType::RParen, "\")\"");
     auto body = std::make_unique<Statement>(parse_statement());
-    return Statement{Switch{std::move(condition), std::move(body), {}, {},
-                            nullptr, line}};
+    return Statement{Switch{std::move(condition), std::move(body), {}, {}, nullptr, line}};
   }
 
   Statement parse_if() {
@@ -370,136 +399,127 @@ export class Parser {
     auto then_stmt = std::make_unique<Statement>(parse_statement());
 
     std::unique_ptr<Statement> else_stmt;
-    if (check(TokenType::Else)) {
-      advance();
+    if (match(TokenType::Else)) {
       else_stmt = std::make_unique<Statement>(parse_statement());
     }
 
-    return Statement{If{std::move(condition), std::move(then_stmt),
-                       std::move(else_stmt), line}};
+    return Statement{If{std::move(condition), std::move(then_stmt), std::move(else_stmt), line}};
   }
 
   Statement parse_goto() {
     uint32_t line = peek().line;
     expect(TokenType::Goto, "\"goto\"");
-
-    const Token& name_tok = advance();
-    if (name_tok.type != TokenType::Identifier) {
-      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
-      had_error_ = true;
-    }
-    std::string name(name_tok.text);
-
+    auto name = parse_identifier();
     expect(TokenType::Semicolon, "\";\"");
     return Statement{Goto{std::move(name), line}};
   }
 
   Statement parse_label() {
     uint32_t line = peek().line;
-
-    const Token& name_tok = advance();
-    if (name_tok.type != TokenType::Identifier) {
-      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
-      had_error_ = true;
-    }
-    std::string name(name_tok.text);
-
+    auto name = parse_identifier();
     expect(TokenType::Colon, "\":\"");
-
     auto stmt = std::make_unique<Statement>(parse_statement());
     return Statement{Label{std::move(name), std::move(stmt), line}};
   }
 
   Statement parse_statement() {
-    if (check(TokenType::Return)) {
-      return Statement{parse_return()};
-    }
+    switch (peek().type) {
+      case TokenType::Return:   return Statement{parse_return()};
+      case TokenType::If:       return parse_if();
+      case TokenType::Break:    return parse_break();
+      case TokenType::Continue: return parse_continue();
+      case TokenType::Case:     return parse_case();
+      case TokenType::Default:  return parse_default();
+      case TokenType::Switch:   return parse_switch();
+      case TokenType::While:    return parse_while();
+      case TokenType::Do:       return parse_do_while();
+      case TokenType::For:      return parse_for();
+      case TokenType::Goto:     return parse_goto();
+      case TokenType::LBrace:   return parse_compound_stmt();
+      case TokenType::Semicolon:
+        advance();
+        return Statement{Null{}};
 
-    if (check(TokenType::If)) {
-      return parse_if();
+      case TokenType::Identifier:
+        if (check(TokenType::Colon, 1)) {
+          return parse_label();
+        }
+        [[fallthrough]];
+      default: {
+        uint32_t line = peek().line;
+        auto exp = parse_exp(0);
+        expect(TokenType::Semicolon, "\";\"");
+        return Statement{Expression{std::move(exp), line}};
+      }
     }
-
-    if (check(TokenType::Break)) {
-      return parse_break();
-    }
-
-    if (check(TokenType::Continue)) {
-      return parse_continue();
-    }
-
-    if (check(TokenType::Case)) {
-      return parse_case();
-    }
-
-    if (check(TokenType::Default)) {
-      return parse_default();
-    }
-
-    if (check(TokenType::Switch)) {
-      return parse_switch();
-    }
-
-    if (check(TokenType::While)) {
-      return parse_while();
-    }
-
-    if (check(TokenType::Do)) {
-      return parse_do_while();
-    }
-
-    if (check(TokenType::For)) {
-      return parse_for();
-    }
-
-    if (check(TokenType::Goto)) {
-      return parse_goto();
-    }
-
-    if (check(TokenType::Identifier) && peek(1).type == TokenType::Colon) {
-      return parse_label();
-    }
-
-    if (check(TokenType::LBrace)) {
-      return parse_compound_stmt();
-    }
-
-    if (check(TokenType::Semicolon)) {
-      advance();
-      return Statement{Null{}};
-    }
-
-    uint32_t line = peek().line;
-    auto exp = parse_exp(0);
-    expect(TokenType::Semicolon, "\";\"");
-    return Statement{Expression{std::move(exp), line}};
   }
 
-  Declaration parse_declaration() {
+  VariableDeclaration parse_variable_declaration() {
     uint32_t line = peek().line;
     expect(TokenType::Int, "\"int\"");
 
-    const Token& name_tok = advance();
-    if (name_tok.type != TokenType::Identifier) {
-      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
-      had_error_ = true;
-    }
-    std::string name(name_tok.text);
+    auto name = parse_identifier();
 
     std::optional<Exp> init;
-    if (check(TokenType::Assign)) {
-      advance();
+    if (match(TokenType::Assign)) {
       init = parse_exp(0);
     }
 
-    expect(TokenType::Semicolon, "\";\"");
     return {std::move(name), std::move(init), line};
   }
 
-  BlockItem parse_block_item() {
-    if (check(TokenType::Int)) {
-      return parse_declaration();
+  std::vector<std::string> parse_param_list() {
+    if (match(TokenType::Void)) {
+      return {};
     }
-    return parse_statement();
+
+    std::vector<std::string> params;
+    do {
+      expect(TokenType::Int, "\"int\"");
+      params.push_back(parse_identifier());
+    } while (match(TokenType::Comma));
+
+    return params;
+  }
+
+  FunctionDeclaration parse_function_declaration() {
+    uint32_t line = peek().line;
+    expect(TokenType::Int, "\"int\"");
+
+    auto name = parse_identifier();
+
+    expect(TokenType::LParen, "\"(\"");
+    auto params = parse_param_list();
+    expect(TokenType::RParen, "\")\"");
+
+    std::unique_ptr<Block> body;
+    if (check(TokenType::LBrace)) {
+      body = std::make_unique<Block>(parse_block());
+    } else {
+      expect(TokenType::Semicolon, "\";\"");
+    }
+
+    return {std::move(name), std::move(params), std::move(body), line};
+  }
+
+  bool at_function_declaration() const {
+    return check(TokenType::Int) && check(TokenType::Identifier, 1) &&
+           check(TokenType::LParen, 2);
+  }
+
+  Declaration parse_declaration() {
+    if (at_function_declaration()) {
+      return FunDecl{parse_function_declaration()};
+    }
+
+    auto decl = parse_variable_declaration();
+    expect(TokenType::Semicolon, "\";\"");
+    return VarDecl{std::move(decl)};
+  }
+
+  BlockItem parse_block_item() {
+    return check(TokenType::Int) ? BlockItem{parse_declaration()}
+                                 : BlockItem{parse_statement()};
   }
 
   Block parse_block() {
@@ -519,35 +539,19 @@ export class Parser {
     return Statement{Compound{std::make_unique<Block>(parse_block()), line}};
   }
 
-  Function parse_function() {
-    uint32_t line = peek().line;
-    expect(TokenType::Int, "\"int\"");
-
-    const Token& name_tok = advance();
-    if (name_tok.type != TokenType::Identifier) {
-      std::println("error:{}: Expected identifier but found '{}'", name_tok.line, name_tok.text);
-      had_error_ = true;
-    }
-
-    std::string name(name_tok.text);
-    expect(TokenType::LParen, "\"(\"");
-    expect(TokenType::Void, "\"void\"");
-    expect(TokenType::RParen, "\")\"");
-
-    auto body = parse_block();
-
-    return {std::move(name), std::move(body), line};
-  }
-
   Program parse_program() {
-    auto func = parse_function();
+    std::vector<FunctionDeclaration> functions;
 
-    if (!check(TokenType::Eof)) {
-      std::println("error:{}: Expected end of file but found '{}'", peek().line, peek().text);
-      had_error_ = true;
+    while (!check(TokenType::Eof)) {
+      if (!check(TokenType::Int)) {
+        std::println("error:{}: Expected function declaration but found '{}'", peek().line, peek().text);
+        had_error_ = true;
+        break;
+      }
+      functions.push_back(parse_function_declaration());
     }
 
-    return {std::move(func)};
+    return {std::move(functions)};
   }
 
 public:

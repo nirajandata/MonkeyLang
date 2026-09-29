@@ -61,17 +61,49 @@ struct GetTypeName {
 };
 constexpr GetTypeName get_type_name{};
 
+static std::string join_names(const std::vector<std::string> &names) {
+  std::string joined;
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (i) joined += ", ";
+    joined += names[i];
+  }
+  return joined;
+}
+
 static void pretty_print(const Block &block, int indent = 0);
 static void pretty_print(const Exp &exp, int indent = 0);
+static void pretty_print(const VariableDeclaration &d, int indent = 0);
 static void pretty_print(const Declaration &d, int indent = 0);
 static void pretty_print(const ForInit &init, int indent = 0);
 
-static void pretty_print(const Declaration &d, int indent) {
+static void pretty_print(const VariableDeclaration &d, int indent) {
   std::string pad(indent * 2, ' ');
-  std::println("{}{}(name=\"{}\"", pad, std::meta::identifier_of(^^Declaration),
-               d.name);
+  std::println("{}{}(name=\"{}\"", pad,
+               std::meta::identifier_of(^^VariableDeclaration), d.name);
   if (d.init)
     pretty_print(*d.init, indent + 2);
+  std::println("{})", pad);
+}
+
+static void pretty_print(const Declaration &d, int indent) {
+  std::string pad(indent * 2, ' ');
+
+  std::println("{}{}(", pad, std::meta::identifier_of(^^Declaration));
+  std::visit(
+      Overload{
+          [&](const VarDecl &v) {
+            pretty_print(v.decl, indent + 2);
+          },
+          [&](const FunDecl &f) {
+            std::println("{}  {}(", pad, std::meta::identifier_of(^^FunDecl));
+            std::println("{}    name=\"{}\",", pad, f.decl.name);
+            std::println("{}    params=[{}],", pad, join_names(f.decl.params));
+            if (f.decl.body)
+              pretty_print(*f.decl.body, indent + 4);
+            std::println("{}  )", pad);
+          },
+      },
+      d);
   std::println("{})", pad);
 }
 
@@ -152,6 +184,12 @@ static void pretty_print(const Exp &exp, int indent) {
             pretty_print(*c.condition, indent + 2);
             pretty_print(*c.then_exp, indent + 2);
             pretty_print(*c.else_exp, indent + 2);
+            std::println("{})", pad);
+          },
+          [&](const FunctionCall &c) {
+            std::println("{}{}(\"{}\"", pad,
+                         std::meta::identifier_of(^^FunctionCall), c.name);
+            for (const auto &arg : c.args) pretty_print(*arg, indent + 2);
             std::println("{})", pad);
           },
       },
@@ -269,10 +307,15 @@ static void pretty_print(const Program &program, int indent = 0) {
   std::string pad(indent * 2, ' ');
 
   std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
-  std::println("{}  {}(", pad, std::meta::identifier_of(^^Function));
-  std::println("{}    name=\"{}\",", pad, program.function.name);
-  pretty_print(program.function.body, indent + 2);
-  std::println("{}  )", pad);
+  for (const auto &func : program.functions) {
+    std::println("{}  {}(", pad,
+                 std::meta::identifier_of(^^FunctionDeclaration));
+    std::println("{}    name=\"{}\",", pad, func.name);
+    std::println("{}    params=[{}],", pad, join_names(func.params));
+    if (func.body)
+      pretty_print(*func.body, indent + 2);
+    std::println("{}  )", pad);
+  }
   std::println("{})", pad);
 }
 

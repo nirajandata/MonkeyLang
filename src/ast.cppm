@@ -125,9 +125,15 @@ export {
     uint32_t line;
   };
 
+  struct FunctionCall {
+    std::string name;
+    std::vector<std::unique_ptr<Exp>> args;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<Constant, Var, Unary, Binary, Assignment, CompoundAssignment,
-                 IncDec, Conditional> value;
+                 IncDec, Conditional, FunctionCall> value;
   };
 
   struct Return {
@@ -195,14 +201,31 @@ export {
     uint32_t line;
   };
 
-  struct Declaration {
+  struct VariableDeclaration {
     std::string name;
     std::optional<Exp> init;
     uint32_t line;
   };
 
+  struct FunctionDeclaration {
+    std::string name;
+    std::vector<std::string> params;
+    std::unique_ptr<Block> body;
+    uint32_t line;
+  };
+
+  struct FunDecl {
+    FunctionDeclaration decl;
+  };
+
+  struct VarDecl {
+    VariableDeclaration decl;
+  };
+
+  using Declaration = std::variant<FunDecl, VarDecl>;
+
   struct InitDecl {
-    Declaration decl;
+    VariableDeclaration decl;
   };
 
   struct InitExp {
@@ -254,13 +277,7 @@ export {
     std::vector<BlockItem> items;
   };
 
-  struct Function {
-    std::string name;
-    Block body;
-    uint32_t line;
-  };
-
   struct Program {
-    Function function;
+    std::vector<FunctionDeclaration> functions;
   };
 }

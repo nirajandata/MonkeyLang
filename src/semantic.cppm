@@ -24,6 +24,7 @@ namespace {
 class VariableResolver {
   using Scope = std::unordered_map<std::string, std::string>;
   using LocalNames = std::unordered_set<std::string>;
+  std::unordered_set<std::string> functions_;
   bool had_error_ = false;
 
   static std::string make_unique_name(const std::string_view name) {
@@ -74,6 +75,14 @@ class VariableResolver {
                      resolve_exp(*c.then_exp, scope);
                      resolve_exp(*c.else_exp, scope);
                    },
+                  [&](FunctionCall &c) {
+                    if (!functions_.contains(c.name)) {
+                      std::println("error:{}: Call to undeclared function '{}'",
+                                   c.line, c.name);
+                      had_error_ = true;
+                    }
+                    for (auto &arg : c.args) resolve_exp(*arg, scope);
+                  },
                },
                exp.value);
   }
@@ -127,8 +136,8 @@ class VariableResolver {
         stmt.value);
   }
 
-  void resolve_declaration(Declaration &d, Scope &scope,
-                           LocalNames &local_names) {
+  void resolve_variable_declaration(VariableDeclaration &d, Scope &scope,
+                                    LocalNames &local_names) {
     if (local_names.contains(d.name)) {
       std::println("error:{}: Duplicate variable '{}'", d.line, d.name);
       had_error_ = true;
@@ -142,10 +151,34 @@ class VariableResolver {
       resolve_exp(*d.init, scope);
   }
 
+  void resolve_declaration(Declaration &d, Scope &scope,
+                           LocalNames &local_names) {
+    std::visit(
+        Overload{
+            [&](const FunDecl &f) {
+              if (f.decl.body) {
+                std::println(
+                    "error:{}: Nested function definitions are not supported",
+                    f.decl.line);
+              } else {
+                std::println(
+                    "error:{}: Function declarations are only allowed at the "
+                    "top level",
+                    f.decl.line);
+              }
+              had_error_ = true;
+            },
+            [&](VarDecl &v) {
+              resolve_variable_declaration(v.decl, scope, local_names);
+            },
+        },
+        d);
+  }
+
   void resolve_for_init(ForInit &init, Scope &scope, LocalNames &local_names) {
     std::visit(Overload{
                    [&](InitDecl &d) {
-                     resolve_declaration(d.decl, scope, local_names);
+                     resolve_variable_declaration(d.decl, scope, local_names);
                    },
                    [&](InitExp &e) {
                      if (e.exp)
@@ -173,9 +206,37 @@ class VariableResolver {
       resolve_block_item(item, scope, local_names);
   }
 
+  void resolve_function(FunctionDeclaration &func) {
+    if (!func.body) return;
+
+    Scope scope;
+    for (auto &param : func.params) {
+      if (scope.contains(param)) {
+        std::println("error:{}: Duplicate parameter '{}'", func.line, param);
+        had_error_ = true;
+        continue;
+      }
+      auto unique_name = make_unique_name(param);
+      scope.insert_or_assign(param, unique_name);
+      param = std::move(unique_name);
+    }
+
+    resolve_block(*func.body, std::move(scope));
+  }
+
 public:
   bool resolve(Program &program) {
-    resolve_block(program.function.body, {});
+    for (const auto &func : program.functions) {
+      if (func.body && !functions_.insert(func.name).second) {
+        std::println("error:{}: Duplicate function definition '{}'", func.line,
+                     func.name);
+        had_error_ = true;
+      }
+      functions_.insert(func.name);
+    }
+
+    for (auto &func : program.functions) resolve_function(func);
+
     return !had_error_;
   }
 };
@@ -250,7 +311,8 @@ class LabelResolver {
 
 public:
   bool resolve(Program &program) {
-    record_block(program.function.body);
+    for (auto &func : program.functions)
+      if (func.body) record_block(*func.body);
     resolve_definitions();
     resolve_gotos();
     return !had_error_;
@@ -258,10 +320,6 @@ public:
 };
 
 class BreakContinueLabeler {
-  // A break statement jumps to the break label of the innermost enclosing loop
-  // or switch statement. A continue statement only ever jumps to the continue
-  // label of an enclosing loop, so that pointer is null when we're not inside
-  // one.
   struct Targets {
     std::string brk_label;
     const std::string *cont_label;
@@ -296,6 +354,9 @@ class BreakContinueLabeler {
                      find_enclosing_loop(*c.then_exp, loop);
                      find_enclosing_loop(*c.else_exp, loop);
                    },
+                  [&](FunctionCall &c) {
+                    for (auto &arg : c.args) find_enclosing_loop(*arg, loop);
+                  },
                },
                exp.value);
   }
@@ -395,13 +456,13 @@ class BreakContinueLabeler {
 
 public:
   bool resolve(Program &program) {
-    record_block(program.function.body, nullptr);
+    for (auto &func : program.functions)
+      if (func.body) record_block(*func.body, nullptr);
     return !had_error_;
   }
 };
 
 class SwitchGatherer {
-  // The cases that belong to the switch statement we're currently inside.
   struct SwitchCases {
     std::vector<Case *> case_list;
     std::unordered_set<int32_t> values;
@@ -441,9 +502,6 @@ class SwitchGatherer {
     cases.default_case = &d;
   }
 
-  // Records the case and default statements that belong to the switch
-  // statement we're currently inside. The cases inside a nested switch belong
-  // to that switch instead, so a nested switch is collected separately.
   void record_statement(Statement &stmt, SwitchCases *cases) {
     std::visit(
         Overload{
@@ -498,8 +556,6 @@ class SwitchGatherer {
     }
   }
 
-  // Collects the cases and default statement of this switch, in the order
-  // they appear in the source code.
   void gather(Switch &s) {
     SwitchCases cases;
     record_statement(*s.body, &cases);
@@ -509,7 +565,8 @@ class SwitchGatherer {
 
 public:
   bool resolve(Program &program) {
-    record_block(program.function.body, nullptr);
+    for (auto &func : program.functions)
+      if (func.body) record_block(*func.body, nullptr);
     return !had_error_;
   }
 };

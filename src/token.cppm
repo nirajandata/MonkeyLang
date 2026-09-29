@@ -65,6 +65,8 @@ export enum class TokenType : uint32_t {
   Switch,
   Case,
   Default,
+  Static,
+  Extern,
 };
 
 export struct Token {

@@ -16,9 +16,10 @@ export module codegen;
 
 import ast;
 import nir;
+import semantic;
 
 export {
-  enum class RegId : uint8_t { AX, CX, DX, R10, R11 };
+  enum class RegId : uint8_t { AX, CX, DX, DI, SI, R8, R9, R10, R11 };
 
   struct Reg { RegId id; };
   struct Imm { int32_t value; };
@@ -77,10 +78,22 @@ export {
 
 static Operand nir_val_to_operand(const NirVal &val) {
   return std::visit(Overload{
-      [](const NirConstant &c) -> Operand { return Imm{c.value}; },
-      [](const NirVar &v) -> Operand { return Pseudo{v.name}; }
+    [](const NirConstant &c) -> Operand { return Imm{c.value}; },
+    [](const NirVar &v) -> Operand { return Pseudo{v.name}; }
   }, val);
 }
+
+constexpr size_t num_arg_registers = 6;
+
+constexpr RegId arg_registers[num_arg_registers] = {
+    RegId::DI, RegId::SI, RegId::DX, RegId::CX, RegId::R8, RegId::R9};
+
+static Operand param_source(size_t index) {
+  if (index < num_arg_registers)
+    return Reg{arg_registers[index]};
+  return Stack{16 + 8 * static_cast<int>(index - num_arg_registers)};
+}
+
 
 static bool is_memory(const Operand &o) {
   return std::holds_alternative<Stack>(o);
@@ -115,9 +128,47 @@ static CondCode convert_relational(NirBinaryOp op) {
   }
 }
 
+static void emit_function_call(const NirCall &c,
+                               std::vector<AsmInstruction> &instructions) {
+  std::vector<Operand> args;
+  args.reserve(c.args.size());
+  for (const auto &arg : c.args) args.push_back(nir_val_to_operand(arg));
+
+  const size_t num_stack_args =
+      args.size() > num_arg_registers ? args.size() - num_arg_registers : 0;
+  const int stack_padding = num_stack_args % 2 != 0 ? 8 : 0;
+  if (stack_padding != 0)
+    instructions.push_back(AllocateStack{stack_padding});
+
+  for (size_t i = 0; i < args.size() && i < num_arg_registers; ++i)
+    instructions.push_back(Mov{args[i], Reg{arg_registers[i]}});
+
+  for (size_t i = args.size(); i > num_arg_registers; --i) {
+    const Operand &arg = args[i - 1];
+    if (std::holds_alternative<Reg>(arg) || std::holds_alternative<Imm>(arg)) {
+      instructions.push_back(Pushq{arg});
+    } else {
+      instructions.push_back(Mov{arg, Reg{RegId::AX}});
+      instructions.push_back(Pushq{Reg{RegId::AX}});
+    }
+  }
+
+  instructions.push_back(Call{c.name});
+
+  const int bytes_to_remove =
+      static_cast<int>(8 * num_stack_args) + stack_padding;
+  if (bytes_to_remove != 0)
+    instructions.push_back(DeallocateStack{bytes_to_remove});
+
+  instructions.push_back(Mov{Reg{RegId::AX}, nir_val_to_operand(c.dst)});
+}
+
 static AsmFunction nir_to_asm(const NirFunction &func) {
   std::vector<AsmInstruction> instructions;
   auto op = nir_val_to_operand;
+
+  for (size_t i = 0; i < func.params.size(); ++i)
+    instructions.push_back(Mov{param_source(i), Pseudo{func.params[i]}});
 
   for (const auto &instr : func.instructions) {
     std::visit(Overload{
@@ -197,20 +248,7 @@ static AsmFunction nir_to_asm(const NirFunction &func) {
           instructions.push_back(JmpCC{CondCode::NE, j.target});
         },
         [&](const NirLabel &l) { instructions.push_back(AsmLabel{l.name}); },
-        [&](const NirCall &c) {
-          for (const auto &arg : c.args) {
-            auto operand = op(arg);
-            if (!std::holds_alternative<Reg>(operand)) {
-              instructions.push_back(Mov{operand, Reg{RegId::R10}});
-              operand = Reg{RegId::R10};
-            }
-            instructions.push_back(Pushq{operand});
-          }
-          instructions.push_back(Call{c.name});
-          instructions.push_back(DeallocateStack{
-              8 * static_cast<int>(c.args.size())});
-          instructions.push_back(Mov{Reg{RegId::AX}, op(c.dst)});
-        }
+        [&](const NirCall &c) { emit_function_call(c, instructions); }
     }, instr);
   }
   return {func.name, func.params, std::move(instructions)};
@@ -227,13 +265,9 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
   return o;
 }
 
-static AsmFunction replace_pseudos(const AsmFunction &func) {
+static std::pair<AsmFunction, int> replace_pseudos(const AsmFunction &func) {
   std::unordered_map<std::string, int> offsets;
   int next_offset = 0;
-
-  const int num_params = static_cast<int>(func.params.size());
-  for (int i = 0; i < num_params; ++i)
-    offsets[func.params[i]] = 16 + 8 * (num_params - 1 - i);
 
   auto fix = [&](Operand o) { return fix_operand(o, offsets, next_offset); };
 
@@ -252,11 +286,10 @@ static AsmFunction replace_pseudos(const AsmFunction &func) {
       }
     }, instr));
   }
-  return {func.name, func.params, std::move(instructions)};
+  return {{func.name, func.params, std::move(instructions)}, -next_offset};
 }
 
-static AsmFunction fix_up(const AsmFunction &func) {
-  int stack_bytes = 0;
+static AsmFunction fix_up(const AsmFunction &func, int stack_bytes) {
   std::vector<AsmInstruction> fixed;
 
   auto fix_bin = [&](const auto &inst) {
@@ -267,7 +300,6 @@ static AsmFunction fix_up(const AsmFunction &func) {
     } else {
       fixed.push_back(inst);
     }
-    track_stack_ops(inst.src, inst.dst, stack_bytes);
   };
 
   for (const auto &instr : func.instructions) {
@@ -287,7 +319,6 @@ static AsmFunction fix_up(const AsmFunction &func) {
           } else {
             fixed.push_back(m);
           }
-          track_stack_ops(m.src, m.dst, stack_bytes);
         },
         [&](const Cmpl &c) {
           if (is_memory(c.src) && is_memory(c.dst)) {
@@ -299,17 +330,14 @@ static AsmFunction fix_up(const AsmFunction &func) {
           } else {
             fixed.push_back(c);
           }
-          track_stack_ops(c.src, c.dst, stack_bytes);
         },
-        [&](const auto &i) {
-          if constexpr (requires { i.operand; }) track_stack(i.operand, stack_bytes);
-          fixed.push_back(i);
-        }
+        [&](const auto &i) { fixed.push_back(i); }
     }, instr);
   }
 
+  const int rounded_bytes = (stack_bytes + 15) & ~15;
   std::vector<AsmInstruction> result;
-  if (stack_bytes > 0) result.push_back(AllocateStack{stack_bytes});
+  if (rounded_bytes > 0) result.push_back(AllocateStack{rounded_bytes});
   std::move(fixed.begin(), fixed.end(), std::back_inserter(result));
 
   return {func.name, func.params, std::move(result)};
@@ -323,9 +351,8 @@ static std::vector<AsmFunction> nir_to_asm(const NirProgram &program) {
     if (func.instructions.empty())
       continue;
     auto asm_func = nir_to_asm(func);
-    asm_func = replace_pseudos(asm_func);
-    asm_func = fix_up(asm_func);
-    functions.push_back(std::move(asm_func));
+    auto [pseudo_free_func, stack_bytes] = replace_pseudos(asm_func);
+    functions.push_back(fix_up(pseudo_free_func, stack_bytes));
   }
 
   return functions;
@@ -343,6 +370,16 @@ static std::string platform_prefix() {
 #endif
 }
 
+static std::string call_target(const std::string &name) {
+  const std::string target = platform_prefix() + name;
+#if defined(__linux__)
+  const Symbol *symbol = symbol_table().find(name);
+  if (!symbol || !symbol->defined)
+    return target + "@PLT";
+#endif
+  return target;
+}
+
 static std::string operand_str(const Operand &o) {
   return std::visit(Overload{
       [](const Imm &i) { return "$" + std::to_string(i.value); },
@@ -351,6 +388,10 @@ static std::string operand_str(const Operand &o) {
           case RegId::AX: return std::string("%eax");
           case RegId::CX: return std::string("%ecx");
           case RegId::DX: return std::string("%edx");
+          case RegId::DI: return std::string("%edi");
+          case RegId::SI: return std::string("%esi");
+          case RegId::R8: return std::string("%r8d");
+          case RegId::R9: return std::string("%r9d");
           case RegId::R10: return std::string("%r10d");
           case RegId::R11: return std::string("%r11d");
         }
@@ -366,6 +407,10 @@ static std::string reg_q_str(RegId id) {
     case RegId::AX: return std::string("%rax");
     case RegId::CX: return std::string("%rcx");
     case RegId::DX: return std::string("%rdx");
+    case RegId::DI: return std::string("%rdi");
+    case RegId::SI: return std::string("%rsi");
+    case RegId::R8: return std::string("%r8");
+    case RegId::R9: return std::string("%r9");
     case RegId::R10: return std::string("%r10");
     case RegId::R11: return std::string("%r11");
   }
@@ -374,6 +419,7 @@ static std::string reg_q_str(RegId id) {
 
 static std::string operand_q_str(const Operand &o) {
   return std::visit(Overload{
+      [](const Imm &i) { return "$" + std::to_string(i.value); },
       [](const Reg &r) { return reg_q_str(r.id); },
       [](const auto &) -> std::string { std::unreachable(); },
   }, o);
@@ -387,6 +433,10 @@ static std::string operand_byte_str(const Operand &o) {
           case RegId::AX: return std::string("%al");
           case RegId::CX: return std::string("%cl");
           case RegId::DX: return std::string("%dl");
+          case RegId::DI: return std::string("%dil");
+          case RegId::SI: return std::string("%sil");
+          case RegId::R8: return std::string("%r8b");
+          case RegId::R9: return std::string("%r9b");
           case RegId::R10: return std::string("%r10b");
           case RegId::R11: return std::string("%r11b");
         }
@@ -428,6 +478,7 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
 
     for (const auto &instr : func.instructions) {
       std::visit(Overload{
+        [&](const Mov &m) { output += "    movl " + operand_str(m.src) + ", " + operand_str(m.dst) + "\n"; },
         [&](const AsmUnary &u) { output += "    " + std::string(u.op == AsmUnaryOp::Neg ? "negl" : "notl") + " " + operand_str(u.operand) + "\n"; },
         [&](const Idivl &d) { output += "    idivl " + operand_str(d.operand) + "\n"; },
         [&](const Cdq &) { output += "    cdq\n"; },
@@ -440,7 +491,7 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
         [&](const AllocateStack &a) { output += "    subq $" + std::to_string(a.bytes) + ", %rsp\n"; },
         [&](const DeallocateStack &a) { output += "    addq $" + std::to_string(a.bytes) + ", %rsp\n"; },
         [&](const Pushq &p) { output += "    pushq " + operand_q_str(p.operand) + "\n"; },
-        [&](const Call &c) { output += "    call " + c.name + "\n"; },
+        [&](const Call &c) { output += "    call " + call_target(c.name) + "\n"; },
         [&](const Ret &) { output += "    movq %rbp, %rsp\n    popq %rbp\n    ret\n"; },
         [&](const auto &i) {
           using T = std::decay_t<decltype(i)>;

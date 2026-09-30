@@ -304,7 +304,8 @@ class TypeChecker {
         Overload{
             [](const Constant &) {},
             [&](const Var &v) {
-              if (symbol_table().get(v.name).type.kind == TypeKind::Function) {
+              const Type &var_type = symbol_table().get(v.name).type;
+              if (var_type.kind == TypeKind::Function) {
                 std::println("error:{}: Function name used as variable",
                              v.line);
                 had_error_ = true;
@@ -404,9 +405,10 @@ class TypeChecker {
   void typecheck_function_declaration(const FunctionDeclaration &d) {
     const Type fun_type = Type::function(d.params.size());
     const bool has_body = static_cast<bool>(d.body);
-    const bool already_defined = had_definition(d.name);
+    bool already_defined = false;
 
     if (const Symbol *prev = symbol_table().find(d.name)) {
+      already_defined = prev->defined;
       if (!(prev->type == fun_type)) {
         std::println("error:{}: Incompatible function declarations", d.line);
         had_error_ = true;
@@ -426,17 +428,10 @@ class TypeChecker {
     typecheck_block(*d.body);
   }
 
-  bool had_definition(const std::string &name) const {
-    const Symbol *prev = symbol_table().find(name);
-    return prev && prev->defined;
-  }
-
   void typecheck_declaration(const Declaration &d) {
     std::visit(
         Overload{
-            [&](const FunDecl &f) {
-              typecheck_function_declaration(f.decl);
-            },
+            [&](const FunDecl &f) { typecheck_function_declaration(f.decl); },
             [&](const VarDecl &v) {
               typecheck_variable_declaration(v.decl);
             },

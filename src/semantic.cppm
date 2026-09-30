@@ -20,11 +20,61 @@ std::uint64_t name_counter = 0;
 
 export std::uint64_t next_name_id();
 
+export {
+  enum class TypeKind { Int, Function };
+
+  struct Type {
+    TypeKind kind = TypeKind::Int;
+    size_t param_count = 0;
+
+    static Type int_type() { return {}; }
+    static Type function(size_t param_count) {
+      return {TypeKind::Function, param_count};
+    }
+
+    friend bool operator==(const Type &, const Type &) = default;
+  };
+
+  struct Symbol {
+    Type type;
+    bool defined = false;
+  };
+
+  class SymbolTable {
+    std::unordered_map<std::string, Symbol> symbols_;
+
+  public:
+    void clear() { symbols_.clear(); }
+
+    void add(const std::string &name, Type type, bool defined = false) {
+      symbols_.insert_or_assign(name, Symbol{type, defined});
+    }
+
+    [[nodiscard]] const Symbol *find(const std::string &name) const {
+      const auto it = symbols_.find(name);
+      return it == symbols_.end() ? nullptr : &it->second;
+    }
+
+    [[nodiscard]] const Symbol &get(const std::string &name) const {
+      return symbols_.at(name);
+    }
+  };
+}
+
+export SymbolTable &symbol_table() {
+  static SymbolTable table;
+  return table;
+}
+
 namespace {
-class VariableResolver {
-  using Scope = std::unordered_map<std::string, std::string>;
+class IdentifierResolver {
+  struct MapEntry {
+    std::string new_name;
+    bool has_linkage;
+  };
+
+  using Scope = std::unordered_map<std::string, MapEntry>;
   using LocalNames = std::unordered_set<std::string>;
-  std::unordered_set<std::string> functions_;
   bool had_error_ = false;
 
   static std::string make_unique_name(const std::string_view name) {
@@ -49,8 +99,8 @@ class VariableResolver {
                        had_error_ = true;
                        return;
                      }
-                     v.name = it->second;
-                   },
+                      v.name = it->second.new_name;
+                    },
                    [&](const Unary &u) { resolve_exp(*u.exp, scope); },
                    [&](const Binary &b) {
                      resolve_exp(*b.left, scope);
@@ -75,14 +125,17 @@ class VariableResolver {
                      resolve_exp(*c.then_exp, scope);
                      resolve_exp(*c.else_exp, scope);
                    },
-                  [&](FunctionCall &c) {
-                    if (!functions_.contains(c.name)) {
-                      std::println("error:{}: Call to undeclared function '{}'",
-                                   c.line, c.name);
-                      had_error_ = true;
-                    }
-                    for (auto &arg : c.args) resolve_exp(*arg, scope);
-                  },
+                   [&](FunctionCall &c) {
+                     const auto it = scope.find(c.name);
+                     if (it == scope.end()) {
+                       std::println("error:{}: Call to undeclared function '{}'",
+                                    c.line, c.name);
+                       had_error_ = true;
+                     } else {
+                       c.name = it->second.new_name;
+                     }
+                     for (auto &arg : c.args) resolve_exp(*arg, scope);
+                   },
                },
                exp.value);
   }
@@ -136,37 +189,58 @@ class VariableResolver {
         stmt.value);
   }
 
+  void resolve_local_declaration(std::string &name, uint32_t line,
+                                 Scope &scope, LocalNames &local_names) {
+    if (local_names.contains(name)) {
+      std::println("error:{}: Duplicate declaration '{}'", line, name);
+      had_error_ = true;
+      return;
+    }
+    auto new_name = make_unique_name(name);
+    local_names.insert(name);
+    scope.insert_or_assign(name, MapEntry{new_name, false});
+    name = std::move(new_name);
+  }
+
   void resolve_variable_declaration(VariableDeclaration &d, Scope &scope,
                                     LocalNames &local_names) {
-    if (local_names.contains(d.name)) {
-      std::println("error:{}: Duplicate variable '{}'", d.line, d.name);
-      had_error_ = true;
-    } else {
-      auto unique_name = make_unique_name(d.name);
-      local_names.insert(d.name);
-      scope.insert_or_assign(d.name, unique_name);
-      d.name = std::move(unique_name);
-    }
+    resolve_local_declaration(d.name, d.line, scope, local_names);
     if (d.init)
       resolve_exp(*d.init, scope);
+  }
+
+  void resolve_function_declaration(FunctionDeclaration &d, Scope &scope,
+                                    LocalNames &local_names) {
+    const auto it = scope.find(d.name);
+    if (it != scope.end() && local_names.contains(d.name) &&
+        !it->second.has_linkage) {
+      std::println("error:{}: Duplicate declaration '{}'", d.line, d.name);
+      had_error_ = true;
+    }
+    local_names.insert(d.name);
+    scope.insert_or_assign(d.name, MapEntry{d.name, true});
+
+    Scope inner = scope;
+    LocalNames inner_names;
+    for (auto &param : d.params)
+      resolve_local_declaration(param, d.line, inner, inner_names);
+    if (d.body)
+      resolve_block_items(*d.body, inner, inner_names);
   }
 
   void resolve_declaration(Declaration &d, Scope &scope,
                            LocalNames &local_names) {
     std::visit(
         Overload{
-            [&](const FunDecl &f) {
+            [&](FunDecl &f) {
               if (f.decl.body) {
                 std::println(
                     "error:{}: Nested function definitions are not supported",
                     f.decl.line);
+                had_error_ = true;
               } else {
-                std::println(
-                    "error:{}: Function declarations are only allowed at the "
-                    "top level",
-                    f.decl.line);
+                resolve_function_declaration(f.decl, scope, local_names);
               }
-              had_error_ = true;
             },
             [&](VarDecl &v) {
               resolve_variable_declaration(v.decl, scope, local_names);
@@ -202,40 +276,205 @@ class VariableResolver {
 
   void resolve_block(Block &block, Scope scope) {
     LocalNames local_names;
+    resolve_block_items(block, scope, local_names);
+  }
+
+  void resolve_block_items(Block &block, Scope &scope,
+                           LocalNames &local_names) {
     for (auto &item : block.items)
       resolve_block_item(item, scope, local_names);
   }
 
-  void resolve_function(FunctionDeclaration &func) {
-    if (!func.body) return;
-
+public:
+  bool resolve(Program &program) {
     Scope scope;
-    for (auto &param : func.params) {
-      if (scope.contains(param)) {
-        std::println("error:{}: Duplicate parameter '{}'", func.line, param);
+    LocalNames local_names;
+    for (auto &func : program.functions)
+      resolve_function_declaration(func, scope, local_names);
+
+    return !had_error_;
+  }
+};
+
+class TypeChecker {
+  bool had_error_ = false;
+
+  void typecheck_exp(const Exp &exp) {
+    std::visit(
+        Overload{
+            [](const Constant &) {},
+            [&](const Var &v) {
+              if (symbol_table().get(v.name).type.kind == TypeKind::Function) {
+                std::println("error:{}: Function name used as variable",
+                             v.line);
+                had_error_ = true;
+              }
+            },
+            [&](const Unary &u) { typecheck_exp(*u.exp); },
+            [&](const Binary &b) {
+              typecheck_exp(*b.left);
+              typecheck_exp(*b.right);
+            },
+            [&](const Assignment &a) {
+              typecheck_exp(*a.left);
+              typecheck_exp(*a.right);
+            },
+            [&](const CompoundAssignment &a) {
+              typecheck_exp(*a.left);
+              typecheck_exp(*a.right);
+            },
+            [&](const IncDec &e) { typecheck_exp(*e.exp); },
+            [&](const Conditional &c) {
+              typecheck_exp(*c.condition);
+              typecheck_exp(*c.then_exp);
+              typecheck_exp(*c.else_exp);
+            },
+            [&](const FunctionCall &c) {
+              const Type &fun_type = symbol_table().get(c.name).type;
+              if (fun_type.kind == TypeKind::Int) {
+                std::println("error:{}: Variable used as function name",
+                             c.line);
+                had_error_ = true;
+              } else if (fun_type.param_count != c.args.size()) {
+                std::println(
+                    "error:{}: Function called with the wrong number of "
+                    "arguments",
+                    c.line);
+                had_error_ = true;
+              }
+              for (const auto &arg : c.args)
+                typecheck_exp(*arg);
+            },
+        },
+        exp.value);
+  }
+
+  void typecheck_statement(const Statement &stmt) {
+    std::visit(
+        Overload{
+            [&](const Return &r) { typecheck_exp(r.value); },
+            [&](const Expression &e) { typecheck_exp(e.value); },
+            [](const Null &) {},
+            [&](const If &i) {
+              typecheck_exp(i.condition);
+              typecheck_statement(*i.then_stmt);
+              if (i.else_stmt)
+                typecheck_statement(*i.else_stmt);
+            },
+            [](const Goto &) {},
+            [&](const Label &l) { typecheck_statement(*l.stmt); },
+            [&](const Compound &c) { typecheck_block(*c.block); },
+            [](const Break &) {},
+            [](const Continue &) {},
+            [&](const Case &c) {
+              typecheck_exp(c.value);
+              typecheck_statement(*c.stmt);
+            },
+            [&](const Default &d) { typecheck_statement(*d.stmt); },
+            [&](const Switch &s) {
+              typecheck_exp(s.condition);
+              typecheck_statement(*s.body);
+            },
+            [&](const While &w) {
+              typecheck_exp(w.condition->value);
+              typecheck_statement(*w.body);
+            },
+            [&](const DoWhile &d) {
+              typecheck_statement(*d.body);
+              typecheck_exp(d.condition->value);
+            },
+            [&](const For &f) {
+              typecheck_for_init(f.init);
+              if (f.condition)
+                typecheck_exp(f.condition->value);
+              if (f.post)
+                typecheck_exp(f.post->value);
+              typecheck_statement(*f.body);
+            },
+        },
+        stmt.value);
+  }
+
+  void typecheck_variable_declaration(const VariableDeclaration &d) {
+    symbol_table().add(d.name, Type::int_type());
+    if (d.init)
+      typecheck_exp(*d.init);
+  }
+
+  void typecheck_function_declaration(const FunctionDeclaration &d) {
+    const Type fun_type = Type::function(d.params.size());
+    const bool has_body = static_cast<bool>(d.body);
+    const bool already_defined = had_definition(d.name);
+
+    if (const Symbol *prev = symbol_table().find(d.name)) {
+      if (!(prev->type == fun_type)) {
+        std::println("error:{}: Incompatible function declarations", d.line);
         had_error_ = true;
-        continue;
       }
-      auto unique_name = make_unique_name(param);
-      scope.insert_or_assign(param, unique_name);
-      param = std::move(unique_name);
+      if (already_defined && has_body) {
+        std::println("error:{}: Function is defined more than once", d.line);
+        had_error_ = true;
+      }
     }
 
-    resolve_block(*func.body, std::move(scope));
+    symbol_table().add(d.name, fun_type, already_defined || has_body);
+
+    if (!has_body)
+      return;
+    for (const auto &param : d.params)
+      symbol_table().add(param, Type::int_type());
+    typecheck_block(*d.body);
+  }
+
+  bool had_definition(const std::string &name) const {
+    const Symbol *prev = symbol_table().find(name);
+    return prev && prev->defined;
+  }
+
+  void typecheck_declaration(const Declaration &d) {
+    std::visit(
+        Overload{
+            [&](const FunDecl &f) {
+              typecheck_function_declaration(f.decl);
+            },
+            [&](const VarDecl &v) {
+              typecheck_variable_declaration(v.decl);
+            },
+        },
+        d);
+  }
+
+  void typecheck_for_init(const ForInit &init) {
+    std::visit(
+        Overload{
+            [&](const InitDecl &d) {
+              typecheck_variable_declaration(d.decl);
+            },
+            [&](const InitExp &e) {
+              if (e.exp)
+                typecheck_exp(*e.exp);
+            },
+        },
+        init);
+  }
+
+  void typecheck_block(const Block &block) {
+    for (const auto &item : block.items) {
+      std::visit(
+          Overload{
+              [&](const Statement &stmt) { typecheck_statement(stmt); },
+              [&](const Declaration &d) { typecheck_declaration(d); },
+          },
+          item);
+    }
   }
 
 public:
-  bool resolve(Program &program) {
-    for (const auto &func : program.functions) {
-      if (func.body && !functions_.insert(func.name).second) {
-        std::println("error:{}: Duplicate function definition '{}'", func.line,
-                     func.name);
-        had_error_ = true;
-      }
-      functions_.insert(func.name);
-    }
+  bool check(Program &program) {
+    symbol_table().clear();
 
-    for (auto &func : program.functions) resolve_function(func);
+    for (const auto &func : program.functions)
+      typecheck_function_declaration(func);
 
     return !had_error_;
   }
@@ -574,9 +813,14 @@ public:
 
 export std::uint64_t next_name_id() { return name_counter++; }
 
-export bool resolve_variables(Program &program) {
-  VariableResolver resolver;
+export bool resolve_identifiers(Program &program) {
+  IdentifierResolver resolver;
   return resolver.resolve(program);
+}
+
+export bool typecheck(Program &program) {
+  TypeChecker checker;
+  return checker.check(program);
 }
 
 export bool resolve_labels(Program &program) {

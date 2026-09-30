@@ -351,19 +351,23 @@ static int compile_file(const std::filesystem::path &source_path, Stage stage,
   if (!resolve_break_and_continue(*program))
     return 1;
   auto t2 = std::chrono::steady_clock::now();
-  if (!resolve_variables(*program))
+  if (!resolve_identifiers(*program))
     return 1;
   auto t3 = std::chrono::steady_clock::now();
-  if (!resolve_switches(*program))
+  if (!typecheck(*program))
     return 1;
   auto t4 = std::chrono::steady_clock::now();
+  if (!resolve_switches(*program))
+    return 1;
+  auto t5 = std::chrono::steady_clock::now();
   if (std::getenv("MCC_TIMING"))
     std::println(
-        "labels={}us breaks={}us variables={}us switches={}us",
+        "labels={}us breaks={}us identifiers={}us typecheck={}us switches={}us",
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
         std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
         std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count(),
-        std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count());
+        std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(t5 - t4).count());
 
   if (stage == Stage::Validate)
     return 0;

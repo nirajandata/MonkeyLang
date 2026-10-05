@@ -20,3 +20,8 @@ target_sources(Monkey PRIVATE
 )
 
 target_compile_options(Monkey PRIVATE -march=native -O3 -freflection)
+
+option(MONKEY_BUILD_BENCHMARKS "Build the lexer benchmarks (needs flex)" OFF)
+if(MONKEY_BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()

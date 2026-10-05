@@ -77,3 +77,6 @@ Testing/
 *.jpg
 *.lex
 *.png
+*.pdf
+
+__pycache__/

@@ -71,3 +71,9 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+#Docs
+*.jpeg
+*.jpg
+*.lex
+*.png

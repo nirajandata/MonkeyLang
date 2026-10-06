@@ -1,0 +1,16 @@
+"if"                  { return MONKEY_TT_If; }
+"else"                { return MONKEY_TT_Else; }
+"int"                 { return MONKEY_TT_Int; }
+"void"                { return MONKEY_TT_Void; }
+"return"              { return MONKEY_TT_Return; }
+"goto"                { return MONKEY_TT_Goto; }
+"do"                  { return MONKEY_TT_Do; }
+"for"                 { return MONKEY_TT_For; }
+"while"               { return MONKEY_TT_While; }
+"break"               { return MONKEY_TT_Break; }
+"continue"            { return MONKEY_TT_Continue; }
+"switch"              { return MONKEY_TT_Switch; }
+"case"                { return MONKEY_TT_Case; }
+"default"             { return MONKEY_TT_Default; }
+"static"              { return MONKEY_TT_Static; }
+"extern"              { return MONKEY_TT_Extern; }

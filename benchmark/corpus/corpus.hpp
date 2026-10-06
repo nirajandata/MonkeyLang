@@ -8,6 +8,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -25,6 +26,7 @@ struct Entry {
 struct Config {
   size_t small_bytes{256u * 1024u};
   size_t large_bytes{4u * 1024u * 1024u};
+  size_t external_bytes{8u * 1024u * 1024u};
   uint64_t seed{0x5eed1234abcd0001ull};
 };
 
@@ -429,18 +431,8 @@ if if if if if
   return text;
 }
 
-inline std::string real_sources(const std::filesystem::path &src_dir) {
-  std::vector<std::filesystem::path> files;
-  for (const auto &entry :
-       std::filesystem::directory_iterator(src_dir)) {
-    if (!entry.is_regular_file())
-      continue;
-    const std::string ext = entry.path().extension().string();
-    if (ext == ".cppm" || ext == ".cpp" || ext == ".h")
-      files.push_back(entry.path());
-  }
+inline std::string concatenate(std::vector<std::filesystem::path> files) {
   std::sort(files.begin(), files.end());
-
   std::string out;
   for (const auto &file : files) {
     std::ifstream in(file, std::ios::binary);
@@ -451,6 +443,52 @@ inline std::string real_sources(const std::filesystem::path &src_dir) {
     out += '\n';
   }
   return out;
+}
+
+inline std::string real_sources(const std::filesystem::path &src_dir) {
+  std::vector<std::filesystem::path> files;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(src_dir)) {
+    if (!entry.is_regular_file())
+      continue;
+    const std::string ext = entry.path().extension().string();
+    if (ext == ".cppm" || ext == ".cpp" || ext == ".h")
+      files.push_back(entry.path());
+  }
+  return concatenate(std::move(files));
+}
+
+inline std::vector<std::filesystem::path> libstdcxx_header_dirs() {
+  std::vector<std::filesystem::path> dirs;
+  for (const auto &entry : std::filesystem::directory_iterator("/usr/include/c++")) {
+    if (entry.is_directory() && entry.path().filename().string().find_first_not_of("0123456789") == std::string::npos)
+      dirs.push_back(entry.path() / "bits");
+  }
+  std::sort(dirs.begin(), dirs.end());
+  return dirs;
+}
+
+inline std::vector<std::filesystem::path> libstdcxx_headers(size_t target_bytes) {
+  std::vector<std::filesystem::path> files;
+  size_t total = 0;
+  for (const auto &dir : libstdcxx_header_dirs()) {
+    std::vector<std::filesystem::path> in_dir;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+      if (!entry.is_regular_file())
+        continue;
+      const std::string ext = entry.path().extension().string();
+      if (ext == ".h" || ext == ".hpp")
+        in_dir.push_back(entry.path());
+    }
+    std::sort(in_dir.begin(), in_dir.end());
+    for (const auto &file : in_dir) {
+      files.push_back(file);
+      total += static_cast<size_t>(std::filesystem::file_size(file));
+      if (total >= target_bytes)
+        return files;
+    }
+  }
+  return files;
 }
 
 inline bool write_if_needed(const std::filesystem::path &path,
@@ -493,6 +531,28 @@ inline std::vector<Entry> generate(const std::filesystem::path &dir,
   add("edge", d::edge_cases(), "hand written edge cases, verify only");
   add("real-src", d::real_sources(src_dir),
       "this repository's own C++ sources");
+
+  if (cfg.external_bytes > 0) {
+    std::string external;
+    const char *description = "libstdc++ headers, external real-world C++";
+#ifdef MONKEY_PINNED_CORPUS_DIR
+    const std::filesystem::path pinned =
+        std::filesystem::path(MONKEY_PINNED_CORPUS_DIR) / "real-libstdcxx.txt";
+    if (std::filesystem::is_regular_file(pinned)) {
+      std::ifstream in(pinned, std::ios::binary);
+      external.assign(std::istreambuf_iterator<char>(in),
+                      std::istreambuf_iterator<char>());
+      description = "libstdc++ headers from GCC 16, vendored snapshot";
+    }
+#endif
+    if (external.empty())
+      external = d::concatenate(d::libstdcxx_headers(cfg.external_bytes));
+    if (external.empty())
+      throw std::runtime_error(
+          "external corpus is empty: no libstdc++ headers found under "
+          "/usr/include/c++, pass --external-bytes 0 to skip it");
+    add("real-libstdcxx", external, description);
+  }
 
   {
     d::Rng rng{cfg.seed ^ 0x1111};

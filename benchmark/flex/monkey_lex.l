@@ -9,9 +9,13 @@
 
 #include "monkey_token_types.h"
 
-int monkey_flex_saw_error = 0;
+#ifndef MONKEY_FLEX_ERROR_FLAG
+#define MONKEY_FLEX_ERROR_FLAG monkey_flex_saw_error
+#endif
 
-static void monkey_flex_mark_error(void) { monkey_flex_saw_error = 1; }
+int MONKEY_FLEX_ERROR_FLAG = 0;
+
+static void monkey_flex_mark_error(void) { MONKEY_FLEX_ERROR_FLAG = 1; }
 
 #ifdef MONKEY_FLEX_KEYWORD_RULES
 static int monkey_flex_keyword_or_identifier(const char *text, int len) {
@@ -107,7 +111,7 @@ WS     [ \t-\r]
 %%
 
 {WS}+                 { }
-  #[^\n]*               { }
+  [#][^\n]*             { }
 "//"[^\n]*            { }
 
 "/*"                  { BEGIN(BLOCK_COMMENT); }
@@ -115,22 +119,7 @@ WS     [ \t-\r]
 <BLOCK_COMMENT>.|\n   { }
   <BLOCK_COMMENT><<EOF>> { BEGIN(INITIAL); monkey_flex_mark_error(); return 0; }
 
-"if"                  { return MONKEY_TT_If; }
-"else"                { return MONKEY_TT_Else; }
-"int"                 { return MONKEY_TT_Int; }
-"void"                { return MONKEY_TT_Void; }
-"return"              { return MONKEY_TT_Return; }
-"goto"                { return MONKEY_TT_Goto; }
-"do"                  { return MONKEY_TT_Do; }
-"for"                 { return MONKEY_TT_For; }
-"while"               { return MONKEY_TT_While; }
-"break"               { return MONKEY_TT_Break; }
-"continue"            { return MONKEY_TT_Continue; }
-"switch"              { return MONKEY_TT_Switch; }
-"case"                { return MONKEY_TT_Case; }
-"default"             { return MONKEY_TT_Default; }
-"static"              { return MONKEY_TT_Static; }
-"extern"              { return MONKEY_TT_Extern; }
+@MONKEY_FLEX_KEYWORD_RULES@
 
 {ALPHA}{IDCHAR}*      { return monkey_flex_keyword_or_identifier(yytext, yyleng); }
   {DIGIT}+{ALPHA}{IDCHAR}* { monkey_flex_mark_error(); return MONKEY_TT_Error; }

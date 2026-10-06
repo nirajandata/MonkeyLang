@@ -17,6 +17,14 @@
 
 import token;
 import lexer;
+import lexer_scalar;
+import lexer_masks;
+import lexer_idents;
+import lexer_flat;
+import lexer_copy;
+import lexer_identscan;
+import lexer_kwonly;
+import lexer_flatidents;
 
 #define MONKEY_ASSERT_TOKEN(name, value)                                     \
   static_assert(static_cast<uint32_t>(TokenType::name) ==                   \
@@ -58,6 +66,32 @@ std::string_view type_name(TokenType type) {
   return kTokenNames[value - 1];
 }
 
+void compare_against(std::string_view label,
+                     const std::vector<Token> &got_tokens,
+                     const std::vector<Token> &expected, std::string &mismatches) {
+  const size_t common = std::min(expected.size(), got_tokens.size());
+  for (size_t i = 0; i < common; ++i) {
+    if (static_cast<uint32_t>(expected[i].type) !=
+            static_cast<uint32_t>(got_tokens[i].type) ||
+        expected[i].text != got_tokens[i].text ||
+        expected[i].line != got_tokens[i].line) {
+      mismatches += "  " + std::string(label) + " token " +
+                    std::to_string(i) + " differs from Monkey: " +
+                    std::string(type_name(got_tokens[i].type)) + " '" +
+                    std::string(got_tokens[i].text) + "' line " +
+                    std::to_string(got_tokens[i].line) + " != " +
+                    std::string(type_name(expected[i].type)) + " '" +
+                    std::string(expected[i].text) + "' line " +
+                    std::to_string(expected[i].line) + '\n';
+      return;
+    }
+  }
+  if (expected.size() != got_tokens.size())
+    mismatches += "  " + std::string(label) + " token count: " +
+                  std::to_string(got_tokens.size()) + " != " +
+                  std::to_string(expected.size()) + '\n';
+}
+
 std::vector<corpus::Entry> g_bench_corpora;
 std::vector<corpus::Entry> g_verify_corpora;
 
@@ -71,87 +105,156 @@ struct VerifyReport {
   std::string message;
 };
 
-VerifyReport verify_corpus(const corpus::Entry &entry, bool verbose) {
-  Lexer lexer(entry.path);
-  lexer.lex();
-  const std::vector<Token> &expected = lexer.get_tokens();
+struct FlexVariant {
+  const char *label;
+  const monkey_flex_api *api;
+};
 
-  const std::string path = entry.path.string();
-  monkey_flex_lexer *flex = monkey_flex_open(path.c_str());
-  if (flex == nullptr) {
-    return VerifyReport{false, 0,
-                        "flex: cannot open " + path + ": " +
-                            monkey_flex_open_error()};
-  }
+constexpr FlexVariant kFlexVariants[] = {
+    {"flex", &monkey_flex_api_base},
+    {"flex-avxkw", &monkey_flex_api_avxkw},
+    {"flex-cf", &monkey_flex_api_cf},
+    {"re2c", &monkey_flex_api_re2c},
+};
 
-  const size_t capacity = token_capacity_for(entry.bytes);
-  auto buffer = std::make_unique_for_overwrite<monkey_flex_token[]>(capacity);
-  size_t flex_count = 0;
-  int flex_had_error = 0;
-  const int rc = monkey_flex_lex(flex, buffer.get(), capacity, &flex_count,
-                                 &flex_had_error);
-
-  VerifyReport report;
-  report.tokens = expected.size();
-
-  if (rc != 0) {
-    report.message = "flex: monkey_flex_lex failed (rc=" + std::to_string(rc) +
-                     "): " + monkey_flex_open_error();
-    monkey_flex_close(flex);
-    return report;
-  }
-
-  const bool flex_ok = !flex_had_error;
-  const bool monkey_ok = lexer.ok();
-
-  std::string mismatches;
+void compare_flex_against(std::string_view label,
+                          const monkey_flex_token *got, size_t got_count,
+                          const std::vector<Token> &expected, bool monkey_ok,
+                          bool flex_ok, std::string &mismatches) {
+  const size_t common = std::min(expected.size(), got_count);
   size_t reported = 0;
-  const size_t common = std::min(expected.size(), flex_count);
+
   for (size_t i = 0; i < common; ++i) {
     const Token &want = expected[i];
-    const monkey_flex_token &got = buffer[i];
+    const monkey_flex_token &tok = got[i];
     const std::string_view want_text = want.text;
-    const std::string_view got_text(got.text, got.len);
+    const std::string_view got_text(tok.text, tok.len);
 
-    if (static_cast<uint32_t>(want.type) != static_cast<uint32_t>(got.type) ||
-        want_text != got_text || want.line != got.line) {
+    if (static_cast<uint32_t>(want.type) != static_cast<uint32_t>(tok.type) ||
+        want_text != got_text || want.line != tok.line) {
       if (reported++ < 8) {
-        std::string message = "  token " + std::to_string(i) + ": monkey " +
+        std::string message = "  " + std::string(label) + " token " +
+                              std::to_string(i) + ": monkey " +
                               std::string(type_name(want.type)) + " '";
         message.append(want_text);
         message += "' line ";
         message += std::to_string(want.line);
-        message += " != flex " +
-                   std::string(type_name(static_cast<TokenType>(got.type))) +
+        message += " != " + std::string(label) + " " +
+                   std::string(type_name(static_cast<TokenType>(tok.type))) +
                    " '";
         message.append(got_text);
         message += "' line ";
-        message += std::to_string(got.line);
+        message += std::to_string(tok.line);
         message += '\n';
         mismatches += message;
       }
     }
   }
 
-  if (expected.size() != flex_count) {
+  if (expected.size() != got_count) {
     if (reported++ < 8) {
-      mismatches += "  token count: monkey " +
-                    std::to_string(expected.size()) + " != flex " +
-                    std::to_string(flex_count) + '\n';
+      mismatches += "  " + std::string(label) + " token count: monkey " +
+                    std::to_string(expected.size()) + " != " +
+                    std::to_string(got_count) + '\n';
     }
   }
 
   if (monkey_ok != flex_ok) {
-    mismatches += "  error flag: monkey " +
-                  std::string(monkey_ok ? "ok" : "had errors") + " != flex " +
+    mismatches += "  " + std::string(label) + " error flag: monkey " +
+                  std::string(monkey_ok ? "ok" : "had errors") + " != " +
                   std::string(flex_ok ? "ok" : "had errors") + '\n';
   }
+}
 
+VerifyReport verify_corpus(const corpus::Entry &entry, bool verbose) {
+  Lexer lexer(entry.path);
+  lexer.lex();
+  const std::vector<Token> &expected = lexer.get_tokens();
+  const bool monkey_ok = lexer.ok();
+
+  std::string ablated_mismatches;
+  {
+    monkey::ablate::scalar::Lexer scalar(entry.path);
+    scalar.lex();
+    compare_against("scalar", scalar.get_tokens(), expected, ablated_mismatches);
+  }
+  {
+    monkey::ablate::masks::Lexer masks(entry.path);
+    masks.lex();
+    compare_against("masks", masks.get_tokens(), expected, ablated_mismatches);
+  }
+  {
+    monkey::ablate::idents::Lexer idents(entry.path);
+    idents.lex();
+    compare_against("idents", idents.get_tokens(), expected, ablated_mismatches);
+  }
+  {
+    monkey::ablate::identscan::Lexer identscan(entry.path);
+    identscan.lex();
+    compare_against("identscan", identscan.get_tokens(), expected,
+                    ablated_mismatches);
+  }
+  {
+    monkey::ablate::kwonly::Lexer kwonly(entry.path);
+    kwonly.lex();
+    compare_against("kwonly", kwonly.get_tokens(), expected, ablated_mismatches);
+  }
+  {
+    monkey::ablate::flatidents::Lexer flatidents(entry.path);
+    flatidents.lex();
+    compare_against("flatidents", flatidents.get_tokens(), expected,
+                    ablated_mismatches);
+  }
+  {
+    monkey::ablate::flat::Lexer flat(entry.path);
+    flat.lex();
+    compare_against("flat", flat.get_tokens(), expected, ablated_mismatches);
+  }
+
+  const std::string path = entry.path.string();
+  const size_t capacity = token_capacity_for(entry.bytes);
+
+  std::string mismatches;
+  if (!ablated_mismatches.empty()) {
+    mismatches += "  ablated lexers do not match the shipped lexer:\n";
+    mismatches += ablated_mismatches;
+  }
+
+  for (const FlexVariant &variant : kFlexVariants) {
+    monkey_flex_lexer *flex = monkey_flex_open(path.c_str());
+    if (flex == nullptr) {
+      mismatches += "  " + std::string(variant.label) + " cannot open " +
+                    path + ": " + monkey_flex_open_error() + '\n';
+      continue;
+    }
+
+    auto buffer =
+        std::make_unique_for_overwrite<monkey_flex_token[]>(capacity);
+    size_t count = 0;
+    int had_error = 0;
+    const int rc =
+        monkey_flex_lex(variant.api, flex, buffer.get(), capacity, &count,
+                        &had_error);
+
+    if (rc != 0) {
+      mismatches += "  " + std::string(variant.label) + " lex failed (rc=" +
+                    std::to_string(rc) + "): " + monkey_flex_open_error() +
+                    '\n';
+    } else {
+      compare_flex_against(variant.label, buffer.get(), count, expected,
+                           monkey_ok, !had_error, mismatches);
+    }
+
+    monkey_flex_close(variant.api, flex);
+  }
+
+  VerifyReport report;
+  report.tokens = expected.size();
   report.ok = mismatches.empty();
   if (!report.ok)
     report.message = mismatches;
 
-  if (verbose) {
+  if (verbose && report.ok) {
     std::println(
         "  {:<14} {:>7} tokens, {:>8} bytes, {} lines, errors {}: token streams "
         "match",
@@ -160,7 +263,6 @@ VerifyReport verify_corpus(const corpus::Entry &entry, bool verbose) {
         monkey_ok ? "no" : "yes");
   }
 
-  monkey_flex_close(flex);
   return report;
 }
 
@@ -204,6 +306,20 @@ void bench_monkey_lex(benchmark::State &state, const corpus::Entry &entry) {
   count_output(state, entry, tokens);
 }
 
+template <typename AblatedLexer>
+void bench_ablated_lex(benchmark::State &state, const corpus::Entry &entry) {
+  AblatedLexer lexer(entry.path);
+  lexer.lex();
+  const size_t tokens = lexer.get_tokens().size();
+
+  for (auto _ : state) {
+    lexer.lex();
+    benchmark::ClobberMemory();
+  }
+
+  count_output(state, entry, tokens);
+}
+
 void bench_monkey_pipeline(benchmark::State &state, const corpus::Entry &entry) {
   size_t tokens = 0;
 
@@ -216,6 +332,24 @@ void bench_monkey_pipeline(benchmark::State &state, const corpus::Entry &entry) 
 
   count_output(state, entry, tokens);
 }
+
+template <typename AblatedLexer>
+void bench_ablated_pipeline(benchmark::State &state, const corpus::Entry &entry) {
+  size_t tokens = 0;
+
+  for (auto _ : state) {
+    AblatedLexer lexer(entry.path);
+    lexer.lex();
+    tokens = lexer.get_tokens().size();
+    benchmark::DoNotOptimize(lexer.get_tokens().data());
+  }
+
+  count_output(state, entry, tokens);
+}
+
+void bench_flex_variant_pipeline(benchmark::State &state,
+                                 const corpus::Entry &entry,
+                                 const monkey_flex_api *api);
 
 void bench_flex_lex(benchmark::State &state, const corpus::Entry &entry) {
   const std::string path = entry.path.string();
@@ -231,18 +365,52 @@ void bench_flex_lex(benchmark::State &state, const corpus::Entry &entry) {
   int had_error = 0;
 
   for (auto _ : state) {
-    if (monkey_flex_lex(flex, buffer.get(), capacity, &tokens, &had_error) != 0) {
+    if (monkey_flex_lex(&monkey_flex_api_base, flex, buffer.get(), capacity,
+                        &tokens, &had_error) != 0) {
       state.SkipWithError("token buffer overflow or scan failure");
       break;
     }
     benchmark::ClobberMemory();
   }
 
-  monkey_flex_close(flex);
+  monkey_flex_close(&monkey_flex_api_base, flex);
+  count_output(state, entry, tokens);
+}
+
+void bench_flex_variant_lex(benchmark::State &state, const corpus::Entry &entry,
+                            const monkey_flex_api *api) {
+  const std::string path = entry.path.string();
+  monkey_flex_lexer *flex = monkey_flex_open(path.c_str());
+  if (flex == nullptr) {
+    state.SkipWithError(monkey_flex_open_error());
+    return;
+  }
+
+  const size_t capacity = token_capacity_for(entry.bytes);
+  auto buffer = std::make_unique_for_overwrite<monkey_flex_token[]>(capacity);
+  size_t tokens = 0;
+  int had_error = 0;
+
+  for (auto _ : state) {
+    if (monkey_flex_lex(api, flex, buffer.get(), capacity, &tokens,
+                        &had_error) != 0) {
+      state.SkipWithError("token buffer overflow or scan failure");
+      break;
+    }
+    benchmark::ClobberMemory();
+  }
+
+  monkey_flex_close(api, flex);
   count_output(state, entry, tokens);
 }
 
 void bench_flex_pipeline(benchmark::State &state, const corpus::Entry &entry) {
+  bench_flex_variant_pipeline(state, entry, &monkey_flex_api_base);
+}
+
+void bench_flex_variant_pipeline(benchmark::State &state,
+                                 const corpus::Entry &entry,
+                                 const monkey_flex_api *api) {
   const std::string path = entry.path.string();
   size_t tokens = 0;
 
@@ -256,14 +424,15 @@ void bench_flex_pipeline(benchmark::State &state, const corpus::Entry &entry) {
     const size_t capacity = token_capacity_for(entry.bytes);
     auto buffer = std::make_unique_for_overwrite<monkey_flex_token[]>(capacity);
     int had_error = 0;
-    if (monkey_flex_lex(flex, buffer.get(), capacity, &tokens, &had_error) != 0) {
-      monkey_flex_close(flex);
+    if (monkey_flex_lex(api, flex, buffer.get(), capacity, &tokens,
+                        &had_error) != 0) {
+      monkey_flex_close(api, flex);
       state.SkipWithError("token buffer overflow or scan failure");
       return;
     }
     benchmark::DoNotOptimize(buffer.get());
 
-    monkey_flex_close(flex);
+    monkey_flex_close(api, flex);
   }
 
   count_output(state, entry, tokens);
@@ -280,11 +449,79 @@ void register_benchmarks() {
         ("Flex/Lex/" + base).c_str(),
         [entry](benchmark::State &state) { bench_flex_lex(state, entry); });
     benchmark::RegisterBenchmark(
+        ("FlexAVXKW/Lex/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_lex(state, entry, &monkey_flex_api_avxkw);
+        });
+    benchmark::RegisterBenchmark(
+        ("FlexCF/Lex/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_lex(state, entry, &monkey_flex_api_cf);
+        });
+    benchmark::RegisterBenchmark(
+        ("Re2c/Lex/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_lex(state, entry, &monkey_flex_api_re2c);
+        });
+    benchmark::RegisterBenchmark(
+        ("Flat/Lex/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::flat::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
         ("Monkey/Pipeline/" + base).c_str(),
         [entry](benchmark::State &state) { bench_monkey_pipeline(state, entry); });
     benchmark::RegisterBenchmark(
         ("Flex/Pipeline/" + base).c_str(),
         [entry](benchmark::State &state) { bench_flex_pipeline(state, entry); });
+    benchmark::RegisterBenchmark(
+        ("FlexAVXKW/Pipeline/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_pipeline(state, entry, &monkey_flex_api_avxkw);
+        });
+    benchmark::RegisterBenchmark(
+        ("FlexCF/Pipeline/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_pipeline(state, entry, &monkey_flex_api_cf);
+        });
+    benchmark::RegisterBenchmark(
+        ("Re2c/Pipeline/" + base).c_str(), [entry](benchmark::State &state) {
+          bench_flex_variant_pipeline(state, entry, &monkey_flex_api_re2c);
+        });
+    benchmark::RegisterBenchmark(
+        ("Scalar/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::scalar::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("Masks/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::masks::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("Idents/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::idents::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("IdentScan/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::identscan::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("KwOnly/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::kwonly::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("FlatIdents/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::flatidents::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("Copy/Lex/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_lex<monkey::ablate::copy::Lexer>(state, entry);
+        });
+    benchmark::RegisterBenchmark(
+        ("Copy/Pipeline/" + base).c_str(),
+        [entry](benchmark::State &state) {
+          bench_ablated_pipeline<monkey::ablate::copy::Lexer>(state, entry);
+        });
   }
 }
 
@@ -302,12 +539,12 @@ struct Options {
 void usage() {
   std::println(
       "usage: {} [--corpus-dir DIR] [--small-bytes N] [--large-bytes N]\n"
-      "          [--generate-only] [--verify-only] [--no-verify] [--list]\n"
-      "          [--quiet] [google benchmark flags...]",
+      "          [--external-bytes N] [--generate-only] [--verify-only]\n"
+      "          [--no-verify] [--list] [--quiet] [google benchmark flags...]",
       "lexer_bench");
 }
 
-} // namespace
+}
 
 int main(int argc, char **argv) {
   Options options;
@@ -334,6 +571,9 @@ int main(int argc, char **argv) {
     } else if (const std::string value = value_of("--large-bytes");
                !value.empty()) {
       options.config.large_bytes = std::strtoull(value.c_str(), nullptr, 10);
+    } else if (const std::string value = value_of("--external-bytes");
+               !value.empty()) {
+      options.config.external_bytes = std::strtoull(value.c_str(), nullptr, 10);
     } else if (arg == "--generate-only") {
       options.generate_only = true;
     } else if (arg == "--verify-only") {

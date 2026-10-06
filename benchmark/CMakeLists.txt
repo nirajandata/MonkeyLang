@@ -51,28 +51,122 @@ if(MONKEY_FLEX_FULL)
 endif()
 string(STRIP "${monkey_flex_flags}" monkey_flex_flags)
 
-set(monkey_flex_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/flex")
-file(MAKE_DIRECTORY "${monkey_flex_generated_dir}")
+set(RE2C_EXECUTABLE "" CACHE FILEPATH "Path to the re2c binary")
+if(NOT RE2C_EXECUTABLE)
+    find_package(re2c QUIET)
+    if(re2c_FOUND)
+        set(RE2C_EXECUTABLE "${re2c_EXECUTABLE}")
+    endif()
+endif()
+if(NOT RE2C_EXECUTABLE)
+    find_program(RE2C_EXECUTABLE
+            NAMES re2c
+            HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/re2c/bin")
+endif()
+if(NOT RE2C_EXECUTABLE)
+    message(FATAL_ERROR
+            "re2c was not found. The benchmark ships a re2c baseline that needs "
+            "re2c (https://re2c.org). Point -DRE2C_EXECUTABLE at a re2c binary, "
+            "or add re2c to PATH.")
+endif()
+message(STATUS "Found re2c: ${RE2C_EXECUTABLE}")
 
-FLEX_TARGET(monkey_scanner
-        "${CMAKE_CURRENT_SOURCE_DIR}/flex/monkey_lex.l"
-        "${monkey_flex_generated_dir}/monkey_lex.c"
-        COMPILE_FLAGS "${monkey_flex_flags}")
+set(monkey_re2c_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/re2c")
+file(MAKE_DIRECTORY "${monkey_re2c_generated_dir}")
 
-add_library(monkey_flex_scanner STATIC ${FLEX_monkey_scanner_OUTPUTS})
-target_compile_features(monkey_flex_scanner PRIVATE c_std_11)
-set_target_properties(monkey_flex_scanner PROPERTIES
+set(monkey_re2c_generated "${monkey_re2c_generated_dir}/monkey_re2c.c")
+add_custom_command(
+        OUTPUT "${monkey_re2c_generated}"
+        COMMAND "${RE2C_EXECUTABLE}" --no-debug-info
+        "-o${monkey_re2c_generated}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/re2c/monkey_lex.re"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/re2c/monkey_lex.re"
+        COMMENT "Generating re2c scanner"
+        VERBATIM)
+
+add_library(monkey_re2c STATIC
+        "${monkey_re2c_generated}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/re2c/monkey_re2c_driver.c")
+target_include_directories(monkey_re2c PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_features(monkey_re2c PRIVATE c_std_11)
+set_target_properties(monkey_re2c PROPERTIES
         C_STANDARD 11
         C_STANDARD_REQUIRED ON
         C_EXTENSIONS OFF)
-target_include_directories(monkey_flex_scanner PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_compile_options(monkey_flex_scanner PRIVATE
-        -O3
-        $<$<NOT:$<BOOL:${MONKEY_FLEX_KEYWORD_RULES}>>:-march=native>)
-target_compile_definitions(monkey_flex_scanner PRIVATE
-        $<$<BOOL:${MONKEY_FLEX_KEYWORD_RULES}>:MONKEY_FLEX_KEYWORD_RULES>
-        _POSIX_C_SOURCE=200809L)
+target_compile_options(monkey_re2c PRIVATE -O3 -march=native)
+
+set(monkey_flex_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/flex")
+file(MAKE_DIRECTORY "${monkey_flex_generated_dir}")
+
+set(monkey_flex_variants base avxkw cf)
+
+set(monkey_flex_variant_sources "")
+foreach(variant IN LISTS monkey_flex_variants)
+    set(spec "${monkey_flex_generated_dir}/monkey_lex_${variant}.l")
+    set(source "${monkey_flex_generated_dir}/monkey_lex_${variant}.c")
+
+    if(variant STREQUAL "base")
+        set(use_keyword_rules ON)
+        set(flex_flags "${monkey_flex_flags}")
+        set(flex_prefix_arg "")
+        set(extra_defines
+                MONKEY_FLEX_KEYWORD_RULES
+                MONKEY_FLEX_ERROR_FLAG=monkey_flex_saw_error)
+    elseif(variant STREQUAL "avxkw")
+        set(use_keyword_rules OFF)
+        set(flex_flags "${monkey_flex_flags}")
+        set(flex_prefix_arg "-Pmonkey_flex_avxkw")
+        set(extra_defines
+                MONKEY_FLEX_ERROR_FLAG=monkey_flex_avxkw_saw_error)
+    else()
+        set(use_keyword_rules ON)
+        set(flex_flags "-CF")
+        set(flex_prefix_arg "-Pmonkey_flex_cf")
+        set(extra_defines
+                MONKEY_FLEX_KEYWORD_RULES
+                MONKEY_FLEX_ERROR_FLAG=monkey_flex_cf_saw_error)
+    endif()
+
+    add_custom_command(
+            OUTPUT "${source}"
+            COMMAND "${CMAKE_COMMAND}"
+            "-DSPEC=${CMAKE_CURRENT_SOURCE_DIR}/flex/monkey_lex.l"
+            "-DRULES=${CMAKE_CURRENT_SOURCE_DIR}/flex/keyword_rules.inc"
+            "-DOUTPUT=${spec}"
+            "-DUSE_KEYWORD_RULES=${use_keyword_rules}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/flex/make_scanner.cmake"
+            COMMAND "${FLEX_EXECUTABLE}" ${flex_prefix_arg} ${flex_flags}
+            "-o${source}" "${spec}"
+            DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/flex/monkey_lex.l"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flex/keyword_rules.inc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/flex/make_scanner.cmake"
+            COMMENT "Generating flex scanner: ${variant}"
+            VERBATIM)
+
+    add_library(monkey_flex_${variant} STATIC "${source}")
+    target_include_directories(monkey_flex_${variant} PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_include_directories(monkey_flex_${variant} PRIVATE
+            "${monkey_flex_generated_dir}")
+    target_compile_features(monkey_flex_${variant} PRIVATE c_std_11)
+    set_target_properties(monkey_flex_${variant} PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED ON
+            C_EXTENSIONS OFF)
+    if(extra_defines)
+        target_compile_definitions(monkey_flex_${variant} PRIVATE
+                ${extra_defines})
+    endif()
+    target_compile_definitions(monkey_flex_${variant} PRIVATE
+            _POSIX_C_SOURCE=200809L)
+    target_compile_options(monkey_flex_${variant} PRIVATE
+            -O3
+            -march=native)
+
+    list(APPEND monkey_flex_variant_sources "${source}")
+endforeach()
 
 add_executable(lexer_bench
         bench/bench_lexer.cpp
@@ -82,13 +176,23 @@ target_sources(lexer_bench
         PRIVATE
         FILE_SET CXX_MODULES
         TYPE CXX_MODULES
-        BASE_DIRS "${MONKEY_SOURCE_ROOT}/src"
+        BASE_DIRS "${MONKEY_SOURCE_ROOT}/src" "${CMAKE_CURRENT_SOURCE_DIR}"
         FILES
         "${MONKEY_SOURCE_ROOT}/src/token.cppm"
         "${MONKEY_SOURCE_ROOT}/src/ascii.cppm"
-        "${MONKEY_SOURCE_ROOT}/src/lexer.cppm")
+        "${MONKEY_SOURCE_ROOT}/src/lexer.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_scalar.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_masks.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_idents.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_flat.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_copy.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_identscan.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_kwonly.cppm"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ablate/lexer_flatidents.cppm")
 
 target_compile_features(lexer_bench PRIVATE cxx_std_26)
+target_compile_definitions(lexer_bench PRIVATE
+        MONKEY_PINNED_CORPUS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/corpus")
 set_target_properties(lexer_bench PROPERTIES
         CXX_STANDARD 26
         CXX_STANDARD_REQUIRED ON
@@ -106,7 +210,10 @@ target_compile_definitions(lexer_bench PRIVATE
 
 target_link_libraries(lexer_bench PRIVATE
         benchmark::benchmark
-        monkey_flex_scanner)
+        monkey_flex_base
+        monkey_flex_avxkw
+        monkey_flex_cf
+        monkey_re2c)
 
 if(BUILD_TESTING)
     add_test(NAME lexer_bench_verify

@@ -1,10 +1,12 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <print>
 #include <string>
@@ -64,6 +66,155 @@ std::string_view type_name(TokenType type) {
   if (value == 0 || value >= MONKEY_TT_COUNT)
     return "<none>";
   return kTokenNames[value - 1];
+}
+
+enum class TokenCategory : size_t {
+  Identifier,
+  Constant,
+  Keyword,
+  OperatorOrPunctuation,
+  Error,
+};
+
+constexpr std::string_view kTokenCategoryNames[] = {
+    "identifier", "constant", "keyword", "operator/punctuation", "error-token"};
+
+TokenCategory token_category(TokenType type) {
+  switch (type) {
+  case TokenType::Identifier:
+    return TokenCategory::Identifier;
+  case TokenType::Constant:
+    return TokenCategory::Constant;
+  case TokenType::Int:
+  case TokenType::Void:
+  case TokenType::Return:
+  case TokenType::If:
+  case TokenType::Else:
+  case TokenType::Goto:
+  case TokenType::Do:
+  case TokenType::While:
+  case TokenType::For:
+  case TokenType::Break:
+  case TokenType::Continue:
+  case TokenType::Switch:
+  case TokenType::Case:
+  case TokenType::Default:
+  case TokenType::Static:
+  case TokenType::Extern:
+    return TokenCategory::Keyword;
+  case TokenType::Error:
+    return TokenCategory::Error;
+  case TokenType::Eof:
+    break;
+  }
+  return TokenCategory::OperatorOrPunctuation;
+}
+
+void print_token_mix(const std::vector<corpus::Entry> &corpora) {
+  std::println("Token mix (percent of non-EOF tokens):");
+  for (const corpus::Entry &entry : corpora) {
+    if (entry.name == "edge")
+      continue;
+
+    Lexer lexer(entry.path);
+    lexer.lex();
+
+    std::array<size_t, std::size(kTokenCategoryNames)> counts{};
+    size_t eof_count = 0;
+    for (const Token &token : lexer.get_tokens()) {
+      if (token.type == TokenType::Eof) {
+        ++eof_count;
+      } else {
+        ++counts[static_cast<size_t>(token_category(token.type))];
+      }
+    }
+    size_t non_eof = 0;
+    for (const size_t count : counts)
+      non_eof += count;
+
+    std::print("  {:<14} tokens={:<9} EOF={} ", entry.name, non_eof, eof_count);
+    for (size_t i = 0; i < counts.size(); ++i) {
+      const double percent =
+          non_eof == 0 ? 0.0 : 100.0 * counts[i] / non_eof;
+      std::print("{}={}({:.1f}%){}", kTokenCategoryNames[i], counts[i],
+                 percent, i + 1 == counts.size() ? "\n" : " ");
+    }
+  }
+}
+
+corpus::Entry filter_error_tokens(const corpus::Entry &entry,
+                                  const std::filesystem::path &output_dir) {
+  Lexer lexer(entry.path);
+  lexer.lex();
+  std::ifstream source(entry.path, std::ios::binary);
+  if (!source)
+    throw std::runtime_error("cannot read input for error filtering: " +
+                             entry.path.string());
+  std::string filtered((std::istreambuf_iterator<char>(source)),
+                       std::istreambuf_iterator<char>());
+  if (filtered.size() != entry.bytes)
+    throw std::runtime_error("input size changed during error filtering: " +
+                             entry.path.string());
+
+  size_t offset = 0;
+  size_t filtered_errors = 0;
+  for (const Token &token : lexer.get_tokens()) {
+    while (offset < filtered.size()) {
+      const char byte = filtered[offset];
+      if (byte == ' ' || (byte >= '\t' && byte <= '\r')) {
+        ++offset;
+      } else if (byte == '#' ||
+                 (byte == '/' && offset + 1 < filtered.size() &&
+                  filtered[offset + 1] == '/')) {
+        while (offset < filtered.size() && filtered[offset] != '\n')
+          ++offset;
+      } else if (byte == '/' && offset + 1 < filtered.size() &&
+                 filtered[offset + 1] == '*') {
+        offset += 2;
+        while (offset + 1 < filtered.size() &&
+               !(filtered[offset] == '*' && filtered[offset + 1] == '/'))
+          ++offset;
+        if (offset + 1 == filtered.size()) {
+          offset = filtered.size();
+        } else {
+          offset += 2;
+        }
+      } else {
+        break;
+      }
+    }
+
+    if (token.type == TokenType::Eof)
+      break;
+    if (token.text.size() > filtered.size() - offset ||
+        std::string_view(filtered).substr(offset, token.text.size()) !=
+            token.text)
+      throw std::runtime_error("cannot align token while filtering errors in " +
+                               entry.path.string());
+    if (token.type != TokenType::Error) {
+      offset += token.text.size();
+      continue;
+    }
+    for (size_t i = 0; i < token.text.size(); ++i) {
+      char &byte = filtered[offset + i];
+      if (byte != '\n' && byte != '\r')
+        byte = ' ';
+    }
+    offset += token.text.size();
+    ++filtered_errors;
+  }
+
+  const auto path = output_dir / (entry.name + "-no-errors.txt");
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out)
+    throw std::runtime_error("cannot create filtered corpus: " + path.string());
+  out.write(filtered.data(), static_cast<std::streamsize>(filtered.size()));
+  if (!out)
+    throw std::runtime_error("cannot write filtered corpus: " + path.string());
+
+  std::println("filtered {} Error tokens from {}", filtered_errors, entry.name);
+  return {entry.name + "-no-errors", path, filtered.size(),
+          "error-token spans replaced by spaces"};
 }
 
 void compare_against(std::string_view label,
@@ -529,9 +680,12 @@ struct Options {
   std::filesystem::path corpus_dir{MONKEY_BENCH_CORPUS_DIR};
   std::filesystem::path src_dir{MONKEY_BENCH_SRC_DIR};
   corpus::Config config;
+  std::vector<corpus::Entry> custom_corpora;
   bool generate_only{false};
   bool verify_only{false};
   bool skip_verify{false};
+  bool token_mix_only{false};
+  bool filter_errors{false};
   bool list_only{false};
   bool quiet{false};
 };
@@ -539,8 +693,11 @@ struct Options {
 void usage() {
   std::println(
       "usage: {} [--corpus-dir DIR] [--small-bytes N] [--large-bytes N]\n"
-      "          [--external-bytes N] [--generate-only] [--verify-only]\n"
-      "          [--no-verify] [--list] [--quiet] [google benchmark flags...]",
+      "          [--src-dir DIR] [--external-bytes N] [--corpus-file NAME=PATH]\n"
+      "          [--generate-only] [--verify-only]\n"
+      "          [--no-verify] [--token-mix] [--filter-errors] [--list]\n"
+      "          [--quiet]\n"
+      "          [google benchmark flags...]",
       "lexer_bench");
 }
 
@@ -565,6 +722,8 @@ int main(int argc, char **argv) {
 
     if (const std::string value = value_of("--corpus-dir"); !value.empty()) {
       options.corpus_dir = value;
+    } else if (const std::string value = value_of("--src-dir"); !value.empty()) {
+      options.src_dir = value;
     } else if (const std::string value = value_of("--small-bytes");
                !value.empty()) {
       options.config.small_bytes = std::strtoull(value.c_str(), nullptr, 10);
@@ -574,12 +733,47 @@ int main(int argc, char **argv) {
     } else if (const std::string value = value_of("--external-bytes");
                !value.empty()) {
       options.config.external_bytes = std::strtoull(value.c_str(), nullptr, 10);
+    } else if (const std::string value = value_of("--corpus-file");
+               !value.empty()) {
+      const size_t separator = value.find('=');
+      if (separator == std::string::npos || separator == 0 ||
+          separator + 1 == value.size()) {
+        std::println(stderr, "--corpus-file expects NAME=PATH");
+        return 2;
+      }
+      const std::string name = value.substr(0, separator);
+      if (name.find_first_of("/\\") != std::string::npos) {
+        std::println(stderr, "custom corpus name cannot contain path separators");
+        return 2;
+      }
+      if (std::any_of(options.custom_corpora.begin(),
+                      options.custom_corpora.end(),
+                      [&](const corpus::Entry &entry) {
+                        return entry.name == name;
+                      })) {
+        std::println(stderr, "duplicate custom corpus name: {}", name);
+        return 2;
+      }
+      const std::filesystem::path path = value.substr(separator + 1);
+      std::error_code ec;
+      const uintmax_t bytes = std::filesystem::file_size(path, ec);
+      if (ec) {
+        std::println(stderr, "cannot stat custom corpus {}: {}", path.string(),
+                     ec.message());
+        return 2;
+      }
+      options.custom_corpora.push_back(
+          {name, path, static_cast<size_t>(bytes), "custom experimental corpus"});
     } else if (arg == "--generate-only") {
       options.generate_only = true;
     } else if (arg == "--verify-only") {
       options.verify_only = true;
     } else if (arg == "--no-verify") {
       options.skip_verify = true;
+    } else if (arg == "--token-mix") {
+      options.token_mix_only = true;
+    } else if (arg == "--filter-errors") {
+      options.filter_errors = true;
     } else if (arg == "--list") {
       options.list_only = true;
     } else if (arg == "--quiet") {
@@ -597,6 +791,27 @@ int main(int argc, char **argv) {
 
   g_verify_corpora = corpus::generate(options.corpus_dir, options.src_dir,
                                      options.config);
+  for (const corpus::Entry &entry : options.custom_corpora) {
+    const auto duplicate = std::find_if(
+        g_verify_corpora.begin(), g_verify_corpora.end(),
+        [&](const corpus::Entry &existing) { return existing.name == entry.name; });
+    if (duplicate != g_verify_corpora.end()) {
+      std::println(stderr, "custom corpus name duplicates built-in corpus: {}",
+                   entry.name);
+      return 2;
+    }
+    g_verify_corpora.push_back(entry);
+  }
+  if (options.filter_errors) {
+    const auto originals = g_verify_corpora;
+    for (const corpus::Entry &entry : originals) {
+      if (entry.name == "edge" || entry.name.starts_with("code-") ||
+          entry.name == "comment-large")
+        continue;
+      g_verify_corpora.push_back(
+          filter_error_tokens(entry, options.corpus_dir));
+    }
+  }
   for (const corpus::Entry &entry : g_verify_corpora)
     if (entry.name != "edge")
       g_bench_corpora.push_back(entry);
@@ -617,6 +832,11 @@ int main(int argc, char **argv) {
 
   if (options.generate_only)
     return 0;
+
+  if (options.token_mix_only) {
+    print_token_mix(g_verify_corpora);
+    return 0;
+  }
 
   if (!options.verify_only && !options.skip_verify) {
     if (!verify_all(!options.quiet)) {

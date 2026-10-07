@@ -76,8 +76,11 @@ Testing/
 *.jpeg
 *.jpg
 *.lex
+!benchmark/research.lex
 *.png
 *.pdf
+!benchmark/cost_scaling_chart.png
+!benchmark/cost_scaling_chart.pdf
 *.txt
 
 __pycache__/

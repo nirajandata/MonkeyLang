@@ -7,9 +7,12 @@ something to compare against that isn't just the same code run twice.
 Both lexers run over the same bytes and every token is compared: type, text and
 line number. If they disagree the harness prints the mismatches and refuses to
 measure anything. The token structs are `static_assert`ed to be the same size
-and layout as `token::Token`, and both sides use the same `mmap` recipe (one
-extra zero filled page past the end of the file) and the same token capacity
-heuristic (`size / 3 + 16`), so neither side wins on bookkeeping.
+and layout as `token::Token`, and both sides use the same padded mapping size
+and token-capacity heuristic (`size / 3 + 16`). The mapping permissions differ:
+Monkey uses a read-only file overlay, while flex needs a private writable
+overlay for its scanner and NUL patching. In `Lex` the mapping is created
+outside the repeated scan; in `Pipeline` flex pays a writable
+`MAP_POPULATE` copy-on-write cost on every iteration.
 
 flex reads the mapping directly through `yy_scan_buffer()` rather than
 `stdio`, so it isn't charged a `memcpy` that the hand written lexer avoids.
@@ -20,7 +23,9 @@ Intel Core i7-11370H (AVX-512, 4 cores / 8 threads), GCC 16.2,
 `-O3 -march=native`, Release, flex 2.6.4 with `--full`. Medians of 7
 repetitions at `--benchmark_min_time=1s`, pinned to core 2. Ratio is flex time /
 monkey time. These are the numbers in Table 1 of `research.lex` and in
-`tools/throughput_chart.py`:
+`tools/throughput_chart.py`. Pipeline columns are historical results from a
+harness that creates and first-touches a new token buffer each iteration; they
+are provisional and are not used as headline evidence:
 
 | corpus | size | Monkey/Lex | Flex/Lex | ratio | Monkey/Pipeline | Flex/Pipeline | ratio |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -32,8 +37,9 @@ monkey time. These are the numbers in Table 1 of `research.lex` and in
 
 Ratios are computed from unrounded medians, so they can differ from the ratio
 of the printed columns in the last digit. Lex speedup is a geometric mean of
-2.10x, Pipeline 1.92x. Throughput is `bytes_per_second` from Google Benchmark. Token counts per run are in
-`tokens_per_run`.
+2.10x. The historical Pipeline geometric mean is 1.92x but is provisional and
+not used as a headline. Throughput is `bytes_per_second` from Google Benchmark.
+Token counts per run are in `tokens_per_run`.
 
 The same session times more than the two lexers in this table: the
 `Scalar`/`Masks`/`IdentScan`/`KwOnly`/`Idents`/`Flat`/`FlatIdents` ablations, two
@@ -47,22 +53,18 @@ taskset -c 2 ./build/bench/lexer_bench --quiet \
   --benchmark_repetitions=7 --benchmark_min_time=1s
 ```
 
-`real-src` is where the AVX-512 lexer looks worst. This repository's own sources
-are 28% whitespace and 0% comments, the least skippable material of the five
-inputs (see Corpora below), so the vector loops bail out early and the
-time goes into per-token bookkeeping instead.
-
-Pipeline redistributes the gap because `mmap`/`munmap` costs a fixed 3.6-4.5 ms
-for a multi-megabyte file, and a fixed cost penalizes the faster lexer
-proportionally more: `code-large` falls from 2.16x to 1.87x while the geometric
-mean gives back part of the win, 2.10x on Lex against 1.92x on Pipeline.
+The two real corpora have a 1.85x geometric-mean speedup over flex in the
+Lex shape. The five-corpus mean of 2.10x includes three generated corpora.
+Neither the input ordering nor the historical Pipeline ratios identify a
+mechanism: token density, whitespace/comment share, buffer allocation and
+first-touch are confounded.
 
 ## What the speedup is actually made of
 
-The obvious explanation for a 2x win is the vector loops, and the instruction
-counts look like they back that up: on `code-large` the shipped lexer retires
-7.83 instructions per byte where the scalar ablation retires 14.94. It does not
-survive contact with the clock. Medians of 7 repetitions at
+On `code-large`, the shipped lexer retires 7.83 instructions per byte where the
+related scalar ablation retires 14.94, but the cycle rates are close. These
+numbers do not identify why the hand-written scanner outperforms the tested
+flex configuration. Medians of 7 repetitions at
 `--benchmark_min_time=1s`, MiB/s:
 
 | corpus | Scalar | Masks | KwOnly | IdentScan | Idents | Flat | FlatIdents | Monkey | Flex |
@@ -74,32 +76,30 @@ survive contact with the clock. Medians of 7 repetitions at
 | `comment-large` | 678.4 | 642.3 | 643.8 | 640.4 | 737.7 | 777.5 | 746.5 | 711.6 | 288.4 |
 
 `Scalar` is the same lexer with every 64-byte loop replaced by a byte-at-a-time
-loop, and it runs level with the shipped lexer, 0.99x of it on geometric mean and
-within 1% on each real-world corpus. The split cells take the small difference
-that remains apart: `IdentScan` vectorizes the identifier/constant scan but keeps
-keyword matching scalar (1.05x of `Scalar`), `KwOnly` keeps the scalar scan and
-adds the packed keyword table (0.96x of `Scalar`), `Idents` has both (1.10x of
-the shipped lexer), and `FlatIdents` adds the per-window cached masks on top
-(1.12x of the shipped lexer, the highest geometric mean of the ladder and
-ahead of the shipped lexer on every corpus). The shipped vectorization does not buy throughput
-on this processor, and the best use of the vector units here is identifiers and
-keyword tables over scalar whitespace.
+loop; its 0.99x geometric mean is near parity with this related variant, not an
+independently tuned scalar baseline. The split cells take the difference apart:
+`IdentScan` vectorizes the identifier/constant scan but keeps keyword matching
+scalar (1.05x of `Scalar`), `KwOnly` keeps the scalar scan and adds the packed
+keyword table (0.96x of `Scalar`), and `Idents` has both (1.10x of `Monkey`).
+`FlatIdents` ranges from 1.07x to 1.14x of `Monkey` across methods, so the
+session's 1.12x is not a stable point estimate.
 
-`research.lex`'s "Uncertainty and cross-method agreement" section puts 95%
-bootstrap intervals on every session cell (±0.5-9.9% per corpus) and
-cross-checks them against paired runs: `Idents` beats the shipped lexer in
-60/60 paired runs, `FlatIdents` in 52/60, `Scalar` in 22/60, `Copy` in 20/60,
-with session, paired and hardware-counter estimates agreeing to within about
-5 percentage points.
+`research.lex` reports 95% within-session intervals (±0.5-9.9% per corpus) and
+existing interleaved paired runs for selected cells. The 60 outcomes pool five
+corpora and are descriptive, not independent trials; the run order was not
+randomized and the full ladder was not paired.
 
-The counters say why. Instructions per byte fall by 48% from Scalar to Monkey on
-`code-large` (14.94 to 7.83), but IPC falls further, from 2.18 to 1.23, because
-the wide loops' dispatched uops concentrate on the vector ports — port 5 (vector
-shift/blend/mask-ALU) is busy in 43% of cycles, ports 0 and 1 in 24% and 26% —
-while the scalar cell's concentrate on the integer and branch port 6, busy in
-56-59% of its cycles. No port exceeds 60% for any lexer, so this is pressure
-rather than saturation, but it is measurable: same fixed-iteration `perf`
-runs as `research.lex` Table 6:
+Instructions per byte fall by 48% from Scalar to Monkey on `code-large` (14.94
+to 7.83), while cycles per byte change only from 6.85 to 6.36. That mismatch
+does not identify a cause. The earlier `perf stat -M TopdownL1` run is withdrawn:
+its reported Scalar retiring share (9.2%) implies only about 0.46 retiring slots
+per cycle on this five-wide core, inconsistent with the independently measured
+IPC of 2.18. None of its four-way percentages are used to support a performance
+mechanism. A replacement measurement needs raw event counts over the same scan
+window, per-core accounting, and an idle SMT sibling; that controlled setup was
+not available for this rerun.
+
+The fixed-iteration per-byte counters are:
 
 | corpus | lexer | instr/B | cycles/B | IPC |
 | --- | --- | ---: | ---: | ---: |
@@ -121,15 +121,12 @@ corpus (25,461 iterations for the 115 kB corpus). A short fixed-iteration run is
 dominated by start-up and inflates the per-byte numbers; that is visible in the
 `real-src` row if you use a single fixed count for all corpora.
 
-The win over flex comes from the scan loop's shape, not from using wide
-registers: flex retires 22.86 instructions per byte on `code-large` where the
-shipped lexer retires 7.83, and both lexers get the same mapping and the same
-tokens.
-
-`Masks` is the awkward one. It vectorizes only whitespace and comment skipping
-and is *slower* than `Scalar` on every corpus (268.6 against 353.5 on `real-src`),
-because a 64-byte load on a four-byte run of whitespace is work thrown away. It
-only pays off on input long enough to fill a register.
+The results do not establish that scan-loop shape causes the flex difference:
+token emission, classification and generator/runtime overhead were not
+separated. `Masks` is slower than `Scalar` in these tests, but this is the
+naively chunked whitespace/comment-mask implementation, not a general result
+about SIMD. Short whitespace runs motivate a scalar fast path before vector
+scanning; no such hybrid variant was measured.
 
 The ablated lexers are copies in `ablate/`, built as separate modules next to the
 real one. They are verified to produce exactly the shipped lexer's token stream,
@@ -163,9 +160,10 @@ figure is the median of the twelve per-pair ratios.
 | `comment-large` | 699.0 | 693.0 | 0.99x | 477.5 | 456.1 | 0.95x | 2/12 | 0/12 |
 
 MiB/s. Lex MiB/s columns are medians of the twelve launches; the Ratio columns
-are medians of the per-pair ratios. Pooled over all 60 pairs the median ratio
-is 0.99x on Lex, where `Copy` wins 20 of 60 pairs, and 0.97x on `Pipeline`, where
-it wins 17 of 60 (2 of 36 on the three multi-megabyte inputs). The counters are
+are medians of the per-pair ratios. Pooled over all 60 outcomes the median ratio
+is 0.99x on Lex, where `Copy` wins 20, and 0.97x on `Pipeline`, where it wins
+17 (2 of 36 on the three multi-megabyte inputs). These counts are descriptive
+across five corpora, not independent-trial significance tests. The counters are
 the cleaner evidence for `Lex`: `Copy` and `Monkey` retire identical instructions
 per byte, 12.37 on `real-libstdcxx` and 7.83 on `code-large`, with cycles per
 byte within 3% (8.28 against 8.08, 6.43 against 6.49). Page faults agree too:
@@ -173,18 +171,20 @@ every run took zero major faults, and user-mode minor faults per pipeline
 iteration match between the two within 1.3% on all three multi-megabyte corpora
 (3,592 against 3,583 on `code-large`, 5,429 against 5,497 on
 `real-libstdcxx`, 2,948 against 2,928 on `comment-large`), so fault behaviour
-does not separate them either. Those faults are token-buffer first-touch — the
-buffer allocates one element per three input bytes, crossing the allocator's
-32 MiB mmap threshold only on multi-megabyte inputs, and the small corpora
-amortize the run's ~14,000 setup faults over tens of thousands of iterations —
-not the mapping, which is populated at mmap time in kernel context.
-
-So the mapping is worth nothing over copying once the buffer is resident, and is
-worth about 3% when mapping is charged per file, where `read` copies the page
-cache and a populated mapping shares it. On a warm page cache both read from the
-same place, so this does not speak to a cold-cache workload. The padding itself is
-still doing necessary work: every variant depends on it to skip the load-safety
-check.
+does not separate them either. Their magnitude is consistent with token-buffer
+first-touch: on `code-large`, 418,308 emitted 32-byte tokens occupy 13.4 MB, or
+about 3,268 4 KiB pages, close to the 3,592 minor faults. The historical
+~1 us/fault rate makes those faults about 3.6 ms, while the measured mapping
+This points to output-buffer first-touch as a major part of Monkey's pipeline
+delta, but does not isolate it experimentally. The buffer allocates one element
+per three input bytes, crossing the allocator's 32 MiB mmap threshold only on
+multi-megabyte inputs, and the small corpora amortize the run's ~14,000 setup
+faults over tens of thousands of iterations. The Copy experiment compares two
+read-only mappings; flex uses a writable private mapping and pays additional
+copy-on-write costs, measured separately below. On a warm page cache both
+Monkey and Copy read the same data; the comparison says nothing about cold-cache
+workloads. The padding itself remains required by every variant to omit
+load-safety checks near EOF.
 
 Two things not to do here: parse `_median` `real_time` from the JSON when
 `--benchmark_repetitions` is set. Google Benchmark writes one entry per repetition
@@ -223,9 +223,11 @@ same story, since the counters here show low IPC rather than a clock drop.
 
 ## Pipeline versus Lex
 
-`Pipeline` adds `open`, `mmap`, `madvise` and `munmap`, which is what a compiler
-pays per translation unit. Milliseconds per file; Lex columns are from the
-seven-repetition session above, Pipeline columns are medians of five:
+The historical `Pipeline` shape includes `open`, `mmap`, `madvise`, tokenization,
+`munmap`, and a fresh token-buffer allocation on each iteration. Its results
+are end-to-end but cannot attribute overhead to mapping. Milliseconds per file;
+Lex columns are from the seven-repetition session above, Pipeline columns are
+historical medians of five:
 
 | corpus | Monkey Lex | Monkey Pipeline | Flex Lex | Flex Pipeline | Lex ratio | Pipeline ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -235,29 +237,34 @@ seven-repetition session above, Pipeline columns are medians of five:
 | `code-large` | 6.738 | 10.448 | 14.548 | 19.538 | 2.16x | 1.87x |
 | `comment-large` | 5.637 | 9.251 | 13.910 | 19.666 | 2.47x | 2.13x |
 
-On the multi-megabyte corpora the mapping and teardown gap between the two
-columns is 3.6 to 4.5 ms per file for the shipped lexer and 4.2 to 5.8 ms for
-the baseline, or 19 to 39% of whichever lexer's pipeline time you measure it
-against. A fixed cost penalises the faster lexer proportionally more, which is
-why `code-large` falls from 2.16x on `Lex` to 1.87x on `Pipeline`: there the
-shipped lexer adds 3.7 ms to a 6.7 ms lex (+55%) while the baseline adds 5.0 ms
-to a 14.5 ms lex (+34%). The geometric mean gives part of the win back with it,
-2.10x on `Lex` against 1.92x on `Pipeline`, while `real-src` and `code-small`,
-whose fixed costs are below the resolution of these runs (-0.007 to +0.024 ms),
-move only within session noise. So the pure-lex path represents most of a front end's
-per-file cost whenever translation units are small, which is the common case in
-C++, and about three fifths to two thirds of it when a single unit is several
-megabytes.
+The read-only mapping-stage probe is documented in Table A.5 of
+`research.lex`. A follow-up run of `tools/mapping_syscall_bench.cpp` measured a
+55.0 us median and 40 minor faults for the read-only `MAP_POPULATE` overlay,
+versus 758.1 us and 1,029 minor faults for the writable overlay. The file has
+1,029 pages; an explicit write pass after the writable map took 6.5 us and
+caused no further faults, showing that `MAP_POPULATE` pays the copy-on-write
+faults during `mmap`. Writable `munmap` took 90.6 us versus 17.0 us for the
+read-only mapping. These session-variable micro-timings suggest that writable
+population adds about 0.70 ms and unmapping about 0.07 ms; they explain part,
+but not all, of the roughly 1.3 ms flex-minus-Monkey Pipeline delta on
+`code-large`. An end-to-end run with matched mapping permissions is still
+needed.
 
-Run-to-run coefficients of variation in this session were 0.7-4.3% for the
-shipped lexer's pipeline medians and up to 6.5% for flex, so these ratios are
-readable without the pairing protocol the mapping comparison needs. The
-comparison does not rest on a single session anyway: a paired rerun of flex
+Reproduce the syscall measurements with:
+
+```sh
+c++ -O2 -std=c++20 benchmark/tools/mapping_syscall_bench.cpp -o /tmp/mapping_syscall_bench
+taskset -c 2 /tmp/mapping_syscall_bench build/bench/corpus/code-large.txt 1000
+```
+
+Run-to-run coefficients of variation in the historical session were 0.7-4.3%
+for the shipped lexer's pipeline medians and up to 6.5% for flex. A paired rerun of flex
 against Monkey (twelve interleaved launches per corpus at
 `--benchmark_min_time=0.3s`) gives 1.68x / 1.65x / 2.30x / 1.97x / 2.09x per
 corpus, a 1.92x pooled geometric mean, and flex wins none of the 60 pairs.
 Four of the five rows agree with the table above to within 2%; `code-large`
-differs by 5% (1.87x against 1.97x), within session drift.
+differs by 5% (1.87x against 1.97x), within session drift. The pooled win count
+is descriptive across corpora, not an independent-trial significance test.
 
 ## Hardware counters
 
@@ -279,12 +286,85 @@ byte: the shipped lexer retires 2.7-4.6x fewer branches per byte, so it takes
 0.061-0.070 mispredicts per input byte against flex's 0.115-0.200, fewer on
 every corpus. Mispredicts per byte do not order the lexers either: the Scalar
 ablation takes 0.118 per byte on `code-large`, the same as flex (0.119), and
-runs 2.3x faster than it. The wide instructions are limited by vector
-port throughput, while the DFA's per-character transitions predict well.
+runs 2.3x faster than it. These aggregate counters do not show where the misses
+occur or establish why fewer instructions fail to reduce time proportionally.
+On `real-libstdcxx`, the rates correspond to about 0.55 misses per Monkey token
+and 1.0 per Flex token; sampled `br_misp_retired.all_branches` profiles with
+annotation are needed to locate them.
 
 The difference is instructions per byte: 0.28x to 0.53x of flex, geometric mean
-0.38x. Branches per retired instruction drop from about 0.20 to about 0.15, and
-what's left is the irregular work at token boundaries.
+0.38x. Branches per retired instruction drop from about 0.20 to about 0.15.
+These aggregate results do not identify a cost mechanism. The controlled 3x3
+grid below varies identifier length and whitespace-run length independently;
+the next useful controls are a scalar-first hybrid whitespace path and a
+null-consumer scan.
+
+The current token-type counts can be reproduced with
+`./build/bench/lexer_bench --quiet --token-mix`. Percentages exclude the
+terminal EOF token; unsupported source constructs appear as error tokens rather
+than being silently folded into another class:
+
+| corpus | identifier | constant | keyword | operator/punctuation | error token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `real-src` | 34.2% | 0.9% | 3.6% | 52.4% | 8.9% |
+| `real-libstdcxx` | 41.0% | 1.0% | 3.0% | 50.5% | 4.5% |
+| `code-small` | 16.4% | 15.1% | 11.1% | 57.4% | 0.0% |
+| `code-large` | 16.3% | 15.4% | 11.0% | 57.3% | 0.0% |
+| `comment-large` | 16.5% | 15.2% | 11.0% | 57.3% | 0.0% |
+
+`Error` tokens are one byte per unsupported character in both scanners; a
+digit-plus-identifier sequence instead becomes one error token spanning the
+whole malformed sequence. Bytes inside quoted strings are still tokenized
+normally. The two real inputs include 8.9% and 4.5% Error tokens, respectively.
+Replacing their spans with spaces (same file byte count) and rerunning seven
+timing repetitions on the source snapshot from the paper's recorded commit gives
+median-CPU-time speedups of 1.83x on `real-src` and 1.91x on `real-libstdcxx`
+(1.87x geometric mean, compared with the original 1.85x). This is a diagnostic
+input edit, not a grammar extension.
+
+Recreate that diagnostic using a source tree checked out at the paper's commit:
+
+```sh
+./build/bench/lexer_bench --src-dir=/path/to/fda7b59/src --filter-errors --verify-only
+./build/bench/lexer_bench --src-dir=/path/to/fda7b59/src --filter-errors --no-verify \
+  --benchmark_filter='(Monkey|Flex)/Lex/.*-no-errors' --benchmark_min_time=1s \
+  --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
+```
+
+The five existing corpora also show an exploratory scaling pattern: bytes per
+token rise from 4.1 to 12.1 while counter speedup rises from 1.68x to 2.44x.
+The manuscript's `cost-scaling` table combines bytes/token, Flex cycles/byte,
+Monkey cycles/token and counter speedup. It is suggestive, not causal, because
+token mix and corpus type are confounded.
+
+The controlled 3x3 corpus generator varies identifier length (4/16/64 bytes)
+and target mean whitespace-run length (1/8/32 spaces) at 4 MiB fixed size.
+The randomized mode uses deterministic random identifier characters and
+shuffled run lengths (1--15 for mean 8, 1--63 for mean 32); the one-space
+separator cannot vary while remaining positive and averaging one:
+
+```sh
+python3 benchmark/tools/control_corpus_grid.py build/bench/control-grid-random \
+  --seed 20261007
+```
+
+Each generated file can be added with a repeated `--corpus-file=NAME=PATH`
+option to `lexer_bench`; use fixed iteration counts with `perf stat` for both
+`Monkey/Lex/NAME` and `Flex/Lex/NAME`. The paper reports three shuffled-order
+rounds of 100 scans for each of the 18 scanner/input pairs. It also retains the
+earlier repeated-identifier grid for comparison. These exploratory samples
+still do not establish a pure per-byte/per-token cost model; CPU scaling was
+enabled and the SMT sibling was not verified idle. The 54 raw counter rows are
+preserved in `benchmark/data/control_grid_random_20261007.csv`.
+
+Regenerate the five-corpus speedup-versus-bytes/token plot with:
+
+```sh
+python3 benchmark/tools/cost_scaling_chart.py
+```
+
+This writes `benchmark/cost_scaling_chart.png` and `.pdf`; the plotted values
+come from `cost-scaling` in `research.lex`.
 
 Cycles per byte implies 1.68x / 1.87x / 2.15x / 2.35x / 2.44x against wall-clock
 1.69x / 2.03x / 2.23x / 2.16x / 2.47x. The two disagree by at most 9%.
@@ -440,6 +520,7 @@ benchmark/
   bench/bench_lexer.cpp          verification + Google Benchmark harness
   tools/compare.py               pairs the two JSON results into one table
   tools/throughput_chart.py      throughput chart, PDF and PNG
+  tools/mapping_syscall_bench.cpp times mapping setup syscalls by stage
   run.sh                         configure, build, verify, measure
   paired_mapping.sh              paired Monkey/Copy sampling for the mapping ablation
   research.lex                   LaTeX draft, takes its numbers from here
@@ -462,4 +543,3 @@ instead of asserted. They live in their own modules and their own namespaces
 compares them against the shipped lexer's token stream as well as against flex.
 If they ever drift from `src/lexer.cppm` the verification fails before anything is
 timed.
-

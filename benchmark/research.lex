@@ -428,7 +428,7 @@ On \code{code-large}, branch misses per byte are $0.069$ for the shipped lexer, 
 
 \subsection{Limitations}
 \label{sec:limitations}
-All results come from a single core of an Intel Core i7-11370H. We did not validate top-down attribution with raw per-core events and an idle SMT sibling, sample and annotate branch misses, repeat the controlled corpus grid across sessions or with less repetitive inputs, measure a hybrid whitespace path, run a null-consumer scan or flex-feature/scalar-DFA ablations, or randomize and pair the whole ablation ladder. Session confidence intervals do not capture between-session drift. The randomized grid's low Monkey branch-miss count is at the process-level measurement floor, so the apparent cycles per token with few misses motivates—but does not substitute for—a null-consumer scan that would separate scanning from token-storage cost.
+All results come from a single core of an Intel Core i7-11370H. We did not validate top-down attribution with raw per-core events and an idle SMT sibling, sample and annotate branch misses, repeat the controlled corpus grid across sessions or with less repetitive inputs, measure a hybrid whitespace path, run a null-consumer scan or flex-feature/scalar-DFA ablations, or randomize and pair the whole ablation ladder. Session confidence intervals do not capture between-session drift. Because Monkey's miss count is at the measurement floor, its cost of about 60 or more cycles per token is not explained by mispredicts. A null-consumer scan would separate scanning from token storage.
 
 \needspace{8\baselineskip}
 \section{Conclusion}

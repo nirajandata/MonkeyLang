@@ -355,7 +355,12 @@ rounds of 100 scans for each of the 18 scanner/input pairs. It also retains the
 earlier repeated-identifier grid for comparison. These exploratory samples
 still do not establish a pure per-byte/per-token cost model; CPU scaling was
 enabled and the SMT sibling was not verified idle. The 54 raw counter rows are
-preserved in `benchmark/data/control_grid_random_20261007.csv`.
+preserved in `benchmark/data/control_grid_random_20261007.csv`. A further
+three-round run with `cycles,branch-misses` is preserved in
+`benchmark/data/control_grid_branch_misses_20261007.csv`; the paper reports the
+median branch misses per byte from these rounds alongside the derived
+cycles/token estimates. The cycles/token estimates are derived from the
+earlier randomized-grid cycle runs, not these separate branch-counter runs.
 
 Regenerate the five-corpus speedup-versus-bytes/token plot with:
 

@@ -358,9 +358,13 @@ enabled and the SMT sibling was not verified idle. The 54 raw counter rows are
 preserved in `benchmark/data/control_grid_random_20261007.csv`. A further
 three-round run with `cycles,branch-misses` is preserved in
 `benchmark/data/control_grid_branch_misses_20261007.csv`; the paper reports the
-median branch misses per byte from these rounds alongside the derived
-cycles/token estimates. The cycles/token estimates are derived from the
-earlier randomized-grid cycle runs, not these separate branch-counter runs.
+median misses/token from these rounds alongside cycles/byte, cycles/token, and
+the Flex/Monkey ratio. The cycles/token estimates are derived from the earlier
+randomized-grid cycle runs, not these separate branch-counter runs. Perf counts
+include benchmark-process startup and harness execution; startup misses were
+not subtracted. Treat the roughly 0.0017 misses/byte repeated across Monkey
+cells, and the 16-byte/one-space Flex cell, as a measurement floor (<0.002),
+not as an exact zero-like result.
 
 Regenerate the five-corpus speedup-versus-bytes/token plot with:
 

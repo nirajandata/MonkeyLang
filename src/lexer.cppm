@@ -287,7 +287,7 @@ public:
     open_ok_ = true;
   }
 
-  Lexer(const Lexer &) = delete;
+  Lexer(const Lexer&) = delete;
   Lexer &operator=(const Lexer &) = delete;
 
   Lexer(Lexer &&other) noexcept

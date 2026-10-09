@@ -4,6 +4,7 @@ module;
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -14,10 +15,85 @@ export {
     using Ts::operator()...;
   };
 
-  struct Constant {
+  enum class TypeKind { Int, Long, UInt, ULong, Double, Function, Pointer };
+
+  struct Type {
+    TypeKind kind = TypeKind::Int;
+    std::vector<Type> params;
+    std::shared_ptr<Type> ret;
+    std::shared_ptr<Type> referenced;
+
+    static Type int_type() { return {}; }
+    static Type long_type() { return {TypeKind::Long, {}, nullptr, nullptr}; }
+    static Type uint_type() { return {TypeKind::UInt, {}, nullptr, nullptr}; }
+    static Type ulong_type() { return {TypeKind::ULong, {}, nullptr, nullptr}; }
+    static Type double_type() { return {TypeKind::Double, {}, nullptr, nullptr}; }
+    static Type function(std::vector<Type> params, Type ret) {
+      return {TypeKind::Function, std::move(params),
+              std::make_shared<Type>(std::move(ret)), nullptr};
+    }
+    static Type pointer(Type referenced) {
+      return {TypeKind::Pointer, {},
+              nullptr, std::make_shared<Type>(std::move(referenced))};
+    }
+
+    friend bool operator==(const Type &a, const Type &b) {
+      if (a.kind != b.kind || a.params != b.params ||
+          static_cast<bool>(a.ret) != static_cast<bool>(b.ret) ||
+          static_cast<bool>(a.referenced) != static_cast<bool>(b.referenced))
+        return false;
+      return (!a.ret || *a.ret == *b.ret) &&
+             (!a.referenced || *a.referenced == *b.referenced);
+    }
+  };
+
+  struct ConstInt {
     int32_t value;
     uint32_t line;
   };
+
+  struct ConstLong {
+    int64_t value;
+    uint32_t line;
+  };
+
+  struct ConstUInt {
+    uint32_t value;
+    uint32_t line;
+  };
+
+  struct ConstULong {
+    uint64_t value;
+    uint32_t line;
+  };
+
+  struct ConstDouble {
+    double value;
+    uint32_t line;
+  };
+
+  struct IntInit {
+    int32_t value;
+  };
+
+  struct LongInit {
+    int64_t value;
+  };
+
+  struct UIntInit {
+    uint32_t value;
+  };
+
+  struct ULongInit {
+    uint64_t value;
+  };
+
+  struct DoubleInit {
+    double value;
+  };
+
+  using StaticInit =
+      std::variant<IntInit, LongInit, UIntInit, ULongInit, DoubleInit>;
 
   struct Complement {};
 
@@ -91,6 +167,12 @@ export {
     uint32_t line;
   };
 
+  struct Cast {
+    Type target_type;
+    std::unique_ptr<Exp> exp;
+    uint32_t line;
+  };
+
   struct Unary {
     UnaryOp op;
     std::unique_ptr<Exp> exp;
@@ -137,9 +219,21 @@ export {
     uint32_t line;
   };
 
+  struct Dereference {
+    std::unique_ptr<Exp> exp;
+    uint32_t line;
+  };
+
+  struct AddrOf {
+    std::unique_ptr<Exp> exp;
+    uint32_t line;
+  };
+
   struct Exp {
-    std::variant<Constant, Var, Unary, Binary, Assignment, CompoundAssignment,
-                 IncDec, Conditional, FunctionCall> value;
+    std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble, Var,
+                 Cast, Unary, Binary, Assignment, CompoundAssignment, IncDec,
+                 Conditional, FunctionCall, Dereference, AddrOf> value;
+    Type type;
   };
 
   struct Return {
@@ -212,6 +306,7 @@ export {
     std::optional<Exp> init;
     uint32_t line;
     std::optional<StorageClass> storage_class;
+    Type var_type;
   };
 
   struct FunctionDeclaration {
@@ -220,6 +315,7 @@ export {
     std::unique_ptr<Block> body;
     uint32_t line;
     std::optional<StorageClass> storage_class;
+    Type fun_type;
   };
 
   struct FunDecl {

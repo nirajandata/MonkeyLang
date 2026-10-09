@@ -67,6 +67,14 @@ export enum class TokenType : uint32_t {
   Default,
   Static,
   Extern,
+  Long,
+  LongConstant,
+  Signed,
+  Unsigned,
+  UnsignedConstant,
+  UnsignedLongConstant,
+  Double,
+  FloatingConstant,
 };
 
 export struct Token {

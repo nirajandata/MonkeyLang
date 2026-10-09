@@ -1,6 +1,9 @@
 module;
 
 #include <cstdint>
+#include <bit>
+#include <cmath>
+#include <memory>
 #include <print>
 #include <string>
 #include <string_view>
@@ -21,20 +24,6 @@ std::uint64_t name_counter = 0;
 export std::uint64_t next_name_id();
 
 export {
-  enum class TypeKind { Int, Function };
-
-  struct Type {
-    TypeKind kind = TypeKind::Int;
-    size_t param_count = 0;
-
-    static Type int_type() { return {}; }
-    static Type function(size_t param_count) {
-      return {TypeKind::Function, param_count};
-    }
-
-    friend bool operator==(const Type &, const Type &) = default;
-  };
-
   struct Symbol {
     Type type;
     struct FunAttr {
@@ -43,7 +32,9 @@ export {
     };
     struct InitialValue {
       enum class Kind { Tentative, Initial, NoInitializer } kind;
-      int32_t value = 0;
+      uint64_t value = 0;
+      double double_value = 0.0;
+      bool is_double = false;
     };
     struct StaticAttr {
       InitialValue init;
@@ -107,16 +98,13 @@ class IdentifierResolver {
       entry.from_current_scope = false;
   }
 
-  void validate_lvalue(const Exp &exp, uint32_t line) {
-    if (!std::holds_alternative<Var>(exp.value)) {
-      std::println("error:{}: Expression is not a valid lvalue", line);
-      had_error_ = true;
-    }
-  }
-
   void resolve_exp(Exp &exp, const Scope &scope) {
     std::visit(Overload{
-                   [](Constant &) {},
+                   [](ConstInt &) {},
+                   [](ConstLong &) {},
+                   [](ConstUInt &) {},
+                   [](ConstULong &) {},
+                   [](ConstDouble &) {},
                    [&](Var &v) {
                      auto it = scope.find(v.name);
                      if (it == scope.end()) {
@@ -128,22 +116,22 @@ class IdentifierResolver {
                       v.name = it->second.new_name;
                     },
                    [&](const Unary &u) { resolve_exp(*u.exp, scope); },
-                   [&](const Binary &b) {
+                   [&](Dereference &d) { resolve_exp(*d.exp, scope); },
+                   [&](AddrOf &a) { resolve_exp(*a.exp, scope); },
+                   [&](Cast &c) { resolve_exp(*c.exp, scope); },
+                   [&](Binary &b) {
                      resolve_exp(*b.left, scope);
                      resolve_exp(*b.right, scope);
                    },
                    [&](Assignment &a) {
-                     validate_lvalue(*a.left, a.line);
                      resolve_exp(*a.left, scope);
                      resolve_exp(*a.right, scope);
                    },
                    [&](CompoundAssignment &a) {
-                     validate_lvalue(*a.left, a.line);
                      resolve_exp(*a.left, scope);
                      resolve_exp(*a.right, scope);
                    },
                    [&](IncDec &e) {
-                     validate_lvalue(*e.exp, e.line);
                      resolve_exp(*e.exp, scope);
                    },
                    [&](const Conditional &c) {
@@ -370,6 +358,7 @@ public:
 class TypeChecker {
   bool had_error_ = false;
   using InitialValue = Symbol::InitialValue;
+  Type return_type_ = Type::int_type();
 
   static bool is_extern(const VariableDeclaration &d) {
     return d.storage_class &&
@@ -381,17 +370,232 @@ class TypeChecker {
            std::holds_alternative<Static>(*d.storage_class);
   }
 
-  std::optional<int32_t> constant_initializer(const VariableDeclaration &d) {
+  std::optional<std::variant<uint64_t, double>>
+  constant_initializer(const VariableDeclaration &d) {
     if (!d.init) return std::nullopt;
-    if (const auto *constant = std::get_if<Constant>(&d.init->value))
-      return constant->value;
-    return std::nullopt;
+    auto evaluate = [&](const auto &self, const Exp &exp)
+        -> std::optional<long double> {
+      return std::visit(
+          Overload{
+              [](const ConstInt &constant) -> std::optional<long double> {
+                return constant.value;
+              },
+              [](const ConstLong &constant) -> std::optional<long double> {
+                return static_cast<long double>(constant.value);
+              },
+              [](const ConstUInt &constant) -> std::optional<long double> {
+                return constant.value;
+              },
+              [](const ConstULong &constant) -> std::optional<long double> {
+                return static_cast<long double>(constant.value);
+              },
+              [](const ConstDouble &constant) -> std::optional<long double> {
+                return constant.value;
+              },
+              [&](const Cast &cast) -> std::optional<long double> {
+                auto value = self(self, *cast.exp);
+                if (!value) return std::nullopt;
+                if (cast.target_type.kind == TypeKind::Double)
+                  return static_cast<double>(*value);
+                if (cast.target_type.kind == TypeKind::Int ||
+                    cast.target_type.kind == TypeKind::UInt ||
+                    cast.target_type.kind == TypeKind::Long ||
+                    cast.target_type.kind == TypeKind::ULong) {
+                  if (cast.exp->type.kind == TypeKind::Double) {
+                    const bool is_unsigned =
+                        cast.target_type.kind == TypeKind::UInt ||
+                        cast.target_type.kind == TypeKind::ULong;
+                    const int bits =
+                        cast.target_type.kind == TypeKind::Int ||
+                                cast.target_type.kind == TypeKind::UInt
+                            ? 32
+                            : 64;
+                    if (!std::isfinite(*value) ||
+                        *value < (is_unsigned ? 0.0L
+                                              : -std::ldexp(1.0L, bits - 1)) ||
+                        *value >= (is_unsigned ? std::ldexp(1.0L, bits)
+                                               : std::ldexp(1.0L, bits - 1)))
+                      return std::nullopt;
+                  }
+                  return std::trunc(*value);
+                }
+                return value;
+              },
+              [](const auto &) -> std::optional<long double> {
+                return std::nullopt;
+              }},
+          exp.value);
+    };
+    auto value = evaluate(evaluate, *d.init);
+    if (!value) return std::nullopt;
+    if (d.var_type.kind == TypeKind::Pointer) {
+      if (*value == 0)
+        return std::variant<uint64_t, double>{uint64_t{0}};
+      return std::nullopt;
+    }
+    if (d.var_type.kind == TypeKind::Double)
+      return std::variant<uint64_t, double>{static_cast<double>(*value)};
+    if (!std::isfinite(*value)) return std::nullopt;
+
+    const bool double_source = d.init->type.kind == TypeKind::Double;
+    const int width =
+        d.var_type.kind == TypeKind::Int || d.var_type.kind == TypeKind::UInt
+            ? 32
+            : 64;
+    const long double modulus = std::ldexp(1.0L, width);
+    if (double_source &&
+        (*value < 0 ||
+         *value >= (d.var_type.kind == TypeKind::UInt ||
+                            d.var_type.kind == TypeKind::ULong
+                        ? modulus
+                        : std::ldexp(1.0L, width - 1))))
+      return std::nullopt;
+
+    long double wrapped = std::fmod(std::trunc(*value), modulus);
+    if (wrapped < 0) wrapped += modulus;
+    const uint64_t bits = static_cast<uint64_t>(wrapped);
+    if (d.var_type.kind == TypeKind::UInt ||
+        d.var_type.kind == TypeKind::ULong)
+      return std::variant<uint64_t, double>{bits};
+    if (width == 32)
+      return std::variant<uint64_t, double>{
+          static_cast<uint64_t>(static_cast<int64_t>(
+              std::bit_cast<int32_t>(static_cast<uint32_t>(bits))))};
+    return std::variant<uint64_t, double>{
+        static_cast<uint64_t>(std::bit_cast<int64_t>(bits))};
   }
 
-  void typecheck_exp(const Exp &exp) {
-    std::visit(
+  static Type common_type(const Type &left, const Type &right) {
+    if (left == right) return left;
+    if (left.kind == TypeKind::Double || right.kind == TypeKind::Double)
+      return Type::double_type();
+    const auto rank = [](TypeKind kind) {
+      return kind == TypeKind::Long || kind == TypeKind::ULong ? 2 : 1;
+    };
+    const auto is_unsigned = [](TypeKind kind) {
+      return kind == TypeKind::UInt || kind == TypeKind::ULong;
+    };
+    if (is_unsigned(left.kind) == is_unsigned(right.kind))
+      return rank(left.kind) > rank(right.kind) ? left : right;
+
+    const Type &unsigned_type = is_unsigned(left.kind) ? left : right;
+    const Type &signed_type = is_unsigned(left.kind) ? right : left;
+    if (rank(unsigned_type.kind) >= rank(signed_type.kind))
+      return unsigned_type;
+    if (rank(signed_type.kind) > rank(unsigned_type.kind))
+      return signed_type;
+    return signed_type.kind == TypeKind::Long ? Type::ulong_type()
+                                               : Type::uint_type();
+  }
+
+  static bool is_arithmetic(const Type &type) {
+    return type.kind != TypeKind::Pointer && type.kind != TypeKind::Function;
+  }
+
+  static bool is_null_pointer_constant(const Exp &exp) {
+    return std::visit(
+        Overload{[](const ConstInt &c) { return c.value == 0; },
+                 [](const ConstLong &c) { return c.value == 0; },
+                 [](const ConstUInt &c) { return c.value == 0; },
+                 [](const ConstULong &c) { return c.value == 0; },
+                 [](const auto &) { return false; }},
+        exp.value);
+  }
+
+  static bool is_lvalue(const Exp &exp) {
+    return exp.type.kind != TypeKind::Function &&
+           (std::holds_alternative<Var>(exp.value) ||
+            std::holds_alternative<Dereference>(exp.value));
+  }
+
+  Type common_pointer_type(Exp &left, Exp &right, uint32_t line) {
+    if (left.type == right.type) return left.type;
+    if (left.type.kind == TypeKind::Pointer &&
+        is_null_pointer_constant(right)) {
+      right = convert_to(std::move(right), left.type);
+      return left.type;
+    }
+    if (right.type.kind == TypeKind::Pointer &&
+        is_null_pointer_constant(left)) {
+      left = convert_to(std::move(left), right.type);
+      return right.type;
+    }
+    std::println("error:{}: Expressions have incompatible pointer types", line);
+    had_error_ = true;
+    return left.type;
+  }
+
+  void convert_by_assignment(Exp &exp, const Type &target) {
+    if (exp.type == target) return;
+    if (is_arithmetic(exp.type) && is_arithmetic(target)) {
+      exp = convert_to(std::move(exp), target);
+      return;
+    }
+    if (target.kind == TypeKind::Pointer && is_null_pointer_constant(exp)) {
+      exp = convert_to(std::move(exp), target);
+      return;
+    }
+    const uint32_t line = std::visit(
+        Overload{[](const ConstInt &v) { return v.line; },
+                 [](const ConstLong &v) { return v.line; },
+                 [](const ConstUInt &v) { return v.line; },
+                 [](const ConstULong &v) { return v.line; },
+                 [](const ConstDouble &v) { return v.line; },
+                 [](const Var &v) { return v.line; },
+                 [](const Dereference &v) { return v.line; },
+                 [](const AddrOf &v) { return v.line; },
+                 [](const Cast &v) { return v.line; },
+                 [](const Unary &v) { return v.line; },
+                 [](const Binary &v) { return v.line; },
+                 [](const Assignment &v) { return v.line; },
+                 [](const CompoundAssignment &v) { return v.line; },
+                 [](const IncDec &v) { return v.line; },
+                 [](const Conditional &v) { return v.line; },
+                 [](const FunctionCall &v) { return v.line; }},
+        exp.value);
+    std::println("error:{}: Cannot convert type for assignment", line);
+    had_error_ = true;
+  }
+
+  static Exp convert_to(Exp exp, const Type &target) {
+    if (exp.type == target) return exp;
+    const uint32_t line = std::visit(
+        Overload{[](const ConstInt &v) { return v.line; },
+                 [](const ConstLong &v) { return v.line; },
+                 [](const ConstUInt &v) { return v.line; },
+                 [](const ConstULong &v) { return v.line; },
+                 [](const ConstDouble &v) { return v.line; },
+                 [](const Var &v) { return v.line; },
+                 [](const Dereference &v) { return v.line; },
+                 [](const AddrOf &v) { return v.line; },
+                 [](const Cast &v) { return v.line; },
+                 [](const Unary &v) { return v.line; },
+                 [](const Binary &v) { return v.line; },
+                 [](const Assignment &v) { return v.line; },
+                 [](const CompoundAssignment &v) { return v.line; },
+                 [](const IncDec &v) { return v.line; },
+                 [](const Conditional &v) {
+                   return v.line;
+                 },
+                 [](const FunctionCall &v) { return v.line; }},
+        exp.value);
+    Exp converted{Cast{target, std::make_unique<Exp>(std::move(exp)), line},
+                  target};
+    return converted;
+  }
+
+  void convert_to(std::unique_ptr<Exp> &exp, const Type &target) {
+    *exp = convert_to(std::move(*exp), target);
+  }
+
+  Type typecheck_exp(Exp &exp) {
+    Type result = std::visit(
         Overload{
-            [](const Constant &) {},
+            [](const ConstInt &) { return Type::int_type(); },
+            [](const ConstLong &) { return Type::long_type(); },
+            [](const ConstUInt &) { return Type::uint_type(); },
+            [](const ConstULong &) { return Type::ulong_type(); },
+            [](const ConstDouble &) { return Type::double_type(); },
             [&](const Var &v) {
               const Type &var_type = symbol_table().get(v.name).type;
               if (var_type.kind == TypeKind::Function) {
@@ -399,81 +603,225 @@ class TypeChecker {
                              v.line);
                 had_error_ = true;
               }
+              return var_type;
             },
-            [&](const Unary &u) { typecheck_exp(*u.exp); },
-            [&](const Binary &b) {
-              typecheck_exp(*b.left);
-              typecheck_exp(*b.right);
+            [&](const Cast &c) {
+              Type source = typecheck_exp(*c.exp);
+              if ((source.kind == TypeKind::Double &&
+                   c.target_type.kind == TypeKind::Pointer) ||
+                  (source.kind == TypeKind::Pointer &&
+                   c.target_type.kind == TypeKind::Double) ||
+                  source.kind == TypeKind::Function ||
+                  c.target_type.kind == TypeKind::Function) {
+                std::println("error:{}: Invalid cast involving pointer type",
+                             c.line);
+                had_error_ = true;
+              }
+              return c.target_type;
             },
-            [&](const Assignment &a) {
-              typecheck_exp(*a.left);
+            [&](Dereference &d) {
+              Type pointer_type = typecheck_exp(*d.exp);
+              if (pointer_type.kind != TypeKind::Pointer ||
+                  !pointer_type.referenced) {
+                std::println("error:{}: Cannot dereference non-pointer",
+                             d.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              return *pointer_type.referenced;
+            },
+            [&](AddrOf &a) {
+              Type referenced = typecheck_exp(*a.exp);
+              if (!is_lvalue(*a.exp)) {
+                std::println("error:{}: Can't take the address of a non-lvalue",
+                             a.line);
+                had_error_ = true;
+              }
+              return Type::pointer(std::move(referenced));
+            },
+            [&](const Unary &u) {
+              Type operand_type = typecheck_exp(*u.exp);
+              if (operand_type.kind == TypeKind::Pointer &&
+                  !std::holds_alternative<Not>(u.op)) {
+                std::println("error:{}: Invalid unary operator on pointer",
+                             u.line);
+                had_error_ = true;
+              }
+              if (std::holds_alternative<Complement>(u.op) &&
+                  operand_type.kind == TypeKind::Double) {
+                std::println(
+                    "error:{}: Can't take the bitwise complement of a double",
+                    u.line);
+                had_error_ = true;
+              }
+              return std::holds_alternative<Not>(u.op) ? Type::int_type()
+                                                        : operand_type;
+            },
+            [&](Binary &b) {
+              Type left = typecheck_exp(*b.left);
+              Type right = typecheck_exp(*b.right);
+              if (std::holds_alternative<Remainder>(b.op) &&
+                  (left.kind == TypeKind::Double ||
+                   right.kind == TypeKind::Double)) {
+                std::println(
+                    "error:{}: Remainder operator requires integer operands",
+                    b.line);
+                had_error_ = true;
+              }
+              if (std::holds_alternative<And>(b.op) ||
+                  std::holds_alternative<Or>(b.op))
+                return Type::int_type();
+              if (std::holds_alternative<Equal>(b.op) ||
+                  std::holds_alternative<NotEqual>(b.op)) {
+                if (left.kind == TypeKind::Pointer ||
+                    right.kind == TypeKind::Pointer) {
+                  common_pointer_type(*b.left, *b.right, b.line);
+                  return Type::int_type();
+                }
+              }
+              if (left.kind == TypeKind::Pointer ||
+                  right.kind == TypeKind::Pointer) {
+                std::println("error:{}: Unsupported operation on pointer",
+                             b.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              Type common = common_type(left, right);
+              convert_to(b.left, common);
+              convert_to(b.right, common);
+              if (std::holds_alternative<Add>(b.op) ||
+                  std::holds_alternative<Subtract>(b.op) ||
+                  std::holds_alternative<Multiply>(b.op) ||
+                  std::holds_alternative<Divide>(b.op) ||
+                  std::holds_alternative<Remainder>(b.op) ||
+                  std::holds_alternative<BitwiseAnd>(b.op) ||
+                  std::holds_alternative<BitwiseOr>(b.op) ||
+                  std::holds_alternative<BitwiseXor>(b.op) ||
+                  std::holds_alternative<ShiftLeft>(b.op) ||
+                  std::holds_alternative<ShiftRight>(b.op))
+                return common;
+              return Type::int_type();
+            },
+            [&](Assignment &a) {
+              Type left = typecheck_exp(*a.left);
               typecheck_exp(*a.right);
+              if (!is_lvalue(*a.left)) {
+                std::println("error:{}: Expression is not a valid lvalue",
+                             a.line);
+                had_error_ = true;
+              }
+              convert_by_assignment(*a.right, left);
+              return left;
             },
-            [&](const CompoundAssignment &a) {
-              typecheck_exp(*a.left);
+            [&](CompoundAssignment &a) {
+              Type left = typecheck_exp(*a.left);
               typecheck_exp(*a.right);
+              if (!is_lvalue(*a.left)) {
+                std::println("error:{}: Expression is not a valid lvalue",
+                             a.line);
+                had_error_ = true;
+              }
+              if (left.kind == TypeKind::Pointer ||
+                  a.right->type.kind == TypeKind::Pointer) {
+                std::println("error:{}: Unsupported compound operation on pointer",
+                             a.line);
+                had_error_ = true;
+              }
+              convert_by_assignment(*a.right, left);
+              return left;
             },
-            [&](const IncDec &e) { typecheck_exp(*e.exp); },
-            [&](const Conditional &c) {
+            [&](const IncDec &e) {
+              Type type = typecheck_exp(*e.exp);
+              if (!is_lvalue(*e.exp) || type.kind == TypeKind::Pointer) {
+                std::println("error:{}: Invalid increment/decrement operand",
+                             e.line);
+                had_error_ = true;
+              }
+              return type;
+            },
+            [&](Conditional &c) {
               typecheck_exp(*c.condition);
-              typecheck_exp(*c.then_exp);
-              typecheck_exp(*c.else_exp);
+              Type then_type = typecheck_exp(*c.then_exp);
+              Type else_type = typecheck_exp(*c.else_exp);
+              Type common;
+              if (then_type.kind == TypeKind::Pointer ||
+                  else_type.kind == TypeKind::Pointer) {
+                common = common_pointer_type(*c.then_exp, *c.else_exp,
+                                             c.line);
+              } else {
+                common = common_type(then_type, else_type);
+                convert_to(c.then_exp, common);
+                convert_to(c.else_exp, common);
+              }
+              return common;
             },
-            [&](const FunctionCall &c) {
+            [&](FunctionCall &c) {
               const Type &fun_type = symbol_table().get(c.name).type;
-              if (fun_type.kind == TypeKind::Int) {
+              if (fun_type.kind != TypeKind::Function) {
                 std::println("error:{}: Variable used as function name",
                              c.line);
                 had_error_ = true;
-              } else if (fun_type.param_count != c.args.size()) {
+                for (const auto &arg : c.args) typecheck_exp(*arg);
+                return Type::int_type();
+              }
+              if (fun_type.params.size() != c.args.size()) {
                 std::println(
                     "error:{}: Function called with the wrong number of "
                     "arguments",
                     c.line);
                 had_error_ = true;
               }
-              for (const auto &arg : c.args)
-                typecheck_exp(*arg);
+              for (size_t i = 0; i < c.args.size(); ++i) {
+                typecheck_exp(*c.args[i]);
+                if (i < fun_type.params.size())
+                  convert_by_assignment(*c.args[i], fun_type.params[i]);
+              }
+              return fun_type.ret ? *fun_type.ret : Type::int_type();
             },
         },
         exp.value);
+    exp.type = result;
+    return result;
   }
 
-  void typecheck_statement(const Statement &stmt) {
+  void typecheck_statement(Statement &stmt) {
     std::visit(
         Overload{
-            [&](const Return &r) { typecheck_exp(r.value); },
-            [&](const Expression &e) { typecheck_exp(e.value); },
+            [&](Return &r) {
+              typecheck_exp(r.value);
+              convert_by_assignment(r.value, return_type_);
+            },
+            [&](Expression &e) { typecheck_exp(e.value); },
             [](const Null &) {},
-            [&](const If &i) {
+            [&](If &i) {
               typecheck_exp(i.condition);
               typecheck_statement(*i.then_stmt);
               if (i.else_stmt)
                 typecheck_statement(*i.else_stmt);
             },
             [](const Goto &) {},
-            [&](const Label &l) { typecheck_statement(*l.stmt); },
-            [&](const Compound &c) { typecheck_block(*c.block); },
+            [&](Label &l) { typecheck_statement(*l.stmt); },
+            [&](Compound &c) { typecheck_block(*c.block); },
             [](const Break &) {},
             [](const Continue &) {},
-            [&](const Case &c) {
+            [&](Case &c) {
               typecheck_exp(c.value);
               typecheck_statement(*c.stmt);
             },
-            [&](const Default &d) { typecheck_statement(*d.stmt); },
-            [&](const Switch &s) {
+            [&](Default &d) { typecheck_statement(*d.stmt); },
+            [&](Switch &s) {
               typecheck_exp(s.condition);
               typecheck_statement(*s.body);
             },
-            [&](const While &w) {
+            [&](While &w) {
               typecheck_exp(w.condition->value);
               typecheck_statement(*w.body);
             },
-            [&](const DoWhile &d) {
+            [&](DoWhile &d) {
               typecheck_statement(*d.body);
               typecheck_exp(d.condition->value);
             },
-            [&](const For &f) {
+            [&](For &f) {
               typecheck_for_init(f.init);
               if (f.condition)
                 typecheck_exp(f.condition->value);
@@ -485,7 +833,8 @@ class TypeChecker {
         stmt.value);
   }
 
-  void typecheck_local_variable_declaration(const VariableDeclaration &d) {
+  void typecheck_local_variable_declaration(VariableDeclaration &d) {
+    const Type &decl_type = d.var_type;
     if (is_extern(d)) {
       if (d.init) {
         std::println("error:{}: Initializer on local extern variable '{}'",
@@ -496,9 +845,13 @@ class TypeChecker {
         if (prev->type.kind == TypeKind::Function) {
           std::println("error:{}: Function redeclared as variable", d.line);
           had_error_ = true;
+        } else if (!(prev->type == decl_type)) {
+          std::println("error:{}: Conflicting variable types for '{}'",
+                       d.line, d.name);
+          had_error_ = true;
         }
       } else {
-        symbol_table().add(d.name, Type::int_type(),
+        symbol_table().add(d.name, decl_type,
                            Symbol::StaticAttr{
                                {InitialValue::Kind::NoInitializer, 0}, true});
       }
@@ -508,30 +861,47 @@ class TypeChecker {
     if (is_static(d)) {
       InitialValue init{InitialValue::Kind::Initial, 0};
       if (d.init) {
+        typecheck_exp(*d.init);
+        convert_by_assignment(*d.init, decl_type);
         if (auto value = constant_initializer(d)) {
-          init.value = *value;
+          if (const auto *integer = std::get_if<uint64_t>(&*value))
+            init.value = *integer;
+          else {
+            init.double_value = std::get<double>(*value);
+            init.is_double = true;
+          }
         } else {
           std::println("error:{}: Non-constant initializer on local static variable '{}'",
                        d.line, d.name);
           had_error_ = true;
         }
       }
-      symbol_table().add(d.name, Type::int_type(),
+      symbol_table().add(d.name, decl_type,
                          Symbol::StaticAttr{init, false});
       return;
     }
 
-    symbol_table().add(d.name, Type::int_type(), Symbol::LocalAttr{});
-    if (d.init)
+    symbol_table().add(d.name, decl_type, Symbol::LocalAttr{});
+    if (d.init) {
       typecheck_exp(*d.init);
+      convert_by_assignment(*d.init, decl_type);
+    }
   }
 
   void typecheck_file_scope_variable_declaration(
-      const VariableDeclaration &d) {
+      VariableDeclaration &d) {
     InitialValue init{InitialValue::Kind::Tentative, 0};
     if (d.init) {
+      typecheck_exp(*d.init);
+      convert_by_assignment(*d.init, d.var_type);
       if (auto value = constant_initializer(d)) {
-        init = {InitialValue::Kind::Initial, *value};
+        init.kind = InitialValue::Kind::Initial;
+        if (const auto *integer = std::get_if<uint64_t>(&*value))
+          init.value = *integer;
+        else {
+          init.double_value = std::get<double>(*value);
+          init.is_double = true;
+        }
       } else {
         std::println("error:{}: Non-constant initializer for file-scope variable '{}'",
                      d.line, d.name);
@@ -544,8 +914,14 @@ class TypeChecker {
 
     bool global = !is_static(d);
     if (const Symbol *prev = symbol_table().find(d.name)) {
-      if (prev->type.kind != TypeKind::Int) {
+      if (prev->type.kind == TypeKind::Function) {
         std::println("error:{}: Function redeclared as variable", d.line);
+        had_error_ = true;
+        return;
+      }
+      if (!(prev->type == d.var_type)) {
+        std::println("error:{}: Conflicting variable types for '{}'",
+                     d.line, d.name);
         had_error_ = true;
         return;
       }
@@ -573,12 +949,12 @@ class TypeChecker {
       }
     }
 
-    symbol_table().add(d.name, Type::int_type(),
+    symbol_table().add(d.name, d.var_type,
                        Symbol::StaticAttr{init, global});
   }
 
-  void typecheck_function_declaration(const FunctionDeclaration &d) {
-    const Type fun_type = Type::function(d.params.size());
+  void typecheck_function_declaration(FunctionDeclaration &d) {
+    const Type fun_type = d.fun_type;
     const bool has_body = static_cast<bool>(d.body);
     bool already_defined = false;
     bool global = !d.storage_class ||
@@ -612,26 +988,30 @@ class TypeChecker {
 
     if (!has_body)
       return;
-    for (const auto &param : d.params)
-      symbol_table().add(param, Type::int_type(), Symbol::LocalAttr{});
+    Type previous_return_type = return_type_;
+    return_type_ = d.fun_type.ret ? *d.fun_type.ret : Type::int_type();
+    for (size_t i = 0; i < d.params.size(); ++i)
+      symbol_table().add(d.params[i], d.fun_type.params[i],
+                         Symbol::LocalAttr{});
     typecheck_block(*d.body);
+    return_type_ = std::move(previous_return_type);
   }
 
-  void typecheck_declaration(const Declaration &d) {
+  void typecheck_declaration(Declaration &d) {
     std::visit(
         Overload{
-            [&](const FunDecl &f) { typecheck_function_declaration(f.decl); },
-            [&](const VarDecl &v) {
+            [&](FunDecl &f) { typecheck_function_declaration(f.decl); },
+            [&](VarDecl &v) {
             typecheck_local_variable_declaration(v.decl);
             },
         },
         d);
   }
 
-  void typecheck_for_init(const ForInit &init) {
+  void typecheck_for_init(ForInit &init) {
     std::visit(
         Overload{
-            [&](const InitDecl &d) {
+            [&](InitDecl &d) {
               if (d.decl.storage_class) {
                 std::println("error:{}: Storage-class specifier is not allowed in a for initializer",
                              d.decl.line);
@@ -639,7 +1019,7 @@ class TypeChecker {
               }
               typecheck_local_variable_declaration(d.decl);
             },
-            [&](const InitExp &e) {
+            [&](InitExp &e) {
               if (e.exp)
                 typecheck_exp(*e.exp);
             },
@@ -647,12 +1027,12 @@ class TypeChecker {
         init);
   }
 
-  void typecheck_block(const Block &block) {
-    for (const auto &item : block.items) {
+  void typecheck_block(Block &block) {
+    for (auto &item : block.items) {
       std::visit(
           Overload{
-              [&](const Statement &stmt) { typecheck_statement(stmt); },
-              [&](const Declaration &d) { typecheck_declaration(d); },
+              [&](Statement &stmt) { typecheck_statement(stmt); },
+              [&](Declaration &d) { typecheck_declaration(d); },
           },
           item);
     }
@@ -662,8 +1042,8 @@ public:
   bool check(Program &program) {
     symbol_table().clear();
 
-    for (const auto &declaration : program.declarations) {
-      if (const auto *func = std::get_if<FunDecl>(&declaration)) {
+    for (auto &declaration : program.declarations) {
+      if (auto *func = std::get_if<FunDecl>(&declaration)) {
         typecheck_function_declaration(func->decl);
       } else {
         typecheck_file_scope_variable_declaration(
@@ -770,9 +1150,16 @@ class BreakContinueLabeler {
 
   void find_enclosing_loop(Exp &exp, const Targets *loop) {
     std::visit(Overload{
-                   [](Constant &) {},
+                   [](ConstInt &) {},
+                   [](ConstLong &) {},
+                   [](ConstUInt &) {},
+                   [](ConstULong &) {},
+                   [](ConstDouble &) {},
                    [](Var &) {},
+                   [&](Dereference &d) { find_enclosing_loop(*d.exp, loop); },
+                   [&](AddrOf &a) { find_enclosing_loop(*a.exp, loop); },
                    [&](Unary &u) { find_enclosing_loop(*u.exp, loop); },
+                   [&](Cast &c) { find_enclosing_loop(*c.exp, loop); },
                    [&](Binary &b) {
                      find_enclosing_loop(*b.left, loop);
                      find_enclosing_loop(*b.right, loop);
@@ -916,15 +1303,26 @@ class SwitchGatherer {
   }
 
   void record_case(Case &c, SwitchCases &cases) {
-    const auto *value = std::get_if<Constant>(&c.value.value);
-    if (!value) {
+    int32_t value = 0;
+    if (const auto *constant = std::get_if<ConstInt>(&c.value.value)) {
+      value = constant->value;
+    } else if (const auto *constant =
+                   std::get_if<ConstLong>(&c.value.value)) {
+      value = static_cast<int32_t>(constant->value);
+    } else if (const auto *constant =
+                   std::get_if<ConstUInt>(&c.value.value)) {
+      value = static_cast<int32_t>(constant->value);
+    } else if (const auto *constant =
+                   std::get_if<ConstULong>(&c.value.value)) {
+      value = static_cast<int32_t>(constant->value);
+    } else {
       std::println("error:{}: Case value must be a constant expression",
                    c.line);
       had_error_ = true;
       return;
     }
-    if (!cases.values.insert(value->value).second) {
-      std::println("error:{}: Duplicate case value '{}'", c.line, value->value);
+    if (!cases.values.insert(value).second) {
+      std::println("error:{}: Duplicate case value '{}'", c.line, value);
       had_error_ = true;
       return;
     }

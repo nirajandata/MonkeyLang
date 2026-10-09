@@ -46,7 +46,8 @@ template <size_t N> struct KeywordMap {
     }
   }
 
-  [[nodiscard]] inline TokenType lookup(const char *data, size_t len) const noexcept {
+  [[nodiscard]] inline TokenType lookup(const char *data,
+                                        size_t len) const noexcept {
     if (len == 0 || len > max_keyword_len)
       return TokenType::Identifier;
 
@@ -59,7 +60,8 @@ template <size_t N> struct KeywordMap {
     uint64_t hits = 0;
 
     for (size_t i = 0; i < NUM_VECS; ++i) {
-      __m512i vkeys = _mm512_load_si512(reinterpret_cast<const __m512i*>(&keys[i * VEC_SIZE]));
+      __m512i vkeys = _mm512_load_si512(
+          reinterpret_cast<const __m512i *>(&keys[i * VEC_SIZE]));
 
       __mmask8 mask = _mm512_cmpeq_epi64_mask(target, vkeys);
 
@@ -74,12 +76,26 @@ template <size_t N> struct KeywordMap {
 };
 
 inline constexpr std::pair<std::string_view, TokenType> keyword_entries_[] = {
-    {"if", TokenType::If}, {"else", TokenType::Else}, {"int", TokenType::Int},
-    {"void", TokenType::Void}, {"return", TokenType::Return}, {"goto", TokenType::Goto},
-    {"do", TokenType::Do}, {"for", TokenType::For}, {"while", TokenType::While},
-    {"break", TokenType::Break}, {"continue", TokenType::Continue}, {"switch", TokenType::Switch},
-    {"case", TokenType::Case}, {"default", TokenType::Default}, {"static", TokenType::Static},
+    {"if", TokenType::If},
+    {"else", TokenType::Else},
+    {"int", TokenType::Int},
+    {"void", TokenType::Void},
+    {"return", TokenType::Return},
+    {"goto", TokenType::Goto},
+    {"do", TokenType::Do},
+    {"for", TokenType::For},
+    {"while", TokenType::While},
+    {"break", TokenType::Break},
+    {"continue", TokenType::Continue},
+    {"switch", TokenType::Switch},
+    {"case", TokenType::Case},
+    {"default", TokenType::Default},
+    {"static", TokenType::Static},
     {"extern", TokenType::Extern},
+    {"long", TokenType::Long},
+    {"signed", TokenType::Signed},
+    {"unsigned", TokenType::Unsigned},
+    {"double", TokenType::Double},
 };
 
 inline constexpr size_t keyword_count =
@@ -87,14 +103,17 @@ inline constexpr size_t keyword_count =
 
 constexpr bool all_keywords_fit() noexcept {
   for (const auto &keyword_entrie : keyword_entries_) {
-    if (keyword_entrie.first.size() > max_keyword_len) return false;
+    if (keyword_entrie.first.size() > max_keyword_len)
+      return false;
   }
   return true;
 }
 
-static_assert(all_keywords_fit(), "a keyword does not fit in max_keyword_len bytes");
+static_assert(all_keywords_fit(),
+              "a keyword does not fit in max_keyword_len bytes");
 
-inline constexpr auto keyword_map_ = KeywordMap<keyword_count>(keyword_entries_);
+inline constexpr auto keyword_map_ =
+    KeywordMap<keyword_count>(keyword_entries_);
 
 } // namespace detail
 
@@ -106,7 +125,10 @@ private:
 
     MMapHandle() = default;
     MMapHandle(void *base, size_t size) : map_base(base), map_size(size) {}
-    ~MMapHandle() { if (map_base) munmap(map_base, map_size); }
+    ~MMapHandle() {
+      if (map_base)
+        munmap(map_base, map_size);
+    }
 
     MMapHandle(const MMapHandle &) = delete;
     MMapHandle &operator=(const MMapHandle &) = delete;
@@ -117,7 +139,8 @@ private:
 
     MMapHandle &operator=(MMapHandle &&other) noexcept {
       if (this != &other) {
-        if (map_base) munmap(map_base, map_size);
+        if (map_base)
+          munmap(map_base, map_size);
         map_base = std::exchange(other.map_base, nullptr);
         map_size = std::exchange(other.map_size, 0);
       }
@@ -139,12 +162,14 @@ private:
       const uint64_t ws = ascii::is_space_512(chars);
 
       if (ws == ~0ULL) {
-        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
+        const uint64_t nl =
+            _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         current_line_ += std::popcount(nl);
         cursor_ += 64;
       } else {
         const int offset = std::countr_zero(~ws);
-        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
+        const uint64_t nl =
+            _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         const uint64_t nl_skipped = nl & ((1ULL << offset) - 1);
         current_line_ += std::popcount(nl_skipped);
         cursor_ += offset;
@@ -165,16 +190,19 @@ private:
         return;
       }
     }
-    if (cursor_ > limit_) cursor_ = limit_;
+    if (cursor_ > limit_)
+      cursor_ = limit_;
   }
 
   inline void skip_block_comment() noexcept {
     while (cursor_ < limit_) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t star = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('*'));
+      const uint64_t star =
+          _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('*'));
 
       if (star == 0) {
-        const uint64_t nl = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
+        const uint64_t nl =
+            _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('\n'));
         current_line_ += std::popcount(nl);
         cursor_ += 64;
       } else {
@@ -183,14 +211,16 @@ private:
     }
 
     while (cursor_ < limit_) {
-      if (*cursor_ == '\n') current_line_++;
+      if (*cursor_ == '\n')
+        current_line_++;
       else if (*cursor_ == '*' && cursor_[1] == '/') {
         cursor_ += 2;
         return;
       }
       cursor_++;
     }
-    if (cursor_ > limit_) cursor_ = limit_;
+    if (cursor_ > limit_)
+      cursor_ = limit_;
     had_error_ = true;
   }
 
@@ -199,7 +229,8 @@ private:
 
     while (true) {
       const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t is_under = _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('_'));
+      const uint64_t is_under =
+          _mm512_cmpeq_epi8_mask(chars, _mm512_set1_epi8('_'));
       const uint64_t valid = ascii::is_alnum_512(chars) | is_under;
 
       if (valid == ~0ULL) {
@@ -212,32 +243,82 @@ private:
 
     const size_t len = cursor_ - start;
     const std::string_view text(start, len);
-    tokens_.emplace_back(detail::keyword_map_.lookup(start, len), text, current_line_);
+    tokens_.emplace_back(detail::keyword_map_.lookup(start, len), text,
+                         current_line_);
   }
 
-  inline void read_constant() noexcept {
+  inline void emit_invalid_constant(const char *start) noexcept {
+    had_error_ = true;
+    while (cursor_ < limit_ &&
+           (ascii::is_alnum(*cursor_) || *cursor_ == '_' || *cursor_ == '.'))
+      ++cursor_;
+    tokens_.emplace_back(TokenType::Error,
+                         std::string_view(start, cursor_ - start),
+                         current_line_);
+  }
+
+  inline void read_constant(bool starts_with_dot = false) noexcept {
     const char *start = cursor_;
+    bool is_floating = starts_with_dot;
+    TokenType type = TokenType::Constant;
 
-    while (true) {
-      const __m512i chars = _mm512_loadu_si512(cursor_);
-      const uint64_t is_digit = ascii::is_digit_512(chars);
-
-      if (is_digit == ~0ULL) {
-        cursor_ += 64;
-      } else {
-        cursor_ += std::countr_zero(~is_digit);
-        break;
+    if (starts_with_dot) {
+      ++cursor_;
+      while (ascii::is_digit(*cursor_))
+        ++cursor_;
+    } else {
+      while (ascii::is_digit(*cursor_))
+        ++cursor_;
+      if (*cursor_ == '.') {
+        is_floating = true;
+        ++cursor_;
+        while (ascii::is_digit(*cursor_))
+          ++cursor_;
       }
     }
 
-    if (ascii::is_alpha(*cursor_) || *cursor_ == '_') {
-      had_error_ = true;
-      while (ascii::is_alnum(*cursor_) || *cursor_ == '_') cursor_++;
-      tokens_.emplace_back(TokenType::Error, std::string_view(start, cursor_ - start), current_line_);
+    if (*cursor_ == 'e' || *cursor_ == 'E') {
+      is_floating = true;
+      ++cursor_;
+      if (*cursor_ == '+' || *cursor_ == '-')
+        ++cursor_;
+      const char *exponent_start = cursor_;
+      while (ascii::is_digit(*cursor_))
+        ++cursor_;
+      if (cursor_ == exponent_start) {
+        emit_invalid_constant(start);
+        return;
+      }
+    }
+
+    if (!is_floating) {
+      if (*cursor_ == 'l' || *cursor_ == 'L') {
+        ++cursor_;
+        if (*cursor_ == 'u' || *cursor_ == 'U') {
+          ++cursor_;
+          type = TokenType::UnsignedLongConstant;
+        } else {
+          type = TokenType::LongConstant;
+        }
+      } else if (*cursor_ == 'u' || *cursor_ == 'U') {
+        ++cursor_;
+        if (*cursor_ == 'l' || *cursor_ == 'L') {
+          ++cursor_;
+          type = TokenType::UnsignedLongConstant;
+        } else {
+          type = TokenType::UnsignedConstant;
+        }
+      }
+    }
+
+    if (ascii::is_alnum(*cursor_) || *cursor_ == '_' || *cursor_ == '.') {
+      emit_invalid_constant(start);
       return;
     }
 
-    tokens_.emplace_back(TokenType::Constant, std::string_view(start, cursor_ - start), current_line_);
+    tokens_.emplace_back(is_floating ? TokenType::FloatingConstant : type,
+                         std::string_view(start, cursor_ - start),
+                         current_line_);
   }
 
   inline void emit(TokenType type, size_t len) noexcept {
@@ -250,30 +331,39 @@ public:
     struct UniqueFd {
       int fd{-1};
       explicit UniqueFd(int f) : fd(f) {}
-      ~UniqueFd() { if (fd >= 0) close(fd); }
+      ~UniqueFd() {
+        if (fd >= 0)
+          close(fd);
+      }
       operator int() const { return fd; }
     };
 
     UniqueFd fd{open(path.c_str(), O_RDONLY)};
-    if (fd < 0) return;
+    if (fd < 0)
+      return;
 
     struct stat st{};
-    if (fstat(fd, &st) != 0 || st.st_size < 0) return;
+    if (fstat(fd, &st) != 0 || st.st_size < 0)
+      return;
 
     const size_t size = static_cast<size_t>(st.st_size);
     const long page_size_l = sysconf(_SC_PAGESIZE);
-    const size_t page_size = page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
+    const size_t page_size =
+        page_size_l > 0 ? static_cast<size_t>(page_size_l) : 4096;
 
     const size_t file_pages = (size + page_size - 1) / page_size;
     const size_t map_size = (file_pages + 1) * page_size;
 
-    void *base = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) return;
+    void *base =
+        mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED)
+      return;
 
     mmap_handle_ = MMapHandle{base, map_size};
 
     if (size > 0) {
-      void *filemap = mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0);
+      void *filemap = mmap(base, size, PROT_READ,
+                           MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, fd, 0);
       if (filemap == MAP_FAILED) {
         mmap_handle_ = MMapHandle{};
         return;
@@ -287,7 +377,7 @@ public:
     open_ok_ = true;
   }
 
-  Lexer(const Lexer&) = delete;
+  Lexer(const Lexer &) = delete;
   Lexer &operator=(const Lexer &) = delete;
 
   Lexer(Lexer &&other) noexcept
@@ -331,6 +421,8 @@ public:
         read_identifier_or_keyword();
       } else if (ascii::is_digit(c)) {
         read_constant();
+      } else if (c == '.' && ascii::is_digit(cursor_[1])) {
+        read_constant(true);
       } else {
         switch (c) {
         case '#':

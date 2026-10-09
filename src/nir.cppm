@@ -15,13 +15,16 @@ import ast;
 import semantic;
 
 export {
-  struct NirConstant {
-    int32_t value;
-  };
+  using NirConstant =
+      std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble>;
   struct NirVar {
     std::string name;
   };
   using NirVal = std::variant<NirConstant, NirVar>;
+  struct NirDereferencedPointer {
+    NirVal pointer;
+  };
+  using NirExpResult = std::variant<NirVal, NirDereferencedPointer>;
 
   enum class NirUnaryOp : uint8_t { Complement, Negate, Not };
   enum class NirBinaryOp : uint8_t {
@@ -46,6 +49,34 @@ export {
   struct NirReturn {
     NirVal val;
   };
+  struct NirSignExtend {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirTruncate {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirZeroExtend {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirDoubleToInt {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirDoubleToUInt {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirIntToDouble {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirUIntToDouble {
+    NirVal src;
+    NirVal dst;
+  };
   struct NirUnary {
     NirUnaryOp op;
     NirVal src;
@@ -60,6 +91,18 @@ export {
   struct NirCopy {
     NirVal src;
     NirVal dst;
+  };
+  struct NirGetAddress {
+    NirVal src;
+    NirVal dst;
+  };
+  struct NirLoad {
+    NirVal pointer;
+    NirVal dst;
+  };
+  struct NirStore {
+    NirVal src;
+    NirVal pointer;
   };
   struct NirJump {
     std::string target;
@@ -87,7 +130,10 @@ export {
   };
 
   using NirInstruction =
-      std::variant<NirReturn, NirUnary, NirBinary, NirCopy, NirJump,
+      std::variant<NirReturn, NirSignExtend, NirTruncate, NirZeroExtend,
+                   NirDoubleToInt, NirDoubleToUInt, NirIntToDouble,
+                   NirUIntToDouble, NirUnary, NirBinary, NirCopy, NirGetAddress,
+                   NirLoad, NirStore, NirJump,
                    NirJumpIfZero, NirJumpIfNotZero, NirJumpIfNotEqual,
                    NirLabel, NirCall>;
 
@@ -100,7 +146,8 @@ export {
   struct NirStaticVariable {
     std::string name;
     bool global;
-    int32_t init;
+    Type type;
+    StaticInit init;
   };
   using NirTopLevel = std::variant<NirFunction, NirStaticVariable>;
   struct NirProgram {
@@ -127,8 +174,10 @@ consteval TargetEnum reflect_to_enum() {
 }
 
 class NirEmitter {
-  std::string make_temporary() {
-    return "tmp." + std::to_string(next_name_id());
+  NirVar make_tacky_variable(const Type &type) {
+    std::string name = "tmp." + std::to_string(next_name_id());
+    symbol_table().add(name, type, Symbol::LocalAttr{});
+    return NirVar{std::move(name)};
   }
 
   std::string make_label(std::string_view prefix) {
@@ -137,20 +186,20 @@ class NirEmitter {
 
   NirVal emit_and(const Binary &b,
                     std::vector<NirInstruction> &instructions) {
-    NirVal dst = NirVar{make_temporary()};
+    NirVal dst = make_tacky_variable(Type::int_type());
     auto false_label = make_label("and_false");
     auto end_label = make_label("and_end");
 
-    auto left = emit_val(*b.left, instructions);
+    auto left = emit_val_and_convert(*b.left, instructions);
     instructions.push_back(NirJumpIfZero{left, false_label});
 
-    auto right = emit_val(*b.right, instructions);
+    auto right = emit_val_and_convert(*b.right, instructions);
     instructions.push_back(NirJumpIfZero{right, false_label});
 
-    instructions.push_back(NirCopy{NirConstant{1}, dst});
+    instructions.push_back(NirCopy{NirConstant{ConstInt{1, 0}}, dst});
     instructions.push_back(NirJump{end_label});
     instructions.push_back(NirLabel{false_label});
-    instructions.push_back(NirCopy{NirConstant{0}, dst});
+    instructions.push_back(NirCopy{NirConstant{ConstInt{0, 0}}, dst});
     instructions.push_back(NirLabel{end_label});
 
     return dst;
@@ -158,41 +207,41 @@ class NirEmitter {
 
   NirVal emit_or(const Binary &b,
                    std::vector<NirInstruction> &instructions) {
-    NirVal dst = NirVar{make_temporary()};
+    NirVal dst = make_tacky_variable(Type::int_type());
     auto true_label = make_label("or_true");
     auto end_label = make_label("or_end");
 
-    auto left = emit_val(*b.left, instructions);
+    auto left = emit_val_and_convert(*b.left, instructions);
     instructions.push_back(NirJumpIfNotZero{left, true_label});
 
-    auto right = emit_val(*b.right, instructions);
+    auto right = emit_val_and_convert(*b.right, instructions);
     instructions.push_back(NirJumpIfNotZero{right, true_label});
 
-    instructions.push_back(NirCopy{NirConstant{0}, dst});
+    instructions.push_back(NirCopy{NirConstant{ConstInt{0, 0}}, dst});
     instructions.push_back(NirJump{end_label});
     instructions.push_back(NirLabel{true_label});
-    instructions.push_back(NirCopy{NirConstant{1}, dst});
+    instructions.push_back(NirCopy{NirConstant{ConstInt{1, 0}}, dst});
     instructions.push_back(NirLabel{end_label});
 
     return dst;
   }
 
-  NirVal emit_conditional(const Conditional &c,
+  NirVal emit_conditional(const Conditional &c, const Type &type,
                           std::vector<NirInstruction> &instructions) {
-    NirVal dst = NirVar{make_temporary()};
+    NirVal dst = make_tacky_variable(type);
     auto then_label = make_label("then");
     auto else_label = make_label("else");
     auto end_label = make_label("end");
 
-    auto condition = emit_val(*c.condition, instructions);
+    auto condition = emit_val_and_convert(*c.condition, instructions);
     instructions.push_back(NirJumpIfZero{std::move(condition), else_label});
 
-    auto then_val = emit_val(*c.then_exp, instructions);
+    auto then_val = emit_val_and_convert(*c.then_exp, instructions);
     instructions.push_back(NirCopy{std::move(then_val), dst});
     instructions.push_back(NirJump{end_label});
     instructions.push_back(NirLabel{else_label});
 
-    auto else_val = emit_val(*c.else_exp, instructions);
+    auto else_val = emit_val_and_convert(*c.else_exp, instructions);
     instructions.push_back(NirCopy{std::move(else_val), dst});
 
     instructions.push_back(NirLabel{then_label});
@@ -200,30 +249,97 @@ class NirEmitter {
     return dst;
   }
 
-  NirVal emit_val(const Exp &exp,
-                    std::vector<NirInstruction> &instructions) {
+  NirExpResult emit_val(const Exp &exp,
+                        std::vector<NirInstruction> &instructions) {
     return std::visit(
-        Overload{[](const Constant &c) -> NirVal {
-                   return NirConstant{c.value};
+        Overload{[](const ConstInt &c) -> NirExpResult {
+                   return NirConstant{c};
+                 },
+                 [](const ConstLong &c) -> NirExpResult {
+                   return NirConstant{c};
+                 },
+                 [](const ConstUInt &c) -> NirExpResult {
+                   return NirConstant{c};
+                 },
+                 [](const ConstULong &c) -> NirExpResult {
+                   return NirConstant{c};
+                 },
+                 [](const ConstDouble &c) -> NirExpResult {
+                   return NirConstant{c};
                  },
 
-                 [](const Var &v) -> NirVal {
+                 [](const Var &v) -> NirExpResult {
                    return NirVar{v.name};
                  },
 
-                 [&](const Assignment &a) -> NirVal {
-                   auto right = emit_val(*a.right, instructions);
-                   auto left = emit_val(*a.left, instructions);
-                   instructions.push_back(NirCopy{std::move(right), left});
-                   return left;
+                 [&](const Cast &c) -> NirExpResult {
+                   NirVal src = emit_val_and_convert(*c.exp, instructions);
+                   if (c.target_type == c.exp->type) return src;
+                   NirVar dst = make_tacky_variable(c.target_type);
+                   if (c.target_type.kind == TypeKind::Double) {
+                     if (c.exp->type.kind == TypeKind::UInt ||
+                         c.exp->type.kind == TypeKind::ULong)
+                       instructions.push_back(NirUIntToDouble{src, dst});
+                     else
+                       instructions.push_back(NirIntToDouble{src, dst});
+                     return dst;
+                   }
+                   if (c.exp->type.kind == TypeKind::Double) {
+                     if (c.target_type.kind == TypeKind::UInt ||
+                         c.target_type.kind == TypeKind::ULong)
+                       instructions.push_back(NirDoubleToUInt{src, dst});
+                     else
+                       instructions.push_back(NirDoubleToInt{src, dst});
+                     return dst;
+                   }
+                   const bool source_is_wide =
+                       c.exp->type.kind == TypeKind::Long ||
+                       c.exp->type.kind == TypeKind::ULong ||
+                       c.exp->type.kind == TypeKind::Pointer;
+                   const bool target_is_wide =
+                       c.target_type.kind == TypeKind::Long ||
+                       c.target_type.kind == TypeKind::ULong ||
+                       c.target_type.kind == TypeKind::Pointer;
+                   if (source_is_wide == target_is_wide) {
+                     instructions.push_back(NirCopy{src, dst});
+                   } else if (target_is_wide && c.exp->type.kind == TypeKind::Int) {
+                     instructions.push_back(NirSignExtend{src, dst});
+                   } else if (target_is_wide) {
+                     instructions.push_back(NirZeroExtend{src, dst});
+                   } else {
+                     instructions.push_back(NirTruncate{src, dst});
+                   }
+                   return dst;
                  },
 
-                 [&](const CompoundAssignment &a) -> NirVal {
+                 [&](const Assignment &a) -> NirExpResult {
                    auto left = emit_val(*a.left, instructions);
-                   auto old = NirVal{NirVar{make_temporary()}};
+                   auto right = emit_val_and_convert(*a.right, instructions);
+                   if (auto *object = std::get_if<NirVal>(&left)) {
+                     instructions.push_back(NirCopy{right, *object});
+                   } else {
+                     instructions.push_back(NirStore{
+                         right, std::get<NirDereferencedPointer>(left).pointer});
+                   }
+                   return right;
+                 },
+
+                 [&](const CompoundAssignment &a) -> NirExpResult {
+                   auto lvalue = emit_val(*a.left, instructions);
+                   NirVal left;
+                   NirVal pointer;
+                   if (auto *object = std::get_if<NirVal>(&lvalue)) {
+                     left = *object;
+                   } else {
+                     pointer =
+                         std::get<NirDereferencedPointer>(lvalue).pointer;
+                     left = make_tacky_variable(a.left->type);
+                     instructions.push_back(NirLoad{pointer, left});
+                   }
+                   auto old = NirVal{make_tacky_variable(a.left->type)};
                    instructions.push_back(NirCopy{left, old});
-                   auto right = emit_val(*a.right, instructions);
-                   auto dst = NirVal{NirVar{make_temporary()}};
+                   auto right = emit_val_and_convert(*a.right, instructions);
+                   auto dst = NirVal{make_tacky_variable(a.left->type)};
 
                    auto op = std::visit(
                        [&](const auto &value) {
@@ -233,15 +349,29 @@ class NirEmitter {
                        a.op);
                    instructions.push_back(
                        NirBinary{op, old, std::move(right), dst});
-                   instructions.push_back(NirCopy{dst, left});
-                   return left;
+                   if (std::holds_alternative<NirDereferencedPointer>(lvalue)) {
+                     instructions.push_back(NirStore{dst, pointer});
+                   } else {
+                     instructions.push_back(NirCopy{dst, left});
+                   }
+                   return dst;
                  },
 
-                 [&](const IncDec &e) -> NirVal {
-                   auto value = emit_val(*e.exp, instructions);
-                   auto next = NirVal{NirVar{make_temporary()}};
+                 [&](const IncDec &e) -> NirExpResult {
+                   auto lvalue = emit_val(*e.exp, instructions);
+                   NirVal value;
+                   NirVal pointer;
+                   if (auto *object = std::get_if<NirVal>(&lvalue)) {
+                     value = *object;
+                   } else {
+                     pointer =
+                         std::get<NirDereferencedPointer>(lvalue).pointer;
+                     value = make_tacky_variable(e.exp->type);
+                     instructions.push_back(NirLoad{pointer, value});
+                   }
+                   auto next = NirVal{make_tacky_variable(e.exp->type)};
                    auto old = e.postfix
-                                  ? NirVal{NirVar{make_temporary()}}
+                                  ? NirVal{make_tacky_variable(e.exp->type)}
                                   : NirVal{};
                    if (e.postfix) instructions.push_back(NirCopy{value, old});
 
@@ -256,18 +386,23 @@ class NirEmitter {
                        },
                        e.op);
                    instructions.push_back(
-                       NirBinary{op, value, NirConstant{1}, next});
-                   instructions.push_back(NirCopy{next, value});
-                   return e.postfix ? old : value;
+                       NirBinary{op, value,
+                                 NirConstant{ConstInt{1, e.line}}, next});
+                   if (std::holds_alternative<NirDereferencedPointer>(lvalue)) {
+                     instructions.push_back(NirStore{next, pointer});
+                   } else {
+                     instructions.push_back(NirCopy{next, value});
+                   }
+                   return e.postfix ? old : next;
                  },
 
-                 [&](const Unary &u) -> NirVal {
+                 [&](const Unary &u) -> NirExpResult {
                    return std::visit(
-                       [&](const auto &op) -> NirVal {
+                       [&](const auto &op) -> NirExpResult {
                          using OpType = std::decay_t<decltype(op)>;
 
-                         auto src = emit_val(*u.exp, instructions);
-                         NirVal dst = NirVar{make_temporary()};
+                         auto src = emit_val_and_convert(*u.exp, instructions);
+                         NirVal dst = make_tacky_variable(exp.type);
                          instructions.push_back(
                              NirUnary{reflect_to_enum<OpType, NirUnaryOp>(),
                                         std::move(src), dst});
@@ -276,9 +411,9 @@ class NirEmitter {
                        u.op);
                  },
 
-                 [&](const Binary &b) -> NirVal {
+                 [&](const Binary &b) -> NirExpResult {
                    return std::visit(
-                       [&](const auto &op) -> NirVal {
+                       [&](const auto &op) -> NirExpResult {
                          using OpType = std::decay_t<decltype(op)>;
 
                          if constexpr (std::is_same_v<OpType, And>) {
@@ -286,9 +421,11 @@ class NirEmitter {
                          } else if constexpr (std::is_same_v<OpType, Or>) {
                            return emit_or(b, instructions);
                          } else {
-                           auto left = emit_val(*b.left, instructions);
-                           auto right = emit_val(*b.right, instructions);
-                           NirVal dst = NirVar{make_temporary()};
+                           auto left =
+                               emit_val_and_convert(*b.left, instructions);
+                           auto right =
+                               emit_val_and_convert(*b.right, instructions);
+                           NirVal dst = make_tacky_variable(exp.type);
 
                            instructions.push_back(NirBinary{
                             reflect_to_enum<OpType, NirBinaryOp>(),
@@ -299,22 +436,49 @@ class NirEmitter {
                         b.op);
                   },
 
-                  [&](const Conditional &c) -> NirVal {
-                    return emit_conditional(c, instructions);
+                  [&](const Conditional &c) -> NirExpResult {
+                    return emit_conditional(c, exp.type, instructions);
                   },
 
-                  [&](const FunctionCall &c) -> NirVal {
+                  [&](const FunctionCall &c) -> NirExpResult {
                     std::vector<NirVal> args;
                     args.reserve(c.args.size());
                     for (const auto &arg : c.args)
-                      args.push_back(emit_val(*arg, instructions));
+                      args.push_back(
+                          emit_val_and_convert(*arg, instructions));
 
-                    NirVal dst = NirVar{make_temporary()};
+                    NirVal dst = make_tacky_variable(exp.type);
                     instructions.push_back(
                         NirCall{c.name, std::move(args), dst});
                     return dst;
+                  },
+
+                  [&](const Dereference &d) -> NirExpResult {
+                    auto pointer = emit_val_and_convert(*d.exp, instructions);
+                    return NirDereferencedPointer{std::move(pointer)};
+                  },
+
+                  [&](const AddrOf &a) -> NirExpResult {
+                    auto object = emit_val(*a.exp, instructions);
+                    if (auto *pointer =
+                            std::get_if<NirDereferencedPointer>(&object))
+                      return std::move(pointer->pointer);
+                    NirVal dst = make_tacky_variable(exp.type);
+                    instructions.push_back(
+                        NirGetAddress{std::get<NirVal>(object), dst});
+                    return dst;
                   }},
          exp.value);
+  }
+
+  NirVal emit_val_and_convert(const Exp &exp,
+                              std::vector<NirInstruction> &instructions) {
+    auto result = emit_val(exp, instructions);
+    if (auto *value = std::get_if<NirVal>(&result)) return std::move(*value);
+    NirVal dst = make_tacky_variable(exp.type);
+    instructions.push_back(
+        NirLoad{std::get<NirDereferencedPointer>(result).pointer, dst});
+    return dst;
   }
 
   void emit_statement(const Statement &stmt,
@@ -323,7 +487,7 @@ class NirEmitter {
         Overload{
             [&](const Return &r) {
               instructions.push_back(
-                  NirReturn{emit_val(r.value, instructions)});
+                  NirReturn{emit_val_and_convert(r.value, instructions)});
             },
             [&](const Expression &e) { emit_val(e.value, instructions); },
             [&](const Null &) {},
@@ -332,7 +496,8 @@ class NirEmitter {
               auto else_label = make_label("else");
               auto end_label = make_label("end");
 
-              auto condition = emit_val(i.condition, instructions);
+              auto condition =
+                  emit_val_and_convert(i.condition, instructions);
               instructions.push_back(
                   NirJumpIfZero{std::move(condition), else_label});
 
@@ -366,14 +531,16 @@ class NirEmitter {
               const auto &default_target =
                   s.default_case ? s.default_case->label : s.break_label;
 
-              auto condition = emit_val(s.condition, instructions);
+              auto condition =
+                  emit_val_and_convert(s.condition, instructions);
 
               for (size_t i = 0; i < s.cases.size(); ++i) {
                 const bool last = (i + 1 == s.cases.size());
                 auto next_label =
                     last ? default_target : make_label("case_next");
 
-                auto case_value = emit_val(s.cases[i]->value, instructions);
+                auto case_value = emit_val_and_convert(
+                    s.cases[i]->value, instructions);
                 instructions.push_back(NirJumpIfNotEqual{
                     condition, std::move(case_value), next_label});
                 instructions.push_back(NirJump{s.cases[i]->label});
@@ -388,7 +555,8 @@ class NirEmitter {
             [&](const While &w) {
               instructions.push_back(NirLabel{w.continue_label});
 
-              auto condition = emit_val(w.condition->value, instructions);
+              auto condition = emit_val_and_convert(
+                  w.condition->value, instructions);
               instructions.push_back(
                   NirJumpIfZero{std::move(condition), w.break_label});
 
@@ -405,7 +573,8 @@ class NirEmitter {
 
               instructions.push_back(NirLabel{d.continue_label});
 
-              auto condition = emit_val(d.condition->value, instructions);
+              auto condition = emit_val_and_convert(
+                  d.condition->value, instructions);
               instructions.push_back(
                   NirJumpIfNotZero{std::move(condition), start_label});
               instructions.push_back(NirLabel{d.break_label});
@@ -418,7 +587,8 @@ class NirEmitter {
               instructions.push_back(NirLabel{start_label});
 
               if (f.condition) {
-                auto condition = emit_val(f.condition->value, instructions);
+                auto condition = emit_val_and_convert(
+                    f.condition->value, instructions);
                 instructions.push_back(
                     NirJumpIfZero{std::move(condition), f.break_label});
               }
@@ -438,7 +608,7 @@ class NirEmitter {
   void emit_variable_declaration(const VariableDeclaration &d,
                                  std::vector<NirInstruction> &instructions) {
     if (d.storage_class || !d.init) return;
-    auto val = emit_val(*d.init, instructions);
+    auto val = emit_val_and_convert(*d.init, instructions);
     instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
   }
 
@@ -484,7 +654,7 @@ class NirEmitter {
     std::vector<NirInstruction> instructions;
     if (func.body) {
       emit_block(*func.body, instructions);
-      instructions.push_back(NirReturn{NirConstant{0}});
+      instructions.push_back(NirReturn{NirConstant{ConstInt{0, 0}}});
     }
 
     bool global = true;
@@ -510,12 +680,36 @@ public:
       if (const auto *attrs = std::get_if<Symbol::StaticAttr>(&symbol.attrs)) {
         if (attrs->init.kind == Symbol::InitialValue::Kind::NoInitializer)
           continue;
-        const int32_t initial_value =
+        const uint64_t initial_value =
             attrs->init.kind == Symbol::InitialValue::Kind::Initial
                 ? attrs->init.value
                 : 0;
-        top_levels.push_back(
-            NirStaticVariable{name, attrs->global, initial_value});
+        StaticInit init;
+        switch (symbol.type.kind) {
+          case TypeKind::Int:
+            init = IntInit{static_cast<int32_t>(initial_value)};
+            break;
+          case TypeKind::Long:
+            init = LongInit{static_cast<int64_t>(initial_value)};
+            break;
+          case TypeKind::UInt:
+            init = UIntInit{static_cast<uint32_t>(initial_value)};
+            break;
+          case TypeKind::ULong:
+          case TypeKind::Pointer:
+            init = ULongInit{initial_value};
+            break;
+          case TypeKind::Double:
+            init = DoubleInit{attrs->init.is_double
+                                  ? attrs->init.double_value
+                                  : static_cast<double>(initial_value)};
+            break;
+          case TypeKind::Function:
+            init = IntInit{0};
+            break;
+        }
+        top_levels.push_back(NirStaticVariable{
+            name, attrs->global, symbol.type, std::move(init)});
       }
     }
 

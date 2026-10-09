@@ -73,6 +73,27 @@ static std::string join_names(const std::vector<std::string> &names) {
   return joined;
 }
 
+static std::string type_name(const Type &type) {
+  if (type.kind == TypeKind::Int) return "Int";
+  if (type.kind == TypeKind::Long) return "Long";
+  if (type.kind == TypeKind::UInt) return "UInt";
+  if (type.kind == TypeKind::ULong) return "ULong";
+  if (type.kind == TypeKind::Double) return "Double";
+  if (type.kind == TypeKind::Pointer)
+    return "Pointer(" +
+           (type.referenced ? type_name(*type.referenced) : "<?>") + ")";
+
+  std::string name = "FunType(";
+  for (size_t i = 0; i < type.params.size(); ++i) {
+    if (i) name += ", ";
+    name += type_name(type.params[i]);
+  }
+  name += " -> ";
+  name += type.ret ? type_name(*type.ret) : "Int";
+  name += ")";
+  return name;
+}
+
 static void pretty_print(const Block &block, int indent = 0);
 static void pretty_print(const Exp &exp, int indent = 0);
 static void pretty_print(const VariableDeclaration &d, int indent = 0);
@@ -83,6 +104,7 @@ static void pretty_print(const VariableDeclaration &d, int indent) {
   std::string pad(indent * 2, ' ');
   std::println("{}{}(name=\"{}\"", pad,
                std::meta::identifier_of(^^VariableDeclaration), d.name);
+  std::println("{}  var_type={},", pad, type_name(d.var_type));
   if (d.storage_class)
     std::println("{}  storage_class={},", pad,
                  std::visit(get_type_name, *d.storage_class));
@@ -104,6 +126,7 @@ static void pretty_print(const Declaration &d, int indent) {
             std::println("{}  {}(", pad, std::meta::identifier_of(^^FunDecl));
             std::println("{}    name=\"{}\",", pad, f.decl.name);
             std::println("{}    params=[{}],", pad, join_names(f.decl.params));
+            std::println("{}    fun_type={},", pad, type_name(f.decl.fun_type));
             if (f.decl.storage_class)
               std::println("{}    storage_class={},", pad,
                            std::visit(get_type_name, *f.decl.storage_class));
@@ -140,13 +163,46 @@ static void pretty_print(const Exp &exp, int indent) {
   std::string pad(indent * 2, ' ');
   std::visit(
       Overload{
-          [&](const Constant &c) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^Constant),
+          [&](const ConstInt &c) {
+            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstInt),
                          c.value);
+          },
+          [&](const ConstLong &c) {
+            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstLong),
+                         c.value);
+          },
+          [&](const ConstUInt &c) {
+            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstUInt),
+                         c.value);
+          },
+          [&](const ConstULong &c) {
+            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstULong),
+                         c.value);
+          },
+          [&](const ConstDouble &c) {
+            std::println("{}{}({})", pad,
+                         std::meta::identifier_of(^^ConstDouble), c.value);
           },
           [&](const Var &v) {
             std::println("{}{}({})", pad, std::meta::identifier_of(^^Var),
                          v.name);
+          },
+          [&](const Cast &c) {
+            std::println("{}{}(", pad, std::meta::identifier_of(^^Cast));
+            std::println("{}  target_type={}", pad, type_name(c.target_type));
+            pretty_print(*c.exp, indent + 2);
+            std::println("{})", pad);
+          },
+          [&](const Dereference &d) {
+            std::println("{}{}(", pad,
+                         std::meta::identifier_of(^^Dereference));
+            pretty_print(*d.exp, indent + 2);
+            std::println("{})", pad);
+          },
+          [&](const AddrOf &a) {
+            std::println("{}{}(", pad, std::meta::identifier_of(^^AddrOf));
+            pretty_print(*a.exp, indent + 2);
+            std::println("{})", pad);
           },
           [&](const Assignment &a) {
             std::println("{}{}(", pad, std::meta::identifier_of(^^Assignment));
@@ -404,9 +460,14 @@ static int assemble(const std::filesystem::path &asm_path,
 int main(int argc, char *argv[]) {
   Stage stage = Stage::Run;
   std::vector<std::filesystem::path> sources;
+  std::vector<std::string> linker_options;
 
   for (int i = 1; i < argc; ++i) {
     std::string_view arg = argv[i];
+    if (arg == "-lm") {
+      linker_options.emplace_back(arg);
+      continue;
+    }
     if (!arg.starts_with('-')) {
       sources.emplace_back(arg);
       continue;
@@ -481,6 +542,7 @@ int main(int argc, char *argv[]) {
     cmd += " " + obj.string();
   cmd += " -o " +
          (sources.front().parent_path() / sources.front().stem()).string();
+  for (const auto &option : linker_options) cmd += " " + option;
 
   return std::system(cmd.c_str());
 }

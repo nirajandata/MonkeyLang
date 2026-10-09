@@ -1,6 +1,10 @@
 module;
 
 #include <charconv>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <meta>
 #include <optional>
@@ -69,6 +73,23 @@ static IncDecOp inc_dec_op(TokenType type) {
 }
 
 export class Parser {
+  struct Declarator;
+  struct ParameterSyntax {
+    Type base_type;
+    std::unique_ptr<Declarator> declarator;
+  };
+  struct Declarator {
+    enum class Kind { Identifier, Pointer, Function } kind;
+    std::string name;
+    std::unique_ptr<Declarator> inner;
+    std::vector<ParameterSyntax> params;
+  };
+  struct ProcessedDeclarator {
+    std::string name;
+    Type type;
+    std::vector<std::string> param_names;
+  };
+
   const std::vector<Token>& tokens_;
   size_t pos_ = 0;
   bool had_error_ = false;
@@ -97,23 +118,62 @@ export class Parser {
     }
   }
 
-  Constant parse_constant() {
+  Exp parse_constant() {
     const Token& tok = advance();
-    if (tok.type != TokenType::Constant) {
+    if (tok.type == TokenType::FloatingConstant) {
+      std::string text(tok.text);
+      char *end = nullptr;
+      const double value = std::strtod(text.c_str(), &end);
+      if (end != text.c_str() + text.size()) {
+        std::println("error:{}: Invalid floating-point constant '{}'",
+                     tok.line, tok.text);
+        had_error_ = true;
+        return Exp{ConstDouble{0.0, tok.line}};
+      }
+      return Exp{ConstDouble{value, tok.line}};
+    }
+    if (tok.type != TokenType::Constant &&
+        tok.type != TokenType::LongConstant &&
+        tok.type != TokenType::UnsignedConstant &&
+        tok.type != TokenType::UnsignedLongConstant) {
       std::println("error:{}: Expected constant but found '{}'", tok.line, tok.text);
       had_error_ = true;
-      return {0, tok.line};
+      return Exp{ConstInt{0, tok.line}};
     }
 
-    int32_t value = 0;
-    const auto [ptr, ec] = std::from_chars(tok.text.data(), tok.text.data() + tok.text.size(), value);
-
-    if (ec != std::errc{} || ptr != tok.text.data() + tok.text.size()) {
-      std::println("error:{}: '{}' is not a valid integer constant", tok.line, tok.text);
+    const bool unsigned_constant =
+        tok.type == TokenType::UnsignedConstant ||
+        tok.type == TokenType::UnsignedLongConstant;
+    const bool ulong_constant = tok.type == TokenType::UnsignedLongConstant;
+    const size_t suffix_length =
+        tok.type == TokenType::LongConstant ? 1 :
+        tok.type == TokenType::UnsignedConstant ? 1 :
+        tok.type == TokenType::UnsignedLongConstant ? 2 : 0;
+    const char *end = tok.text.data() + tok.text.size() - suffix_length;
+    uint64_t value = 0;
+    const auto [ptr, ec] = std::from_chars(tok.text.data(), end, value);
+    const bool out_of_range =
+        ec != std::errc{} || ptr != end ||
+        (!unsigned_constant &&
+         value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+    if (out_of_range) {
+      std::println("error:{}: Constant '{}' is too large to represent",
+                   tok.line, tok.text);
       had_error_ = true;
-      return {0, tok.line};
+      return Exp{ConstInt{0, tok.line}};
     }
-    return {value, tok.line};
+    if (ulong_constant)
+      return Exp{ConstULong{value, tok.line}};
+    if (unsigned_constant) {
+      if (value <= std::numeric_limits<uint32_t>::max())
+        return Exp{ConstUInt{static_cast<uint32_t>(value), tok.line}};
+      return Exp{ConstULong{value, tok.line}};
+    }
+    const bool long_constant = tok.type == TokenType::LongConstant;
+    if (!long_constant &&
+        value <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
+      return Exp{ConstInt{static_cast<int32_t>(value), tok.line}};
+    return Exp{ConstLong{static_cast<int64_t>(value), tok.line}};
   }
 
   std::string parse_identifier() {
@@ -144,7 +204,11 @@ export class Parser {
 
     switch (tok.type) {
       case TokenType::Constant:
-        return Exp{parse_constant()};
+      case TokenType::LongConstant:
+      case TokenType::UnsignedConstant:
+      case TokenType::UnsignedLongConstant:
+      case TokenType::FloatingConstant:
+        return parse_constant();
 
       case TokenType::Identifier: {
         advance();
@@ -172,8 +236,29 @@ export class Parser {
         return Exp{Unary{std::move(op), std::make_unique<Exp>(parse_postfix()), tok.line}};
       }
 
+      case TokenType::Multiply:
+      case TokenType::BitwiseAnd: {
+        advance();
+        Exp inner = parse_postfix();
+        if (tok.type == TokenType::Multiply)
+          return Exp{Dereference{std::make_unique<Exp>(std::move(inner)),
+                                 tok.line}};
+        return Exp{AddrOf{std::make_unique<Exp>(std::move(inner)), tok.line}};
+      }
+
       case TokenType::LParen: {
         advance();
+        if (check(TokenType::Int) || check(TokenType::Long) ||
+            check(TokenType::Signed) || check(TokenType::Unsigned) ||
+            check(TokenType::Double)) {
+          Type target_type = parse_type_specifiers();
+          if (check(TokenType::Multiply) || check(TokenType::LParen))
+            target_type = process_abstract_declarator(
+                parse_abstract_declarator(), std::move(target_type));
+          expect(TokenType::RParen, "\")\"");
+          return Exp{Cast{std::move(target_type),
+                          std::make_unique<Exp>(parse_postfix()), tok.line}};
+        }
         auto inner = parse_exp(0);
         expect(TokenType::RParen, "\")\"");
         return inner;
@@ -183,7 +268,7 @@ export class Parser {
         std::println("error:{}: Expected expression but found '{}'", tok.line, tok.text);
         had_error_ = true;
         advance();
-        return Exp{Constant{0, tok.line}};
+        return Exp{ConstInt{0, tok.line}};
     }
   }
 
@@ -460,16 +545,181 @@ export class Parser {
     }
   }
 
-  std::optional<StorageClass> parse_specifiers() {
-    size_t type_count = 0;
+  Type type_from_specifiers(const std::vector<TokenType> &types,
+                            uint32_t line) {
+    const auto double_count =
+        std::count(types.begin(), types.end(), TokenType::Double);
+    if (double_count != 0) {
+      if (types.size() == 1)
+        return Type::double_type();
+      std::println("error:{}: Can't combine 'double' with other type specifiers",
+                   line);
+      had_error_ = true;
+      return Type::double_type();
+    }
+    bool has_int = false;
+    bool has_long = false;
+    bool has_signed = false;
+    bool has_unsigned = false;
+    bool invalid = types.empty();
+    for (TokenType type : types) {
+      bool *seen = type == TokenType::Int ? &has_int :
+                   type == TokenType::Long ? &has_long :
+                   type == TokenType::Signed ? &has_signed : &has_unsigned;
+      if (*seen) invalid = true;
+      *seen = true;
+    }
+    if (has_signed && has_unsigned) invalid = true;
+    if (invalid) {
+      std::println("error:{}: Invalid type specifier", line);
+      had_error_ = true;
+      return Type::int_type();
+    }
+    if (has_unsigned)
+      return has_long ? Type::ulong_type() : Type::uint_type();
+    return has_long ? Type::long_type() : Type::int_type();
+  }
+
+  Type parse_type_specifiers() {
+    const uint32_t line = peek().line;
+    std::vector<TokenType> types;
+    while (check(TokenType::Int) || check(TokenType::Long) ||
+           check(TokenType::Signed) || check(TokenType::Unsigned) ||
+           check(TokenType::Double))
+      types.push_back(advance().type);
+    return type_from_specifiers(types, line);
+  }
+
+  std::unique_ptr<Declarator> parse_declarator() {
+    size_t pointer_count = 0;
+    while (match(TokenType::Multiply))
+      ++pointer_count;
+
+    std::unique_ptr<Declarator> result;
+    if (check(TokenType::Identifier)) {
+      result = std::make_unique<Declarator>(
+          Declarator{Declarator::Kind::Identifier, parse_identifier(), {},
+                     {}});
+    } else if (match(TokenType::LParen)) {
+      result = parse_declarator();
+      expect(TokenType::RParen, "\")\"");
+    } else {
+      std::println("error:{}: Expected declarator but found '{}'",
+                   peek().line, peek().text);
+      had_error_ = true;
+      result = std::make_unique<Declarator>(
+          Declarator{Declarator::Kind::Identifier, "__error", {}, {}});
+    }
+
+    if (match(TokenType::LParen)) {
+      std::vector<ParameterSyntax> params;
+      if (!match(TokenType::Void)) {
+        if (!check(TokenType::RParen)) {
+          do {
+            if (check(TokenType::Static) || check(TokenType::Extern)) {
+              std::println("error:{}: Storage-class specifier is not allowed on a parameter",
+                           peek().line);
+              had_error_ = true;
+              advance();
+            }
+            Type base_type = parse_type_specifiers();
+            params.push_back({std::move(base_type), parse_declarator()});
+          } while (match(TokenType::Comma));
+        }
+      }
+      expect(TokenType::RParen, "\")\"");
+      result = std::make_unique<Declarator>(Declarator{
+          Declarator::Kind::Function, {}, std::move(result),
+          std::move(params)});
+    }
+
+    while (pointer_count-- > 0) {
+      result = std::make_unique<Declarator>(Declarator{
+          Declarator::Kind::Pointer, {}, std::move(result), {}});
+    }
+    return result;
+  }
+
+  ProcessedDeclarator process_declarator(const Declarator &declarator,
+                                         Type base_type) {
+    switch (declarator.kind) {
+      case Declarator::Kind::Identifier:
+        return {declarator.name, std::move(base_type), {}};
+      case Declarator::Kind::Pointer:
+        if (base_type.kind == TypeKind::Function) {
+          std::println("error:{}: Pointers to functions are not supported",
+                       peek().line);
+          had_error_ = true;
+        }
+        return process_declarator(*declarator.inner,
+                                  Type::pointer(std::move(base_type)));
+      case Declarator::Kind::Function: {
+        if (declarator.inner->kind != Declarator::Kind::Identifier) {
+          std::println("error:{}: Function pointers and functions returning functions are not supported",
+                       peek().line);
+          had_error_ = true;
+          return {"__error", Type::int_type(), {}};
+        }
+        std::vector<Type> param_types;
+        std::vector<std::string> param_names;
+        for (const auto &param : declarator.params) {
+          auto processed =
+              process_declarator(*param.declarator, param.base_type);
+          if (processed.type.kind == TypeKind::Function) {
+            std::println("error:{}: Function parameters are not supported",
+                         peek().line);
+            had_error_ = true;
+          }
+          param_types.push_back(std::move(processed.type));
+          param_names.push_back(std::move(processed.name));
+        }
+        return {declarator.inner->name,
+                Type::function(std::move(param_types), std::move(base_type)),
+                std::move(param_names)};
+      }
+    }
+    std::unreachable();
+  }
+
+  struct AbstractDeclarator {
+    size_t pointer_count = 0;
+  };
+
+  AbstractDeclarator parse_abstract_declarator() {
+    AbstractDeclarator result;
+    while (match(TokenType::Multiply))
+      ++result.pointer_count;
+    if (match(TokenType::LParen)) {
+      auto nested = parse_abstract_declarator();
+      expect(TokenType::RParen, "\")\"");
+      result.pointer_count += nested.pointer_count;
+    }
+    return result;
+  }
+
+  static Type process_abstract_declarator(AbstractDeclarator declarator,
+                                          Type base_type) {
+    while (declarator.pointer_count-- > 0)
+      base_type = Type::pointer(std::move(base_type));
+    return base_type;
+  }
+
+  std::pair<Type, std::optional<StorageClass>> parse_specifiers() {
+    std::vector<TokenType> types;
     std::optional<StorageClass> storage_class;
     uint32_t line = peek().line;
 
-    while (check(TokenType::Int) || check(TokenType::Static) ||
-           check(TokenType::Extern)) {
+    while (check(TokenType::Int) || check(TokenType::Long) ||
+           check(TokenType::Signed) || check(TokenType::Unsigned) ||
+           check(TokenType::Double) ||
+           check(TokenType::Static) || check(TokenType::Extern)) {
       const Token specifier = advance();
-      if (specifier.type == TokenType::Int) {
-        ++type_count;
+      if (specifier.type == TokenType::Int ||
+          specifier.type == TokenType::Long ||
+          specifier.type == TokenType::Signed ||
+          specifier.type == TokenType::Unsigned ||
+          specifier.type == TokenType::Double) {
+        types.push_back(specifier.type);
       } else if (storage_class) {
         std::println("error:{}: Invalid storage class", specifier.line);
         had_error_ = true;
@@ -480,36 +730,17 @@ export class Parser {
       }
     }
 
-    if (type_count != 1) {
-      std::println("error:{}: Invalid type specifier", line);
-      had_error_ = true;
-    }
-    return storage_class;
-  }
-
-  std::vector<std::string> parse_param_list() {
-    if (match(TokenType::Void)) {
-      return {};
-    }
-
-    std::vector<std::string> params;
-    do {
-      expect(TokenType::Int, "\"int\"");
-      params.push_back(parse_identifier());
-    } while (match(TokenType::Comma));
-
-    return params;
+    Type declaration_type = type_from_specifiers(types, line);
+    return {std::move(declaration_type), std::move(storage_class)};
   }
 
   Declaration parse_declaration() {
     uint32_t line = peek().line;
-    auto storage_class = parse_specifiers();
-    auto name = parse_identifier();
+    auto [decl_type, storage_class] = parse_specifiers();
+    auto declarator = parse_declarator();
+    auto processed = process_declarator(*declarator, std::move(decl_type));
 
-    if (match(TokenType::LParen)) {
-      auto params = parse_param_list();
-      expect(TokenType::RParen, "\")\"");
-
+    if (processed.type.kind == TypeKind::Function) {
       std::unique_ptr<Block> body;
       if (check(TokenType::LBrace)) {
         body = std::make_unique<Block>(parse_block());
@@ -517,19 +748,25 @@ export class Parser {
         expect(TokenType::Semicolon, "\";\"");
       }
       return FunDecl{FunctionDeclaration{
-          std::move(name), std::move(params), std::move(body), line,
-          std::move(storage_class)}};
+          std::move(processed.name), std::move(processed.param_names),
+          std::move(body), line,
+          std::move(storage_class),
+          std::move(processed.type)}};
     }
 
     std::optional<Exp> init;
     if (match(TokenType::Assign)) init = parse_exp(0);
     expect(TokenType::Semicolon, "\";\"");
     return VarDecl{VariableDeclaration{
-        std::move(name), std::move(init), line, std::move(storage_class)}};
+        std::move(processed.name), std::move(init), line,
+        std::move(storage_class), std::move(processed.type)}};
   }
 
   bool is_declaration_start() const {
-    return check(TokenType::Int) || check(TokenType::Static) ||
+    return check(TokenType::Int) || check(TokenType::Long) ||
+           check(TokenType::Signed) || check(TokenType::Unsigned) ||
+           check(TokenType::Double) ||
+           check(TokenType::Static) ||
            check(TokenType::Extern);
   }
 

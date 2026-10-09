@@ -37,7 +37,20 @@ export {
 
   struct Symbol {
     Type type;
-    bool defined = false;
+    struct FunAttr {
+      bool defined;
+      bool global;
+    };
+    struct InitialValue {
+      enum class Kind { Tentative, Initial, NoInitializer } kind;
+      int32_t value = 0;
+    };
+    struct StaticAttr {
+      InitialValue init;
+      bool global;
+    };
+    struct LocalAttr {};
+    std::variant<FunAttr, StaticAttr, LocalAttr> attrs;
   };
 
   class SymbolTable {
@@ -46,8 +59,10 @@ export {
   public:
     void clear() { symbols_.clear(); }
 
-    void add(const std::string &name, Type type, bool defined = false) {
-      symbols_.insert_or_assign(name, Symbol{type, defined});
+    void add(const std::string &name, Type type,
+             std::variant<Symbol::FunAttr, Symbol::StaticAttr,
+                          Symbol::LocalAttr> attrs) {
+      symbols_.insert_or_assign(name, Symbol{type, std::move(attrs)});
     }
 
     [[nodiscard]] const Symbol *find(const std::string &name) const {
@@ -57,6 +72,11 @@ export {
 
     [[nodiscard]] const Symbol &get(const std::string &name) const {
       return symbols_.at(name);
+    }
+
+    [[nodiscard]] const std::unordered_map<std::string, Symbol> &entries()
+        const {
+      return symbols_;
     }
   };
 }
@@ -70,6 +90,7 @@ namespace {
 class IdentifierResolver {
   struct MapEntry {
     std::string new_name;
+    bool from_current_scope;
     bool has_linkage;
   };
 
@@ -79,6 +100,11 @@ class IdentifierResolver {
 
   static std::string make_unique_name(const std::string_view name) {
     return std::string(name) + "." + std::to_string(next_name_id());
+  }
+
+  static void mark_outer_scope(Scope &scope) {
+    for (auto &[name, entry] : scope)
+      entry.from_current_scope = false;
   }
 
   void validate_lvalue(const Exp &exp, uint32_t line) {
@@ -177,6 +203,7 @@ class IdentifierResolver {
             },
             [&](For &f) {
               Scope loop_scope = scope;
+              mark_outer_scope(loop_scope);
               LocalNames loop_names;
               resolve_for_init(f.init, loop_scope, loop_names);
               if (f.condition)
@@ -198,15 +225,45 @@ class IdentifierResolver {
     }
     auto new_name = make_unique_name(name);
     local_names.insert(name);
-    scope.insert_or_assign(name, MapEntry{new_name, false});
+    scope.insert_or_assign(name, MapEntry{new_name, true, false});
     name = std::move(new_name);
   }
 
   void resolve_variable_declaration(VariableDeclaration &d, Scope &scope,
                                     LocalNames &local_names) {
+    const bool has_linkage =
+        d.storage_class && std::holds_alternative<Extern>(*d.storage_class);
+    const auto prev = scope.find(d.name);
+    const bool declared_in_scope =
+        prev != scope.end() && prev->second.from_current_scope;
+    if (declared_in_scope &&
+        (!prev->second.has_linkage || !has_linkage)) {
+      std::println("error:{}: Conflicting local declarations of '{}'",
+                   d.line, d.name);
+      had_error_ = true;
+    }
+
+    if (has_linkage) {
+      scope.insert_or_assign(d.name, MapEntry{d.name, true, true});
+      local_names.insert(d.name);
+      if (d.init) {
+        std::println("error:{}: Initializer on local extern variable '{}'",
+                     d.line, d.name);
+        had_error_ = true;
+      }
+      return;
+    }
+
+    if (declared_in_scope)
+      return;
     resolve_local_declaration(d.name, d.line, scope, local_names);
     if (d.init)
       resolve_exp(*d.init, scope);
+  }
+
+  void resolve_file_scope_variable_declaration(VariableDeclaration &d,
+                                                Scope &scope) {
+    scope.insert_or_assign(d.name, MapEntry{d.name, true, true});
   }
 
   void resolve_function_declaration(FunctionDeclaration &d, Scope &scope,
@@ -218,9 +275,10 @@ class IdentifierResolver {
       had_error_ = true;
     }
     local_names.insert(d.name);
-    scope.insert_or_assign(d.name, MapEntry{d.name, true});
+    scope.insert_or_assign(d.name, MapEntry{d.name, true, true});
 
     Scope inner = scope;
+    mark_outer_scope(inner);
     LocalNames inner_names;
     for (auto &param : d.params)
       resolve_local_declaration(param, d.line, inner, inner_names);
@@ -239,6 +297,12 @@ class IdentifierResolver {
                     f.decl.line);
                 had_error_ = true;
               } else {
+                if (f.decl.storage_class &&
+                    std::holds_alternative<Static>(*f.decl.storage_class)) {
+                  std::println("error:{}: Block-scope function declaration cannot be static",
+                               f.decl.line);
+                  had_error_ = true;
+                }
                 resolve_function_declaration(f.decl, scope, local_names);
               }
             },
@@ -275,6 +339,7 @@ class IdentifierResolver {
   }
 
   void resolve_block(Block &block, Scope scope) {
+    mark_outer_scope(scope);
     LocalNames local_names;
     resolve_block_items(block, scope, local_names);
   }
@@ -289,8 +354,14 @@ public:
   bool resolve(Program &program) {
     Scope scope;
     LocalNames local_names;
-    for (auto &func : program.functions)
-      resolve_function_declaration(func, scope, local_names);
+    for (auto &declaration : program.declarations) {
+      if (auto *func = std::get_if<FunDecl>(&declaration)) {
+        resolve_function_declaration(func->decl, scope, local_names);
+      } else {
+        resolve_file_scope_variable_declaration(
+            std::get<VarDecl>(declaration).decl, scope);
+      }
+    }
 
     return !had_error_;
   }
@@ -298,6 +369,24 @@ public:
 
 class TypeChecker {
   bool had_error_ = false;
+  using InitialValue = Symbol::InitialValue;
+
+  static bool is_extern(const VariableDeclaration &d) {
+    return d.storage_class &&
+           std::holds_alternative<Extern>(*d.storage_class);
+  }
+
+  static bool is_static(const VariableDeclaration &d) {
+    return d.storage_class &&
+           std::holds_alternative<Static>(*d.storage_class);
+  }
+
+  std::optional<int32_t> constant_initializer(const VariableDeclaration &d) {
+    if (!d.init) return std::nullopt;
+    if (const auto *constant = std::get_if<Constant>(&d.init->value))
+      return constant->value;
+    return std::nullopt;
+  }
 
   void typecheck_exp(const Exp &exp) {
     std::visit(
@@ -396,21 +485,120 @@ class TypeChecker {
         stmt.value);
   }
 
-  void typecheck_variable_declaration(const VariableDeclaration &d) {
-    symbol_table().add(d.name, Type::int_type());
+  void typecheck_local_variable_declaration(const VariableDeclaration &d) {
+    if (is_extern(d)) {
+      if (d.init) {
+        std::println("error:{}: Initializer on local extern variable '{}'",
+                     d.line, d.name);
+        had_error_ = true;
+      }
+      if (const Symbol *prev = symbol_table().find(d.name)) {
+        if (prev->type.kind == TypeKind::Function) {
+          std::println("error:{}: Function redeclared as variable", d.line);
+          had_error_ = true;
+        }
+      } else {
+        symbol_table().add(d.name, Type::int_type(),
+                           Symbol::StaticAttr{
+                               {InitialValue::Kind::NoInitializer, 0}, true});
+      }
+      return;
+    }
+
+    if (is_static(d)) {
+      InitialValue init{InitialValue::Kind::Initial, 0};
+      if (d.init) {
+        if (auto value = constant_initializer(d)) {
+          init.value = *value;
+        } else {
+          std::println("error:{}: Non-constant initializer on local static variable '{}'",
+                       d.line, d.name);
+          had_error_ = true;
+        }
+      }
+      symbol_table().add(d.name, Type::int_type(),
+                         Symbol::StaticAttr{init, false});
+      return;
+    }
+
+    symbol_table().add(d.name, Type::int_type(), Symbol::LocalAttr{});
     if (d.init)
       typecheck_exp(*d.init);
+  }
+
+  void typecheck_file_scope_variable_declaration(
+      const VariableDeclaration &d) {
+    InitialValue init{InitialValue::Kind::Tentative, 0};
+    if (d.init) {
+      if (auto value = constant_initializer(d)) {
+        init = {InitialValue::Kind::Initial, *value};
+      } else {
+        std::println("error:{}: Non-constant initializer for file-scope variable '{}'",
+                     d.line, d.name);
+        had_error_ = true;
+        init = {InitialValue::Kind::Tentative, 0};
+      }
+    } else if (is_extern(d)) {
+      init = {InitialValue::Kind::NoInitializer, 0};
+    }
+
+    bool global = !is_static(d);
+    if (const Symbol *prev = symbol_table().find(d.name)) {
+      if (prev->type.kind != TypeKind::Int) {
+        std::println("error:{}: Function redeclared as variable", d.line);
+        had_error_ = true;
+        return;
+      }
+
+      const auto &old = std::get<Symbol::StaticAttr>(prev->attrs);
+      if (is_extern(d)) {
+        global = old.global;
+      } else if (old.global != global) {
+        std::println("error:{}: Conflicting variable linkage for '{}'",
+                     d.line, d.name);
+        had_error_ = true;
+      }
+
+      if (old.init.kind == InitialValue::Kind::Initial) {
+        if (init.kind == InitialValue::Kind::Initial) {
+          std::println("error:{}: Conflicting file-scope variable definitions",
+                       d.line);
+          had_error_ = true;
+        } else {
+          init = old.init;
+        }
+      } else if (init.kind != InitialValue::Kind::Initial &&
+                 old.init.kind == InitialValue::Kind::Tentative) {
+        init = old.init;
+      }
+    }
+
+    symbol_table().add(d.name, Type::int_type(),
+                       Symbol::StaticAttr{init, global});
   }
 
   void typecheck_function_declaration(const FunctionDeclaration &d) {
     const Type fun_type = Type::function(d.params.size());
     const bool has_body = static_cast<bool>(d.body);
     bool already_defined = false;
+    bool global = !d.storage_class ||
+                  !std::holds_alternative<Static>(*d.storage_class);
 
     if (const Symbol *prev = symbol_table().find(d.name)) {
-      already_defined = prev->defined;
       if (!(prev->type == fun_type)) {
         std::println("error:{}: Incompatible function declarations", d.line);
+        had_error_ = true;
+      } else if (const auto *old = std::get_if<Symbol::FunAttr>(&prev->attrs)) {
+        already_defined = old->defined;
+        if (old->global && d.storage_class &&
+            std::holds_alternative<Static>(*d.storage_class)) {
+          std::println("error:{}: Static function declaration follows non-static",
+                       d.line);
+          had_error_ = true;
+        }
+        global = old->global;
+      } else {
+        std::println("error:{}: Variable redeclared as function", d.line);
         had_error_ = true;
       }
       if (already_defined && has_body) {
@@ -419,12 +607,13 @@ class TypeChecker {
       }
     }
 
-    symbol_table().add(d.name, fun_type, already_defined || has_body);
+    symbol_table().add(d.name, fun_type,
+                       Symbol::FunAttr{already_defined || has_body, global});
 
     if (!has_body)
       return;
     for (const auto &param : d.params)
-      symbol_table().add(param, Type::int_type());
+      symbol_table().add(param, Type::int_type(), Symbol::LocalAttr{});
     typecheck_block(*d.body);
   }
 
@@ -433,7 +622,7 @@ class TypeChecker {
         Overload{
             [&](const FunDecl &f) { typecheck_function_declaration(f.decl); },
             [&](const VarDecl &v) {
-              typecheck_variable_declaration(v.decl);
+            typecheck_local_variable_declaration(v.decl);
             },
         },
         d);
@@ -443,7 +632,12 @@ class TypeChecker {
     std::visit(
         Overload{
             [&](const InitDecl &d) {
-              typecheck_variable_declaration(d.decl);
+              if (d.decl.storage_class) {
+                std::println("error:{}: Storage-class specifier is not allowed in a for initializer",
+                             d.decl.line);
+                had_error_ = true;
+              }
+              typecheck_local_variable_declaration(d.decl);
             },
             [&](const InitExp &e) {
               if (e.exp)
@@ -468,8 +662,14 @@ public:
   bool check(Program &program) {
     symbol_table().clear();
 
-    for (const auto &func : program.functions)
-      typecheck_function_declaration(func);
+    for (const auto &declaration : program.declarations) {
+      if (const auto *func = std::get_if<FunDecl>(&declaration)) {
+        typecheck_function_declaration(func->decl);
+      } else {
+        typecheck_file_scope_variable_declaration(
+            std::get<VarDecl>(declaration).decl);
+      }
+    }
 
     return !had_error_;
   }
@@ -545,8 +745,11 @@ class LabelResolver {
 
 public:
   bool resolve(Program &program) {
-    for (auto &func : program.functions)
-      if (func.body) record_block(*func.body);
+    for (auto &declaration : program.declarations) {
+      if (auto *func = std::get_if<FunDecl>(&declaration);
+          func && func->decl.body)
+        record_block(*func->decl.body);
+    }
     resolve_definitions();
     resolve_gotos();
     return !had_error_;
@@ -690,8 +893,11 @@ class BreakContinueLabeler {
 
 public:
   bool resolve(Program &program) {
-    for (auto &func : program.functions)
-      if (func.body) record_block(*func.body, nullptr);
+    for (auto &declaration : program.declarations) {
+      if (auto *func = std::get_if<FunDecl>(&declaration);
+          func && func->decl.body)
+        record_block(*func->decl.body, nullptr);
+    }
     return !had_error_;
   }
 };
@@ -799,8 +1005,11 @@ class SwitchGatherer {
 
 public:
   bool resolve(Program &program) {
-    for (auto &func : program.functions)
-      if (func.body) record_block(*func.body, nullptr);
+    for (auto &declaration : program.declarations) {
+      if (auto *func = std::get_if<FunDecl>(&declaration);
+          func && func->decl.body)
+        record_block(*func->decl.body, nullptr);
+    }
     return !had_error_;
   }
 };

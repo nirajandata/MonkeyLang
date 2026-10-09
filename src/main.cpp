@@ -83,6 +83,9 @@ static void pretty_print(const VariableDeclaration &d, int indent) {
   std::string pad(indent * 2, ' ');
   std::println("{}{}(name=\"{}\"", pad,
                std::meta::identifier_of(^^VariableDeclaration), d.name);
+  if (d.storage_class)
+    std::println("{}  storage_class={},", pad,
+                 std::visit(get_type_name, *d.storage_class));
   if (d.init)
     pretty_print(*d.init, indent + 2);
   std::println("{})", pad);
@@ -101,6 +104,9 @@ static void pretty_print(const Declaration &d, int indent) {
             std::println("{}  {}(", pad, std::meta::identifier_of(^^FunDecl));
             std::println("{}    name=\"{}\",", pad, f.decl.name);
             std::println("{}    params=[{}],", pad, join_names(f.decl.params));
+            if (f.decl.storage_class)
+              std::println("{}    storage_class={},", pad,
+                           std::visit(get_type_name, *f.decl.storage_class));
             if (f.decl.body)
               pretty_print(*f.decl.body, indent + 4);
             std::println("{}  )", pad);
@@ -310,15 +316,8 @@ static void pretty_print(const Program &program, int indent = 0) {
   std::string pad(indent * 2, ' ');
 
   std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
-  for (const auto &func : program.functions) {
-    std::println("{}  {}(", pad,
-                 std::meta::identifier_of(^^FunctionDeclaration));
-    std::println("{}    name=\"{}\",", pad, func.name);
-    std::println("{}    params=[{}],", pad, join_names(func.params));
-    if (func.body)
-      pretty_print(*func.body, indent + 2);
-    std::println("{}  )", pad);
-  }
+  for (const auto &declaration : program.declarations)
+    pretty_print(declaration, indent + 1);
   std::println("{})", pad);
 }
 

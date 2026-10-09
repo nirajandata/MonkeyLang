@@ -93,11 +93,18 @@ export {
 
   struct NirFunction {
     std::string name;
+    bool global;
     std::vector<std::string> params;
     std::vector<NirInstruction> instructions;
   };
+  struct NirStaticVariable {
+    std::string name;
+    bool global;
+    int32_t init;
+  };
+  using NirTopLevel = std::variant<NirFunction, NirStaticVariable>;
   struct NirProgram {
-    std::vector<NirFunction> functions;
+    std::vector<NirTopLevel> top_levels;
   };
 }
 
@@ -430,7 +437,7 @@ class NirEmitter {
 
   void emit_variable_declaration(const VariableDeclaration &d,
                                  std::vector<NirInstruction> &instructions) {
-    if (!d.init) return;
+    if (d.storage_class || !d.init) return;
     auto val = emit_val(*d.init, instructions);
     instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
   }
@@ -480,17 +487,39 @@ class NirEmitter {
       instructions.push_back(NirReturn{NirConstant{0}});
     }
 
-    return {std::string(func.name), func.params, std::move(instructions)};
+    bool global = true;
+    if (const Symbol *symbol = symbol_table().find(func.name)) {
+      if (const auto *attrs = std::get_if<Symbol::FunAttr>(&symbol->attrs))
+        global = attrs->global;
+    }
+    return {std::string(func.name), global, func.params,
+            std::move(instructions)};
   }
 
 public:
   NirProgram emit_program(const Program &program) {
-    std::vector<NirFunction> functions;
-    functions.reserve(program.functions.size());
-    for (const auto &func : program.functions)
-      functions.push_back(emit_function(func));
+    std::vector<NirTopLevel> top_levels;
+    top_levels.reserve(program.declarations.size() +
+                       symbol_table().entries().size());
+    for (const auto &declaration : program.declarations) {
+      if (const auto *func = std::get_if<FunDecl>(&declaration))
+        top_levels.push_back(emit_function(func->decl));
+    }
 
-    return {std::move(functions)};
+    for (const auto &[name, symbol] : symbol_table().entries()) {
+      if (const auto *attrs = std::get_if<Symbol::StaticAttr>(&symbol.attrs)) {
+        if (attrs->init.kind == Symbol::InitialValue::Kind::NoInitializer)
+          continue;
+        const int32_t initial_value =
+            attrs->init.kind == Symbol::InitialValue::Kind::Initial
+                ? attrs->init.value
+                : 0;
+        top_levels.push_back(
+            NirStaticVariable{name, attrs->global, initial_value});
+      }
+    }
+
+    return {std::move(top_levels)};
   }
 };
 

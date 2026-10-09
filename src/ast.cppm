@@ -27,6 +27,12 @@ export {
 
   using UnaryOp = std::variant<Complement, Negate, Not>;
 
+  struct Static {};
+
+  struct Extern {};
+
+  using StorageClass = std::variant<Static, Extern>;
+
   struct Add {};
 
   struct Subtract {};
@@ -205,6 +211,7 @@ export {
     std::string name;
     std::optional<Exp> init;
     uint32_t line;
+    std::optional<StorageClass> storage_class;
   };
 
   struct FunctionDeclaration {
@@ -212,6 +219,7 @@ export {
     std::vector<std::string> params;
     std::unique_ptr<Block> body;
     uint32_t line;
+    std::optional<StorageClass> storage_class;
   };
 
   struct FunDecl {
@@ -278,6 +286,6 @@ export {
   };
 
   struct Program {
-    std::vector<FunctionDeclaration> functions;
+    std::vector<Declaration> declarations;
   };
 }

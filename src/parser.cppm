@@ -332,10 +332,16 @@ export class Parser {
   }
 
   ForInit parse_for_init() {
-    if (check(TokenType::Int)) {
-      auto decl = parse_variable_declaration();
-      expect(TokenType::Semicolon, "\";\"");
-      return ForInit{InitDecl{std::move(decl)}};
+    if (is_declaration_start()) {
+      uint32_t line = peek().line;
+      auto decl = parse_declaration();
+      if (auto *variable = std::get_if<VarDecl>(&decl))
+        return ForInit{InitDecl{std::move(variable->decl)}};
+
+      std::println("error:{}: Function declaration is not allowed in a for initializer",
+                   line);
+      had_error_ = true;
+      return ForInit{InitExp{std::nullopt}};
     }
     auto exp = parse_optional_exp(TokenType::Semicolon);
     expect(TokenType::Semicolon, "\";\"");
@@ -454,18 +460,31 @@ export class Parser {
     }
   }
 
-  VariableDeclaration parse_variable_declaration() {
+  std::optional<StorageClass> parse_specifiers() {
+    size_t type_count = 0;
+    std::optional<StorageClass> storage_class;
     uint32_t line = peek().line;
-    expect(TokenType::Int, "\"int\"");
 
-    auto name = parse_identifier();
-
-    std::optional<Exp> init;
-    if (match(TokenType::Assign)) {
-      init = parse_exp(0);
+    while (check(TokenType::Int) || check(TokenType::Static) ||
+           check(TokenType::Extern)) {
+      const Token specifier = advance();
+      if (specifier.type == TokenType::Int) {
+        ++type_count;
+      } else if (storage_class) {
+        std::println("error:{}: Invalid storage class", specifier.line);
+        had_error_ = true;
+      } else if (specifier.type == TokenType::Static) {
+        storage_class = StorageClass{Static{}};
+      } else {
+        storage_class = StorageClass{Extern{}};
+      }
     }
 
-    return {std::move(name), std::move(init), line};
+    if (type_count != 1) {
+      std::println("error:{}: Invalid type specifier", line);
+      had_error_ = true;
+    }
+    return storage_class;
   }
 
   std::vector<std::string> parse_param_list() {
@@ -482,43 +501,40 @@ export class Parser {
     return params;
   }
 
-  FunctionDeclaration parse_function_declaration() {
+  Declaration parse_declaration() {
     uint32_t line = peek().line;
-    expect(TokenType::Int, "\"int\"");
-
+    auto storage_class = parse_specifiers();
     auto name = parse_identifier();
 
-    expect(TokenType::LParen, "\"(\"");
-    auto params = parse_param_list();
-    expect(TokenType::RParen, "\")\"");
+    if (match(TokenType::LParen)) {
+      auto params = parse_param_list();
+      expect(TokenType::RParen, "\")\"");
 
-    std::unique_ptr<Block> body;
-    if (check(TokenType::LBrace)) {
-      body = std::make_unique<Block>(parse_block());
-    } else {
-      expect(TokenType::Semicolon, "\";\"");
+      std::unique_ptr<Block> body;
+      if (check(TokenType::LBrace)) {
+        body = std::make_unique<Block>(parse_block());
+      } else {
+        expect(TokenType::Semicolon, "\";\"");
+      }
+      return FunDecl{FunctionDeclaration{
+          std::move(name), std::move(params), std::move(body), line,
+          std::move(storage_class)}};
     }
 
-    return {std::move(name), std::move(params), std::move(body), line};
-  }
-
-  bool at_function_declaration() const {
-    return check(TokenType::Int) && check(TokenType::Identifier, 1) &&
-           check(TokenType::LParen, 2);
-  }
-
-  Declaration parse_declaration() {
-    if (at_function_declaration()) {
-      return FunDecl{parse_function_declaration()};
-    }
-
-    auto decl = parse_variable_declaration();
+    std::optional<Exp> init;
+    if (match(TokenType::Assign)) init = parse_exp(0);
     expect(TokenType::Semicolon, "\";\"");
-    return VarDecl{std::move(decl)};
+    return VarDecl{VariableDeclaration{
+        std::move(name), std::move(init), line, std::move(storage_class)}};
+  }
+
+  bool is_declaration_start() const {
+    return check(TokenType::Int) || check(TokenType::Static) ||
+           check(TokenType::Extern);
   }
 
   BlockItem parse_block_item() {
-    return check(TokenType::Int) ? BlockItem{parse_declaration()}
+    return is_declaration_start() ? BlockItem{parse_declaration()}
                                  : BlockItem{parse_statement()};
   }
 
@@ -540,18 +556,19 @@ export class Parser {
   }
 
   Program parse_program() {
-    std::vector<FunctionDeclaration> functions;
+    std::vector<Declaration> declarations;
 
     while (!check(TokenType::Eof)) {
-      if (!check(TokenType::Int)) {
-        std::println("error:{}: Expected function declaration but found '{}'", peek().line, peek().text);
+      if (!is_declaration_start()) {
+        std::println("error:{}: Expected declaration but found '{}'", peek().line, peek().text);
         had_error_ = true;
-        break;
+        advance();
+        continue;
       }
-      functions.push_back(parse_function_declaration());
+      declarations.push_back(parse_declaration());
     }
 
-    return {std::move(functions)};
+    return {std::move(declarations)};
   }
 
 public:

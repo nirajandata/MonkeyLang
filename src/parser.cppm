@@ -12,6 +12,7 @@ module;
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <variant>
 #include <utility>
 #include <vector>
@@ -91,10 +92,55 @@ export class Parser {
     std::vector<std::string> param_names;
   };
 
+  struct StructSpecifierResult {
+    Type type;
+    std::shared_ptr<StructDef> definition;
+  };
+
+  struct Specifiers {
+    Type type;
+    std::optional<StorageClass> storage_class;
+    bool has_struct_specifier = false;
+    std::shared_ptr<StructDef> struct_definition;
+    std::string struct_tag;
+  };
+
+  static Type array_type(Type element, size_t size) {
+    const bool incomplete_struct =
+        element.kind == TypeKind::Structure &&
+        (!element.struct_def || !element.struct_def->complete);
+    Type type = Type::array(std::move(element), size);
+    type.incomplete_array_element = incomplete_struct;
+    return type;
+  }
+
+  static Type structure_type(std::shared_ptr<StructDef> definition) {
+    Type type = Type::structure(definition);
+    type.incomplete_at_declaration =
+        !definition || !definition->complete;
+    return type;
+  }
+
   const std::vector<Token>& tokens_;
   size_t pos_ = 0;
   bool had_error_ = false;
   std::string_view filename_;
+  std::vector<std::unordered_map<std::string, std::shared_ptr<StructDef>>>
+      tag_scopes_;
+
+  std::shared_ptr<StructDef> lookup_tag(const std::string &tag) const {
+    for (auto it = tag_scopes_.rbegin(); it != tag_scopes_.rend(); ++it) {
+      const auto found = it->find(tag);
+      if (found != it->end()) return found->second;
+    }
+    return nullptr;
+  }
+
+  std::shared_ptr<StructDef> lookup_tag_current(const std::string &tag) const {
+    const auto &scope = tag_scopes_.back();
+    const auto it = scope.find(tag);
+    return it == scope.end() ? nullptr : it->second;
+  }
 
   const Token& peek(size_t offset = 0) const { return tokens_[pos_ + offset]; }
 
@@ -375,7 +421,8 @@ export class Parser {
             (check(TokenType::Int, 1) || check(TokenType::Long, 1) ||
              check(TokenType::Signed, 1) || check(TokenType::Unsigned, 1) ||
              check(TokenType::Double, 1) || check(TokenType::Char, 1) ||
-             check(TokenType::Void, 1))) {
+             check(TokenType::Void, 1) || check(TokenType::Struct, 1) ||
+             check(TokenType::Union, 1))) {
           advance();
           Type target_type = parse_type_specifiers();
           if (check(TokenType::Multiply) || check(TokenType::LParen) ||
@@ -394,7 +441,8 @@ export class Parser {
         if (check(TokenType::Int) || check(TokenType::Long) ||
             check(TokenType::Signed) || check(TokenType::Unsigned) ||
             check(TokenType::Double) || check(TokenType::Char) ||
-            check(TokenType::Void)) {
+            check(TokenType::Void) || check(TokenType::Struct) ||
+            check(TokenType::Union)) {
           Type target_type = parse_type_specifiers();
           if (check(TokenType::Multiply) || check(TokenType::LParen) ||
               check(TokenType::LBracket))
@@ -420,7 +468,17 @@ export class Parser {
   Exp parse_postfix() {
     auto exp = parse_primary();
     while (check(TokenType::Increment) || check(TokenType::Decrement) ||
-           check(TokenType::LBracket)) {
+           check(TokenType::LBracket) || check(TokenType::Dot) ||
+           check(TokenType::Arrow)) {
+      if (check(TokenType::Dot) || check(TokenType::Arrow)) {
+        const bool through_pointer = check(TokenType::Arrow);
+        const uint32_t line = peek().line;
+        advance();
+        std::string member = parse_identifier();
+        exp = Exp{MemberAccess{std::make_unique<Exp>(std::move(exp)),
+                               std::move(member), through_pointer, 0, line}};
+        continue;
+      }
       if (match(TokenType::LBracket)) {
         const uint32_t line = peek().line;
         auto index = parse_exp(0);
@@ -575,11 +633,13 @@ export class Parser {
   ForInit parse_for_init() {
     if (is_declaration_start()) {
       uint32_t line = peek().line;
-      auto decl = parse_declaration();
-      if (auto *variable = std::get_if<VarDecl>(&decl))
-        return ForInit{InitDecl{std::move(variable->decl)}};
+      auto declarations = parse_declaration();
+      for (auto &decl : declarations) {
+        if (auto *variable = std::get_if<VarDecl>(&decl))
+          return ForInit{InitDecl{std::move(variable->decl)}};
+      }
 
-      std::println("error:{}: Function declaration is not allowed in a for initializer",
+      std::println("error:{}: Declaration is not allowed in a for initializer",
                    line);
       had_error_ = true;
       return ForInit{InitExp{std::nullopt}};
@@ -594,6 +654,7 @@ export class Parser {
     expect(TokenType::For, "\"for\"");
     expect(TokenType::LParen, "\"(\"");
 
+    tag_scopes_.emplace_back();
     auto init = parse_for_init();
 
     uint32_t condition_line = peek().line;
@@ -605,6 +666,7 @@ export class Parser {
     expect(TokenType::RParen, "\")\"");
 
     auto body = std::make_unique<Statement>(parse_statement());
+    tag_scopes_.pop_back();
     return Statement{For{std::move(init), std::move(condition),
                          std::move(post), std::move(body), {}, {}, line}};
   }
@@ -768,6 +830,8 @@ export class Parser {
 
   Type parse_type_specifiers() {
     const uint32_t line = peek().line;
+    if (check(TokenType::Struct) || check(TokenType::Union))
+      return parse_struct_specifier().type;
     std::vector<TokenType> types;
     while (check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
@@ -775,6 +839,96 @@ export class Parser {
            check(TokenType::Void))
       types.push_back(advance().type);
     return type_from_specifiers(types, line);
+  }
+
+  StructSpecifierResult parse_struct_specifier() {
+    const bool is_union = match(TokenType::Union);
+    if (!is_union) expect(TokenType::Struct, "\"struct\"");
+    std::string tag = parse_identifier();
+
+    if (!check(TokenType::LBrace)) {
+      std::shared_ptr<StructDef> def = lookup_tag(tag);
+      if (def && def->is_union != is_union) {
+        if (lookup_tag_current(tag)) {
+          std::println("error:{}: Conflicting struct/union tag '{}'",
+                       peek().line, tag);
+          had_error_ = true;
+        } else {
+          def = std::make_shared<StructDef>();
+          def->tag = tag;
+          def->is_union = is_union;
+          def->declared = true;
+          def->invalid = true;
+          tag_scopes_.back()[tag] = def;
+        }
+      } else if (!def) {
+        def = std::make_shared<StructDef>();
+        def->tag = tag;
+        def->is_union = is_union;
+        def->declared = false;
+      }
+      return {structure_type(std::move(def)), nullptr};
+    }
+
+    auto &scope = tag_scopes_.back();
+    std::shared_ptr<StructDef> def;
+    const auto found = scope.find(tag);
+    if (found == scope.end()) {
+      def = std::make_shared<StructDef>();
+      def->tag = tag;
+      def->is_union = is_union;
+      scope[tag] = def;
+    } else {
+      def = found->second;
+      if (def->complete || def->is_union != is_union) {
+        def->redefinition = true;
+        def->invalid = true;
+      }
+    }
+    def->declared = true;
+
+    advance();
+    std::vector<StructMember> members;
+    while (!check(TokenType::RBrace) && !check(TokenType::Eof)) {
+      const size_t start = pos_;
+      parse_struct_member(members);
+      if (pos_ == start) advance();
+    }
+    expect(TokenType::RBrace, "\"}\"");
+
+    if (members.empty()) {
+      std::println("error:{}: Structure must have at least one member", peek().line);
+      had_error_ = true;
+    }
+
+    if (!def->redefinition) {
+      def->members = std::move(members);
+      def->complete = true;
+    }
+    return {structure_type(def), def};
+  }
+
+  void parse_struct_member(std::vector<StructMember> &members) {
+    const uint32_t line = peek().line;
+    Type base = parse_type_specifiers();
+    if (check(TokenType::Semicolon)) {
+      std::println("error:{}: Expected declarator in structure member", peek().line);
+      had_error_ = true;
+      advance();
+      return;
+    }
+    while (true) {
+      auto declarator = parse_declarator();
+      auto processed = process_declarator(*declarator, base);
+      if (processed.type.kind == TypeKind::Function) {
+        std::println("error:{}: Structure member cannot be a function", line);
+        had_error_ = true;
+      }
+      members.push_back(
+          StructMember{processed.name, std::move(processed.type), 0, line});
+      if (!match(TokenType::Comma)) break;
+    }
+    expect(TokenType::Semicolon, "\";\"");
   }
 
   std::unique_ptr<Declarator> parse_declarator() {
@@ -915,7 +1069,7 @@ export class Parser {
       case Declarator::Kind::Array:
         return process_declarator(
             *declarator.inner,
-            Type::array(std::move(base_type), declarator.array_size));
+            array_type(std::move(base_type), declarator.array_size));
       case Declarator::Kind::Function: {
         if (declarator.inner->kind != Declarator::Kind::Identifier) {
           std::println("error:{}: Function pointers and functions returning functions are not supported",
@@ -1015,12 +1169,12 @@ export class Parser {
       case AbstractDeclarator::Kind::Array:
         return process_abstract_declarator(
             std::move(*declarator.inner),
-            Type::array(std::move(base_type), declarator.array_size));
+            array_type(std::move(base_type), declarator.array_size));
     }
     std::unreachable();
   }
 
-  std::pair<Type, std::optional<StorageClass>> parse_specifiers() {
+  Specifiers parse_specifiers() {
     std::vector<TokenType> types;
     std::optional<StorageClass> storage_class;
     uint32_t line = peek().line;
@@ -1029,7 +1183,15 @@ export class Parser {
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
            check(TokenType::Double) || check(TokenType::Char) ||
            check(TokenType::Void) ||
-           check(TokenType::Static) || check(TokenType::Extern)) {
+           check(TokenType::Static) || check(TokenType::Extern) ||
+           check(TokenType::Struct) || check(TokenType::Union)) {
+      if (check(TokenType::Struct) || check(TokenType::Union)) {
+        StructSpecifierResult result = parse_struct_specifier();
+        std::string tag = result.type.struct_def ? result.type.struct_def->tag
+                                                 : std::string{};
+        return {std::move(result.type), std::move(storage_class), true,
+                std::move(result.definition), std::move(tag)};
+      }
       const Token specifier = advance();
       if (specifier.type == TokenType::Int ||
           specifier.type == TokenType::Long ||
@@ -1050,14 +1212,44 @@ export class Parser {
     }
 
     Type declaration_type = type_from_specifiers(types, line);
-    return {std::move(declaration_type), std::move(storage_class)};
+    return {std::move(declaration_type), std::move(storage_class), false,
+            nullptr, {}};
   }
 
-  Declaration parse_declaration() {
+  std::vector<Declaration> parse_declaration() {
     uint32_t line = peek().line;
-    auto [decl_type, storage_class] = parse_specifiers();
+    Specifiers specs = parse_specifiers();
+    std::vector<Declaration> declarations;
+    if (specs.struct_definition)
+      declarations.push_back(StructDecl{specs.struct_definition, line});
+
+    if (check(TokenType::Semicolon)) {
+      if (!specs.has_struct_specifier) {
+        std::println("error:{}: Expected declarator but found ';'", peek().line);
+        had_error_ = true;
+        advance();
+        return declarations;
+      }
+      if (!specs.struct_definition && !specs.struct_tag.empty()) {
+        const std::string &tag = specs.struct_tag;
+        auto &scope = tag_scopes_.back();
+        if (!scope.contains(tag)) {
+          auto def = std::make_shared<StructDef>();
+          def->tag = tag;
+          def->is_union = specs.type.struct_def && specs.type.struct_def->is_union;
+          def->declared = true;
+          def->complete = false;
+          scope[tag] = def;
+        } else {
+          scope[tag]->invalid = false;
+        }
+      }
+      expect(TokenType::Semicolon, "\";\"");
+      return declarations;
+    }
+
     auto declarator = parse_declarator();
-    auto processed = process_declarator(*declarator, std::move(decl_type));
+    auto processed = process_declarator(*declarator, std::move(specs.type));
 
     if (processed.type.kind == TypeKind::Function) {
       std::unique_ptr<Block> body;
@@ -1066,43 +1258,49 @@ export class Parser {
       } else {
         expect(TokenType::Semicolon, "\";\"");
       }
-      return FunDecl{FunctionDeclaration{
+      declarations.push_back(FunDecl{FunctionDeclaration{
           std::move(processed.name), std::move(processed.param_names),
-          std::move(body), line,
-          std::move(storage_class),
-          std::move(processed.type)}};
+          std::move(body), line, std::move(specs.storage_class),
+          std::move(processed.type)}});
+      return declarations;
     }
 
     std::optional<Initializer> init;
     if (match(TokenType::Assign)) init = parse_initializer();
     expect(TokenType::Semicolon, "\";\"");
-    return VarDecl{VariableDeclaration{
+    declarations.push_back(VarDecl{VariableDeclaration{
         std::move(processed.name), std::move(init), line,
-        std::move(storage_class), std::move(processed.type)}};
+        std::move(specs.storage_class), std::move(processed.type)}});
+    return declarations;
   }
 
   bool is_declaration_start() const {
     return check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
            check(TokenType::Double) || check(TokenType::Char) ||
-           check(TokenType::Void) ||
+           check(TokenType::Void) || check(TokenType::Struct) ||
+           check(TokenType::Union) ||
            check(TokenType::Static) ||
            check(TokenType::Extern);
-  }
-
-  BlockItem parse_block_item() {
-    return is_declaration_start() ? BlockItem{parse_declaration()}
-                                 : BlockItem{parse_statement()};
   }
 
   Block parse_block() {
     expect(TokenType::LBrace, "\"{\"");
 
+    tag_scopes_.emplace_back();
     std::vector<BlockItem> items;
     while (!check(TokenType::RBrace) && !check(TokenType::Eof)) {
-      items.push_back(parse_block_item());
+      const size_t start = pos_;
+      if (is_declaration_start()) {
+        for (auto &declaration : parse_declaration())
+          items.push_back(BlockItem{std::move(declaration)});
+      } else {
+        items.push_back(BlockItem{parse_statement()});
+      }
+      if (pos_ == start) advance();
     }
     expect(TokenType::RBrace, "\"}\"");
+    tag_scopes_.pop_back();
 
     return {std::move(items)};
   }
@@ -1122,7 +1320,8 @@ export class Parser {
         advance();
         continue;
       }
-      declarations.push_back(parse_declaration());
+      for (auto &declaration : parse_declaration())
+        declarations.push_back(std::move(declaration));
     }
 
     return {std::move(declarations)};
@@ -1130,7 +1329,9 @@ export class Parser {
 
 public:
   Parser(const std::vector<Token>& tokens, std::string_view filename)
-      : tokens_(tokens), filename_(filename) {}
+      : tokens_(tokens), filename_(filename) {
+    tag_scopes_.emplace_back();
+  }
 
   std::optional<Program> parse() {
     auto program = parse_program();

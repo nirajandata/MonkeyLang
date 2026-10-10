@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -21,6 +22,37 @@ import parser;
 import semantic;
 import nir;
 import codegen;
+
+static bool expand_local_includes(const std::filesystem::path &path,
+                                  std::string &output,
+                                  std::unordered_set<std::string> &included) {
+  std::ifstream input(path);
+  if (!input) return false;
+  std::string line;
+  while (std::getline(input, line)) {
+    const size_t directive = line.find("#include");
+    const size_t quote = directive == std::string::npos
+                             ? std::string::npos
+                             : line.find('"', directive + 8);
+    if (quote != std::string::npos) {
+      const size_t end = line.find('"', quote + 1);
+      if (end != std::string::npos) {
+        const auto included_path =
+            std::filesystem::weakly_canonical(path.parent_path() /
+                line.substr(quote + 1, end - quote - 1));
+        const std::string key = included_path.string();
+        if (included.insert(key).second &&
+            !expand_local_includes(included_path, output, included))
+          return false;
+        output.push_back('\n');
+        continue;
+      }
+    }
+    output += line;
+    output.push_back('\n');
+  }
+  return true;
+}
 
 enum class Stage : std::uint8_t {
   Lex,
@@ -134,6 +166,9 @@ template <typename T> constexpr bool is_optional_v<std::optional<T>> = true;
 template <typename T> constexpr bool is_unique_ptr_v = false;
 template <typename T, typename D> constexpr bool is_unique_ptr_v<std::unique_ptr<T, D>> = true;
 
+template <typename T> constexpr bool is_shared_ptr_v = false;
+template <typename T> constexpr bool is_shared_ptr_v<std::shared_ptr<T>> = true;
+
 template <typename T> constexpr bool is_string_like_v =
     std::is_same_v<std::decay_t<T>, std::string> || std::is_same_v<std::decay_t<T>, std::string_view>;
 
@@ -159,7 +194,7 @@ void pretty_print(const T& obj, int indent = 0) {
         }
         std::println("{}{}", pad, name);
     }
-    else if constexpr (is_optional_v<T> || is_unique_ptr_v<T> || std::is_pointer_v<T>) {
+    else if constexpr (is_optional_v<T> || is_unique_ptr_v<T> || is_shared_ptr_v<T> || std::is_pointer_v<T>) {
         if (obj) {
             pretty_print(*obj, indent);
         } else {
@@ -204,7 +239,21 @@ void pretty_print(const T& obj, int indent = 0) {
 
 static int compile_file(const std::filesystem::path &source_path, Stage stage,
                         std::string &assembly) {
-  Lexer lexer(source_path);
+  std::unordered_set<std::string> included;
+  std::string preprocessed;
+  if (!expand_local_includes(source_path, preprocessed, included)) return 1;
+  const auto temporary_path = std::filesystem::temp_directory_path() /
+      ("monkey-" + std::to_string(next_name_id()) + ".c");
+  {
+    std::ofstream temporary(temporary_path);
+    if (!temporary) return 1;
+    temporary << preprocessed;
+  }
+  struct TemporaryFile {
+    std::filesystem::path path;
+    ~TemporaryFile() { std::error_code ec; std::filesystem::remove(path, ec); }
+  } cleanup{temporary_path};
+  Lexer lexer(temporary_path);
   lexer.lex();
   if (!lexer.ok())
     return 1;

@@ -1,5 +1,6 @@
 module;
 
+#include <algorithm>
 #include <cstdint>
 #include <bit>
 #include <cmath>
@@ -158,6 +159,7 @@ class IdentifierResolver {
                    [](String &) {},
                    [](SizeOfT &) {},
                    [&](SizeOf &s) { resolve_exp(*s.exp, scope); },
+                   [&](MemberAccess &m) { resolve_exp(*m.exp, scope); },
                },
                exp.value);
   }
@@ -316,6 +318,7 @@ class IdentifierResolver {
             [&](VarDecl &v) {
               resolve_variable_declaration(v.decl, scope, local_names);
             },
+            [](StructDecl &) {},
         },
         d);
   }
@@ -364,9 +367,8 @@ public:
     for (auto &declaration : program.declarations) {
       if (auto *func = std::get_if<FunDecl>(&declaration)) {
         resolve_function_declaration(func->decl, scope, local_names);
-      } else {
-        resolve_file_scope_variable_declaration(
-            std::get<VarDecl>(declaration).decl, scope);
+      } else if (auto *var = std::get_if<VarDecl>(&declaration)) {
+        resolve_file_scope_variable_declaration(var->decl, scope);
       }
     }
 
@@ -390,6 +392,16 @@ class TypeChecker {
   }
 
   static Initializer zero_initializer(const Type &type) {
+    if (type.kind == TypeKind::Structure && type.struct_def) {
+      std::vector<Initializer> members;
+      const size_t count = type.struct_def->is_union
+                               ? std::min<size_t>(1, type.struct_def->members.size())
+                               : type.struct_def->members.size();
+      members.reserve(count);
+      for (size_t i = 0; i < count; ++i)
+        members.push_back(zero_initializer(type.struct_def->members[i].type));
+      return Initializer{CompoundInit{std::move(members)}, type};
+    }
     if (type.kind == TypeKind::Array && type.referenced) {
       std::vector<Initializer> elements;
       elements.reserve(type.size);
@@ -415,6 +427,12 @@ class TypeChecker {
   }
 
   Type typecheck_initializer(const Type &target, Initializer &init) {
+    if (target.kind == TypeKind::Structure && !is_complete(target)) {
+      std::println("error: Cannot initialize incomplete structure");
+      had_error_ = true;
+      init.type = target;
+      return target;
+    }
     if (target.kind == TypeKind::Array && target.referenced &&
         is_char_kind(target.referenced->kind) &&
         std::holds_alternative<SingleInit>(init.value)) {
@@ -459,21 +477,32 @@ class TypeChecker {
               return target;
             },
             [&](CompoundInit &compound) {
-              if (target.kind != TypeKind::Array || !target.referenced) {
-                std::println("error: Compound initializer requires an array type");
+              const bool is_array = target.kind == TypeKind::Array && target.referenced;
+              const bool is_structure = target.kind == TypeKind::Structure && target.struct_def;
+              if (!is_array && !is_structure) {
+                std::println("error: Compound initializer requires an aggregate type");
                 had_error_ = true;
                 init.type = target;
                 return target;
               }
-              if (compound.initializers.size() > target.size) {
-                std::println("error: Too many values in array initializer");
+              const size_t count = is_array ? target.size
+                  : target.struct_def->is_union ? 1
+                                                : target.struct_def->members.size();
+              if (compound.initializers.size() > count) {
+                std::println("error: Too many values in aggregate initializer");
                 had_error_ = true;
               }
-              for (auto &child : compound.initializers)
-                typecheck_initializer(*target.referenced, child);
-              while (compound.initializers.size() < target.size)
-                compound.initializers.push_back(
-                    zero_initializer(*target.referenced));
+              for (size_t i = 0; i < compound.initializers.size() && i < count; ++i) {
+                const Type &element = is_array ? *target.referenced
+                                               : target.struct_def->members[i].type;
+                typecheck_initializer(element, compound.initializers[i]);
+              }
+              while ((!is_structure || !target.struct_def->is_union) &&
+                     compound.initializers.size() < count) {
+                const Type &element = is_array ? *target.referenced
+                                               : target.struct_def->members[compound.initializers.size()].type;
+                compound.initializers.push_back(zero_initializer(element));
+              }
               init.type = target;
               return target;
             }},
@@ -644,10 +673,17 @@ class TypeChecker {
               return true;
             },
             [&](const CompoundInit &compound) {
+              size_t offset = 0;
               for (const auto &child : compound.initializers) {
+                const size_t alignment = type_alignment(child.type);
+                const size_t aligned = (offset + alignment - 1) / alignment * alignment;
+                if (aligned > offset) values.push_back(ZeroInit{aligned - offset});
                 if (!collect_static_initializers(child, values))
                   return false;
+                offset = aligned + type_size(child.type);
               }
+              const size_t total_size = type_size(initializer.type);
+              if (total_size > offset) values.push_back(ZeroInit{total_size - offset});
               return true;
             }},
         initializer.value);
@@ -680,7 +716,8 @@ class TypeChecker {
 
   static bool is_arithmetic(const Type &type) {
     return type.kind != TypeKind::Pointer && type.kind != TypeKind::Function &&
-           type.kind != TypeKind::Array && type.kind != TypeKind::Void;
+           type.kind != TypeKind::Array && type.kind != TypeKind::Void &&
+           type.kind != TypeKind::Structure;
   }
 
   static bool is_integer(const Type &type) {
@@ -704,15 +741,181 @@ class TypeChecker {
       return false;
     case TypeKind::Array:
       return type.referenced && is_complete(*type.referenced);
+    case TypeKind::Structure:
+      return type.struct_def && type.struct_def->complete;
     default:
       return true;
+    }
+  }
+
+  static size_t type_size(const Type &type) {
+    switch (type.kind) {
+    case TypeKind::Char:
+    case TypeKind::SChar:
+    case TypeKind::UChar: return 1;
+    case TypeKind::Int:
+    case TypeKind::UInt: return 4;
+    case TypeKind::Double:
+    case TypeKind::Long:
+    case TypeKind::ULong:
+    case TypeKind::Pointer: return 8;
+    case TypeKind::Array: return type.size * type_size(*type.referenced);
+    case TypeKind::Structure:
+      return type.struct_def ? type.struct_def->size : 0;
+    default: return 0;
+    }
+  }
+
+  static size_t type_alignment(const Type &type) {
+    switch (type.kind) {
+    case TypeKind::Char:
+    case TypeKind::SChar:
+    case TypeKind::UChar: return 1;
+    case TypeKind::Int:
+    case TypeKind::UInt: return 4;
+    case TypeKind::Double:
+    case TypeKind::Long:
+    case TypeKind::ULong:
+    case TypeKind::Pointer: return 8;
+    case TypeKind::Array:
+      return type.referenced ? type_alignment(*type.referenced) : 1;
+    case TypeKind::Structure:
+      return type.struct_def ? type.struct_def->alignment : 1;
+    default: return 4;
+    }
+  }
+
+  std::unordered_set<const StructDef *> validated_structs_;
+
+  static bool type_contains_void_member(const Type &type) {
+    if (type.kind == TypeKind::Void) return true;
+    if (type.kind == TypeKind::Array)
+      return type.referenced && type_contains_void_member(*type.referenced);
+    return false;
+  }
+
+  void layout_and_validate(StructDef &def,
+                           std::vector<const StructDef *> &stack) {
+    if (def.invalid) {
+      std::println("error: Conflicting struct/union tag '{}'", def.tag);
+      had_error_ = true;
+      return;
+    }
+    if (!def.declared) {
+      std::println("error: Struct '{}' is undeclared", def.tag);
+      had_error_ = true;
+      return;
+    }
+    if (def.redefinition) {
+      std::println("error: Structure '{}' is defined more than once", def.tag);
+      had_error_ = true;
+      return;
+    }
+    if (!def.complete) return;
+    if (std::find(stack.begin(), stack.end(), &def) != stack.end()) {
+      std::println("error: Structure '{}' contains itself", def.tag);
+      had_error_ = true;
+      return;
+    }
+    stack.push_back(&def);
+
+    std::unordered_set<std::string> member_names;
+    size_t offset = 0;
+    size_t union_size = 0;
+    size_t alignment = 1;
+    for (StructMember &member : def.members) {
+      if (has_invalid_array(member.type)) {
+        std::println("error: Structure member '{}' has an invalid array type",
+                     member.name);
+        had_error_ = true;
+      }
+      if (!member_names.insert(member.name).second) {
+        std::println("error: Duplicate member '{}' in structure '{}'",
+                     member.name, def.tag);
+        had_error_ = true;
+      }
+      if (type_contains_void_member(member.type)) {
+        std::println("error: Structure member '{}' cannot have type void",
+                     member.name);
+        had_error_ = true;
+      }
+      if (member.type.kind == TypeKind::Structure &&
+          member.type.struct_def) {
+        if (!member.type.struct_def->declared) {
+          std::println("error: Structure member '{}' has undeclared type",
+                       member.name);
+          had_error_ = true;
+        } else if (!member.type.struct_def->complete) {
+          std::println("error: Structure member '{}' has incomplete type",
+                       member.name);
+          had_error_ = true;
+        } else {
+          layout_and_validate(*member.type.struct_def, stack);
+        }
+      } else if (member.type.kind == TypeKind::Array && member.type.referenced &&
+                 member.type.referenced->kind == TypeKind::Structure &&
+                 member.type.referenced->struct_def) {
+        const StructDef &element_def = *member.type.referenced->struct_def;
+        if (!element_def.declared) {
+          std::println("error: Structure member '{}' has undeclared type",
+                       member.name);
+          had_error_ = true;
+        } else if (!element_def.complete) {
+          std::println("error: Structure member '{}' has incomplete type",
+                       member.name);
+          had_error_ = true;
+        } else {
+          layout_and_validate(const_cast<StructDef &>(element_def), stack);
+        }
+      }
+      const size_t member_alignment = type_alignment(member.type);
+      if (def.is_union) {
+        member.offset = 0;
+        union_size = std::max(union_size, type_size(member.type));
+      } else {
+        offset = (offset + member_alignment - 1) / member_alignment *
+                 member_alignment;
+        member.offset = offset;
+        offset += type_size(member.type);
+      }
+      if (member_alignment > alignment) alignment = member_alignment;
+    }
+    stack.pop_back();
+    def.alignment = alignment;
+    const size_t size = def.is_union ? union_size : offset;
+    def.size = (size + alignment - 1) / alignment * alignment;
+  }
+
+  void validate_struct(const std::shared_ptr<StructDef> &def) {
+    if (!def) return;
+    if (!validated_structs_.insert(def.get()).second) return;
+    std::vector<const StructDef *> stack;
+    layout_and_validate(*def, stack);
+  }
+
+  void validate_struct_type(const Type &type) {
+    switch (type.kind) {
+    case TypeKind::Structure:
+      validate_struct(type.struct_def);
+      break;
+    case TypeKind::Pointer:
+    case TypeKind::Array:
+      if (type.referenced) validate_struct_type(*type.referenced);
+      break;
+    case TypeKind::Function:
+      if (type.ret) validate_struct_type(*type.ret);
+      for (const Type &param : type.params) validate_struct_type(param);
+      break;
+    default:
+      break;
     }
   }
 
   static bool has_invalid_array(const Type &type) {
     switch (type.kind) {
     case TypeKind::Array:
-      return !type.referenced || !is_complete(*type.referenced) ||
+      return type.incomplete_array_element || !type.referenced ||
+             !is_complete(*type.referenced) ||
              has_invalid_array(*type.referenced);
     case TypeKind::Pointer:
       return type.referenced && has_invalid_array(*type.referenced);
@@ -750,6 +953,10 @@ class TypeChecker {
 
   Type typecheck_and_convert(Exp &exp) {
     Type type = typecheck_exp(exp);
+    if (type.kind == TypeKind::Structure && !is_complete(type)) {
+      std::println("error: Cannot use incomplete structure value");
+      had_error_ = true;
+    }
     if (type.kind == TypeKind::Array && type.referenced) {
       const uint32_t line = std::visit(
           Overload{[](const ConstInt &v) { return v.line; },
@@ -771,7 +978,8 @@ class TypeChecker {
                         [](const Subscript &v) { return v.line; },
                  [](const String &v) { return v.line; },
                  [](const SizeOfT &v) { return v.line; },
-                 [](const SizeOf &v) { return v.line; }},
+                 [](const SizeOf &v) { return v.line; },
+                 [](const MemberAccess &v) { return v.line; }},
           exp.value);
       Type decayed = Type::pointer(*type.referenced);
       exp = Exp{AddrOf{std::make_unique<Exp>(std::move(exp)), line}, decayed};
@@ -781,11 +989,17 @@ class TypeChecker {
   }
 
   static bool is_lvalue(const Exp &exp) {
-    return exp.type.kind != TypeKind::Function &&
-           (std::holds_alternative<Var>(exp.value) ||
-            std::holds_alternative<Dereference>(exp.value) ||
-            std::holds_alternative<Subscript>(exp.value) ||
-            std::holds_alternative<String>(exp.value));
+    if (exp.type.kind == TypeKind::Function) return false;
+    return std::visit(
+        Overload{[](const Var &) { return true; },
+                 [](const Dereference &) { return true; },
+                 [](const Subscript &) { return true; },
+                 [](const String &) { return true; },
+                 [](const MemberAccess &member) {
+                   return member.through_pointer || is_lvalue(*member.exp);
+                 },
+                 [](const auto &) { return false; }},
+        exp.value);
   }
 
   Type common_pointer_type(Exp &left, Exp &right, uint32_t line) {
@@ -849,7 +1063,8 @@ class TypeChecker {
                  [](const Subscript &v) { return v.line; },
                  [](const String &v) { return v.line; },
                  [](const SizeOfT &v) { return v.line; },
-                 [](const SizeOf &v) { return v.line; }},
+                 [](const SizeOf &v) { return v.line; },
+                 [](const MemberAccess &v) { return v.line; }},
         exp.value);
     std::println("error:{}: Cannot convert type for assignment", line);
     had_error_ = true;
@@ -879,7 +1094,8 @@ class TypeChecker {
                  [](const Subscript &v) { return v.line; },
                  [](const String &v) { return v.line; },
                  [](const SizeOfT &v) { return v.line; },
-                 [](const SizeOf &v) { return v.line; }},
+                 [](const SizeOf &v) { return v.line; },
+                 [](const MemberAccess &v) { return v.line; }},
         exp.value);
     Exp converted{Cast{target, std::make_unique<Exp>(std::move(exp)), line},
                   target};
@@ -908,6 +1124,7 @@ class TypeChecker {
               return var_type;
             },
             [&](const Cast &c) {
+              validate_struct_type(c.target_type);
               Type source = typecheck_and_convert(*c.exp);
               if ((source.kind == TypeKind::Double &&
                    c.target_type.kind == TypeKind::Pointer) ||
@@ -916,6 +1133,9 @@ class TypeChecker {
                   source.kind == TypeKind::Function ||
                   c.target_type.kind == TypeKind::Function ||
                   c.target_type.kind == TypeKind::Array ||
+                  (source.kind == TypeKind::Structure &&
+                   c.target_type.kind != TypeKind::Void) ||
+                  c.target_type.kind == TypeKind::Structure ||
                   has_invalid_array(c.target_type)) {
                 std::println("error:{}: Invalid cast involving pointer type",
                              c.line);
@@ -935,12 +1155,6 @@ class TypeChecker {
                              d.line);
                 had_error_ = true;
                 return Type::int_type();
-              }
-              if (!is_complete(*pointer_type.referenced)) {
-                std::println(
-                    "error:{}: Cannot dereference pointer to incomplete type",
-                    d.line);
-                had_error_ = true;
               }
               return *pointer_type.referenced;
             },
@@ -996,6 +1210,7 @@ class TypeChecker {
               return symbol_table().get(s.name).type;
             },
             [&](const SizeOfT &s) {
+              validate_struct_type(s.target_type);
               if (!is_complete(s.target_type) ||
                   has_invalid_array(s.target_type)) {
                 std::println(
@@ -1016,10 +1231,53 @@ class TypeChecker {
               }
               return Type::ulong_type();
             },
+            [&](MemberAccess &m) {
+              Type struct_type;
+              if (m.through_pointer) {
+                struct_type = typecheck_and_convert(*m.exp);
+                if (struct_type.kind != TypeKind::Pointer ||
+                    !struct_type.referenced ||
+                    struct_type.referenced->kind != TypeKind::Structure) {
+                  std::println(
+                      "error:{}: Member access on non-structure pointer",
+                      m.line);
+                  had_error_ = true;
+                  return Type::int_type();
+                }
+                struct_type = *struct_type.referenced;
+              } else {
+                struct_type = typecheck_exp(*m.exp);
+                if (struct_type.kind != TypeKind::Structure) {
+                  std::println("error:{}: Member access on non-structure type",
+                               m.line);
+                  had_error_ = true;
+                  return Type::int_type();
+                }
+              }
+              if (!struct_type.struct_def ||
+                  !struct_type.struct_def->complete) {
+                std::println("error:{}: Member access on incomplete structure",
+                             m.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              for (const StructMember &member :
+                   struct_type.struct_def->members) {
+                if (member.name == m.member) {
+                  m.offset = member.offset;
+                  return member.type;
+                }
+              }
+              std::println("error:{}: Structure has no member named '{}'",
+                           m.line, m.member);
+              had_error_ = true;
+              return Type::int_type();
+            },
             [&](const Unary &u) {
               Type operand_type = typecheck_exp(*u.exp);
               if (std::holds_alternative<Not>(u.op)) {
-                if (is_void(operand_type)) {
+                if (is_void(operand_type) ||
+                    operand_type.kind == TypeKind::Structure) {
                   std::println(
                       "error:{}: Invalid unary operator on non-arithmetic type",
                       u.line);
@@ -1050,6 +1308,13 @@ class TypeChecker {
               Type left = typecheck_and_convert(*b.left);
               Type right = typecheck_and_convert(*b.right);
               if (is_void(left) || is_void(right)) {
+                std::println("error:{}: Invalid operands to binary operator",
+                             b.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              if (left.kind == TypeKind::Structure ||
+                  right.kind == TypeKind::Structure) {
                 std::println("error:{}: Invalid operands to binary operator",
                              b.line);
                 had_error_ = true;
@@ -1191,7 +1456,8 @@ class TypeChecker {
               }
               if (left.kind == TypeKind::Pointer ||
                   a.right->type.kind == TypeKind::Pointer ||
-                  left.kind == TypeKind::Array) {
+                  left.kind == TypeKind::Array ||
+                  left.kind == TypeKind::Structure) {
                 std::println("error:{}: Unsupported compound operation on pointer",
                              a.line);
                 had_error_ = true;
@@ -1203,6 +1469,7 @@ class TypeChecker {
               Type type = typecheck_exp(*e.exp);
               if (!is_lvalue(*e.exp) || type.kind == TypeKind::Pointer ||
                   type.kind == TypeKind::Array ||
+                  type.kind == TypeKind::Structure ||
                   std::holds_alternative<String>(e.exp->value)) {
                 std::println("error:{}: Invalid increment/decrement operand",
                              e.line);
@@ -1212,13 +1479,30 @@ class TypeChecker {
             },
             [&](Conditional &c) {
               Type condition = typecheck_and_convert(*c.condition);
-              if (is_void(condition)) {
+              if (is_void(condition) ||
+                  condition.kind == TypeKind::Structure) {
                 std::println("error:{}: Conditional condition must have scalar type",
                              c.line);
                 had_error_ = true;
               }
               Type then_type = typecheck_and_convert(*c.then_exp);
               Type else_type = typecheck_and_convert(*c.else_exp);
+              if ((then_type.kind == TypeKind::Structure &&
+                   !is_complete(then_type)) ||
+                  (else_type.kind == TypeKind::Structure &&
+                   !is_complete(else_type))) {
+                std::println("error:{}: Conditional branch has incomplete structure type",
+                             c.line);
+                had_error_ = true;
+              }
+              if (then_type.kind == TypeKind::Structure ||
+                  else_type.kind == TypeKind::Structure) {
+                if (then_type == else_type) return then_type;
+                std::println("error:{}: Conditional branches have incompatible types",
+                             c.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
               if (is_void(then_type) || is_void(else_type)) {
                 if (is_void(then_type) && is_void(else_type))
                   return Type::void_type();
@@ -1249,6 +1533,12 @@ class TypeChecker {
                 for (const auto &arg : c.args) typecheck_exp(*arg);
                 return Type::int_type();
               }
+              if (fun_type.ret && fun_type.ret->kind == TypeKind::Structure &&
+                  !is_complete(*fun_type.ret)) {
+                std::println("error:{}: Cannot call function returning incomplete structure",
+                             c.line);
+                had_error_ = true;
+              }
               if (fun_type.params.size() != c.args.size()) {
                 std::println(
                     "error:{}: Function called with the wrong number of "
@@ -1271,9 +1561,14 @@ class TypeChecker {
 
   void check_object_type(const Type &type, uint32_t line,
                          bool allow_void) {
+    validate_struct_type(type);
     if (has_invalid_array(type)) {
       std::println(
           "error:{}: Array has incomplete element type", line);
+      had_error_ = true;
+    }
+    if (type.kind == TypeKind::Structure && !is_complete(type)) {
+      std::println("error:{}: Variable has incomplete type", line);
       had_error_ = true;
     }
     if (!allow_void && is_void(type)) {
@@ -1284,7 +1579,7 @@ class TypeChecker {
 
   void typecheck_condition(Exp &exp, uint32_t line) {
     Type type = typecheck_exp(exp);
-    if (is_void(type)) {
+    if (is_void(type) || type.kind == TypeKind::Structure) {
       std::println("error:{}: Controlling condition must have scalar type",
                    line);
       had_error_ = true;
@@ -1311,7 +1606,14 @@ class TypeChecker {
                 had_error_ = true;
               }
             },
-            [&](Expression &e) { typecheck_exp(e.value); },
+            [&](Expression &e) {
+              Type type = typecheck_exp(e.value);
+              if (type.kind == TypeKind::Structure && !is_complete(type)) {
+                std::println("error:{}: Incomplete structure expression",
+                             e.line);
+                had_error_ = true;
+              }
+            },
             [](const Null &) {},
             [&](If &i) {
               typecheck_condition(i.condition, i.line);
@@ -1365,7 +1667,8 @@ class TypeChecker {
 
   void typecheck_local_variable_declaration(VariableDeclaration &d) {
     const Type &decl_type = d.var_type;
-    check_object_type(decl_type, d.line, false);
+    if (!(is_extern(d) && !d.init && decl_type.kind == TypeKind::Structure))
+      check_object_type(decl_type, d.line, false);
     if (is_extern(d)) {
       if (d.init) {
         std::println("error:{}: Initializer on local extern variable '{}'",
@@ -1414,9 +1717,17 @@ class TypeChecker {
 
   void typecheck_file_scope_variable_declaration(
       VariableDeclaration &d) {
-    check_object_type(d.var_type, d.line, false);
+    if (!(is_extern(d) && !d.init &&
+          d.var_type.kind == TypeKind::Structure))
+      check_object_type(d.var_type, d.line, false);
     InitialValue init{InitialValue::Kind::Tentative, 0};
     if (d.init) {
+      if (is_extern(d) && d.var_type.kind == TypeKind::Structure &&
+          d.var_type.incomplete_at_declaration) {
+        std::println("error:{}: Cannot initialize incomplete structure",
+                     d.line);
+        had_error_ = true;
+      }
       typecheck_initializer(d.var_type, *d.init);
       init.kind = InitialValue::Kind::Initial;
       if (!collect_static_initializers(*d.init, init.values)) {
@@ -1471,6 +1782,9 @@ class TypeChecker {
   }
 
   void typecheck_function_declaration(FunctionDeclaration &d) {
+    const bool has_body = static_cast<bool>(d.body);
+    if (d.fun_type.ret) validate_struct_type(*d.fun_type.ret);
+    for (const Type &param : d.fun_type.params) validate_struct_type(param);
     if (d.fun_type.ret && d.fun_type.ret->kind == TypeKind::Array) {
       std::println("error:{}: A function cannot return an array", d.line);
       had_error_ = true;
@@ -1480,6 +1794,12 @@ class TypeChecker {
       had_error_ = true;
     }
     for (const Type &param : d.fun_type.params) {
+      if (has_body && param.kind == TypeKind::Structure &&
+          !is_complete(param)) {
+        std::println("error:{}: Function definition has incomplete parameter type",
+                     d.line);
+        had_error_ = true;
+      }
       if (is_void(param)) {
         std::println("error:{}: Parameter cannot have type void", d.line);
         had_error_ = true;
@@ -1488,12 +1808,18 @@ class TypeChecker {
         had_error_ = true;
       }
     }
+    if (has_body && d.fun_type.ret &&
+        d.fun_type.ret->kind == TypeKind::Structure &&
+        !is_complete(*d.fun_type.ret)) {
+      std::println("error:{}: Function definition has incomplete return type",
+                   d.line);
+      had_error_ = true;
+    }
     for (Type &param : d.fun_type.params) {
       if (param.kind == TypeKind::Array && param.referenced)
         param = Type::pointer(*param.referenced);
     }
     const Type fun_type = d.fun_type;
-    const bool has_body = static_cast<bool>(d.body);
     bool already_defined = false;
     bool global = !d.storage_class ||
                   !std::holds_alternative<Static>(*d.storage_class);
@@ -1542,6 +1868,7 @@ class TypeChecker {
             [&](VarDecl &v) {
             typecheck_local_variable_declaration(v.decl);
             },
+            [&](StructDecl &s) { validate_struct(s.def); },
         },
         d);
   }
@@ -1558,8 +1885,14 @@ class TypeChecker {
               typecheck_local_variable_declaration(d.decl);
             },
             [&](InitExp &e) {
-              if (e.exp)
-                typecheck_exp(*e.exp);
+              if (e.exp) {
+                Type type = typecheck_exp(*e.exp);
+                if (type.kind == TypeKind::Structure && !is_complete(type)) {
+                  std::println("error:{}: Incomplete structure expression",
+                               0);
+                  had_error_ = true;
+                }
+              }
             },
         },
         init);
@@ -1583,9 +1916,10 @@ public:
     for (auto &declaration : program.declarations) {
       if (auto *func = std::get_if<FunDecl>(&declaration)) {
         typecheck_function_declaration(func->decl);
-      } else {
-        typecheck_file_scope_variable_declaration(
-            std::get<VarDecl>(declaration).decl);
+      } else if (auto *var = std::get_if<VarDecl>(&declaration)) {
+        typecheck_file_scope_variable_declaration(var->decl);
+      } else if (auto *s = std::get_if<StructDecl>(&declaration)) {
+        validate_struct(s->def);
       }
     }
 
@@ -1726,6 +2060,9 @@ class BreakContinueLabeler {
                    [](String &) {},
                    [](SizeOfT &) {},
                    [&](SizeOf &s) { find_enclosing_loop(*s.exp, loop); },
+                   [&](MemberAccess &m) {
+                     find_enclosing_loop(*m.exp, loop);
+                   },
                },
                exp.value);
   }

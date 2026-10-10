@@ -27,8 +27,11 @@ export {
     Void,
     Function,
     Pointer,
-    Array
+    Array,
+    Structure
   };
+
+  struct StructDef;
 
   struct Type {
     TypeKind kind = TypeKind::Int;
@@ -36,6 +39,9 @@ export {
     std::shared_ptr<Type> ret;
     std::shared_ptr<Type> referenced;
     size_t size = 0;
+    std::shared_ptr<StructDef> struct_def;
+    bool incomplete_array_element = false;
+    bool incomplete_at_declaration = false;
 
     static Type int_type() { return {}; }
     static Type long_type() { return {TypeKind::Long, {}, nullptr, nullptr, 0}; }
@@ -55,18 +61,48 @@ export {
               nullptr, std::make_shared<Type>(std::move(referenced)), 0};
     }
     static Type array(Type element, size_t size) {
-      return {TypeKind::Array, {},
-              nullptr, std::make_shared<Type>(std::move(element)), size};
+      return {TypeKind::Array, {}, nullptr,
+              std::make_shared<Type>(std::move(element)), size};
+    }
+    static Type structure(std::shared_ptr<StructDef> def) {
+      Type type;
+      type.kind = TypeKind::Structure;
+      type.struct_def = std::move(def);
+      return type;
     }
 
     friend bool operator==(const Type &a, const Type &b) {
       if (a.kind != b.kind || a.params != b.params || a.size != b.size ||
+          a.incomplete_array_element != b.incomplete_array_element ||
           static_cast<bool>(a.ret) != static_cast<bool>(b.ret) ||
-          static_cast<bool>(a.referenced) != static_cast<bool>(b.referenced))
+          static_cast<bool>(a.referenced) != static_cast<bool>(b.referenced) ||
+          static_cast<bool>(a.struct_def) !=
+              static_cast<bool>(b.struct_def))
         return false;
+      if (a.kind == TypeKind::Structure)
+        return a.struct_def.get() == b.struct_def.get();
       return (!a.ret || *a.ret == *b.ret) &&
              (!a.referenced || *a.referenced == *b.referenced);
     }
+  };
+
+  struct StructMember {
+    std::string name;
+    Type type;
+    size_t offset = 0;
+    uint32_t line = 0;
+  };
+
+  struct StructDef {
+    std::string tag;
+    bool declared = false;
+    bool complete = false;
+    bool redefinition = false;
+  bool invalid = false;
+  bool is_union = false;
+    std::vector<StructMember> members;
+    size_t size = 0;
+    size_t alignment = 1;
   };
 
   struct ConstInt {
@@ -290,11 +326,19 @@ export {
     uint32_t line;
   };
 
+  struct MemberAccess {
+    std::unique_ptr<Exp> exp;
+    std::string member;
+    bool through_pointer = false;
+    size_t offset = 0;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble, Var,
                  Cast, Unary, Binary, Assignment, CompoundAssignment, IncDec,
                  Conditional, FunctionCall, Dereference, AddrOf, Subscript,
-                 String, SizeOfT, SizeOf> value;
+                 String, SizeOfT, SizeOf, MemberAccess> value;
     Type type;
   };
 
@@ -400,7 +444,12 @@ export {
     VariableDeclaration decl;
   };
 
-  using Declaration = std::variant<FunDecl, VarDecl>;
+  struct StructDecl {
+    std::shared_ptr<StructDef> def;
+    uint32_t line;
+  };
+
+  using Declaration = std::variant<FunDecl, VarDecl, StructDecl>;
 
   struct InitDecl {
     VariableDeclaration decl;

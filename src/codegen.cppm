@@ -179,7 +179,8 @@ static Operand nir_val_to_operand(const NirVal &val,
     },
     [](const NirVar &v) -> Operand {
       if (const Symbol *symbol = symbol_table().find(v.name);
-          symbol && symbol->type.kind == TypeKind::Array)
+          symbol && (symbol->type.kind == TypeKind::Array ||
+                     symbol->type.kind == TypeKind::Structure))
         return PseudoMem{v.name, 0};
       return Pseudo{v.name};
     }
@@ -195,6 +196,127 @@ static AsmType asm_type(const Type &type) {
       type.kind == TypeKind::UChar)
     return AsmType::Byte;
   return AsmType::Longword;
+}
+
+static size_t type_size(const Type &type);
+
+static std::vector<bool> aggregate_register_classes(const Type &type) {
+  const size_t size = type.struct_def ? type.struct_def->size : 0;
+  std::vector<bool> classes((size + 7) / 8, true);
+  if (!type.struct_def || size == 0 || size > 16) return {};
+  const auto mark_integer = [&](size_t offset, size_t member_size) {
+    if (member_size == 0) return;
+    const size_t first = offset / 8;
+    const size_t last = (offset + member_size - 1) / 8;
+    for (size_t i = first; i <= last && i < classes.size(); ++i)
+      classes[i] = false;
+  };
+  const auto classify = [&](const auto &self, const Type &member,
+                            size_t offset) -> void {
+    if (member.kind == TypeKind::Double) return;
+    if (member.kind == TypeKind::Structure && member.struct_def) {
+      for (const auto &nested : member.struct_def->members)
+        self(self, nested.type, offset + nested.offset);
+      return;
+    }
+    if (member.kind == TypeKind::Array && member.referenced) {
+      const size_t element_size = type_size(*member.referenced);
+      for (size_t i = 0; i < member.size; ++i)
+        self(self, *member.referenced, offset + i * element_size);
+      return;
+    }
+    mark_integer(offset, type_size(member));
+  };
+  for (const auto &member : type.struct_def->members)
+    classify(classify, member.type, member.offset);
+  return classes;
+}
+
+static Operand aggregate_chunk(const Operand &operand, size_t offset) {
+  if (auto *memory = std::get_if<PseudoMem>(&operand))
+    return PseudoMem{memory->name, memory->offset + static_cast<int>(offset)};
+  if (auto *stack = std::get_if<Stack>(&operand))
+    return Stack{stack->offset + static_cast<int>(offset)};
+  if (auto *data = std::get_if<Data>(&operand))
+    return Data{data->name, data->constant, data->offset + static_cast<int>(offset)};
+  return operand;
+}
+
+static void emit_bytes_to_integer_register(const Operand &source, size_t count,
+                                           RegId target,
+                                           std::vector<AsmInstruction> &out) {
+  const bool target_is_cx = target == RegId::CX;
+  const RegId accumulator = target_is_cx ? RegId::AX : target;
+  out.push_back(Mov{AsmType::Quadword, Imm{0}, Reg{accumulator}});
+  out.push_back(Lea{source, Reg{RegId::R11}});
+  for (size_t i = 0; i < count; ++i) {
+    out.push_back(Mov{AsmType::Quadword, Imm{0}, Reg{RegId::R10}});
+    out.push_back(Mov{AsmType::Byte, Indirect{RegId::R11}, Reg{RegId::R10}});
+    if (i != 0) {
+      out.push_back(Mov{AsmType::Longword, Imm{static_cast<int64_t>(i * 8)}, Reg{RegId::CX}});
+      out.push_back(Shll{AsmType::Quadword, Reg{RegId::R10}});
+    }
+    out.push_back(Orl{AsmType::Quadword, Reg{RegId::R10}, Reg{accumulator}});
+    out.push_back(Addl{AsmType::Quadword, Imm{1}, Reg{RegId::R11}});
+  }
+  if (target_is_cx)
+    out.push_back(Mov{AsmType::Quadword, Reg{accumulator}, Reg{target}});
+}
+
+static void emit_bytes_from_integer_register(RegId source, const Operand &destination,
+                                             size_t count,
+                                             std::vector<AsmInstruction> &out) {
+  out.push_back(Mov{AsmType::Quadword, Reg{source}, Reg{RegId::R10}});
+  out.push_back(Mov{AsmType::Longword, Imm{8}, Reg{RegId::CX}});
+  out.push_back(Lea{destination, Reg{RegId::R11}});
+  for (size_t i = 0; i < count; ++i) {
+    out.push_back(Mov{AsmType::Byte, Reg{RegId::R10}, Indirect{RegId::R11}});
+    out.push_back(Shrl{AsmType::Quadword, Reg{RegId::R10}});
+    out.push_back(Addl{AsmType::Quadword, Imm{1}, Reg{RegId::R11}});
+  }
+}
+
+static void emit_aggregate_register_copies(const Type &type,
+                                            const Operand &memory,
+                                            std::vector<AsmInstruction> &out,
+                                            bool to_registers) {
+  const auto classes = aggregate_register_classes(type);
+  if (classes.empty()) return;
+  size_t integer_index = 0, double_index = 0;
+  const RegId int_regs[] = {RegId::AX, RegId::DX};
+  const RegId xmm_regs[] = {RegId::XMM0, RegId::XMM1};
+  for (size_t i = 0; i < classes.size(); ++i) {
+    const RegId reg = classes[i] ? xmm_regs[double_index++]
+                                 : int_regs[integer_index++];
+    const size_t count = std::min<size_t>(8, type.struct_def->size - i * 8);
+    const AsmType chunk_type = classes[i] ? AsmType::Double : AsmType::Quadword;
+    Operand chunk = aggregate_chunk(memory, i * 8);
+    if (classes[i]) {
+      if (to_registers)
+        out.push_back(Mov{chunk_type, chunk, Reg{reg}});
+      else
+        out.push_back(Mov{chunk_type, Reg{reg}, chunk});
+    } else if (to_registers) {
+      emit_bytes_to_integer_register(chunk, count, reg, out);
+    } else {
+      emit_bytes_from_integer_register(reg, chunk, count, out);
+    }
+  }
+}
+
+static void emit_copy_from_address_regs(size_t size,
+                                        std::vector<AsmInstruction> &out) {
+  size_t offset = 0;
+  while (offset < size) {
+    const size_t remaining = size - offset;
+    const size_t chunk = remaining >= 8 ? 8 : remaining >= 4 ? 4 : 1;
+    const AsmType type = chunk >= 8 ? AsmType::Quadword
+                         : chunk >= 4 ? AsmType::Longword : AsmType::Byte;
+    out.push_back(Mov{AsmType::Longword, Imm{static_cast<int64_t>(offset)}, Reg{RegId::R11}});
+    out.push_back(Mov{type, Indexed{RegId::AX, RegId::R11, 1}, Reg{RegId::R10}});
+    out.push_back(Mov{type, Reg{RegId::R10}, Indexed{RegId::DX, RegId::R11, 1}});
+    offset += chunk;
+  }
 }
 
 static Type type_of(const NirVal &value) {
@@ -277,10 +399,36 @@ static void emit_function_call(const NirCall &c,
   for (const auto &arg : c.args)
     args.push_back(nir_val_to_operand(arg, constants));
 
-  size_t int_reg = 0, double_reg = 0, stack_args = 0;
+  const Symbol *function_symbol = symbol_table().find(c.name);
+  const Type return_type = function_symbol && function_symbol->type.ret
+                               ? *function_symbol->type.ret
+                               : Type::void_type();
+  const bool return_in_memory = return_type.kind == TypeKind::Structure &&
+                                aggregate_register_classes(return_type).empty();
+  if (return_in_memory && c.dst)
+    instructions.push_back(Lea{nir_val_to_operand(*c.dst, constants), Reg{RegId::DI}});
+
+  size_t int_reg = return_in_memory ? 1 : 0, double_reg = 0, stack_args = 0;
   std::vector<bool> on_stack(args.size());
   for (size_t i = 0; i < args.size(); ++i) {
-    if (type_of(c.args[i]).kind == TypeKind::Double) {
+    const Type arg_type = type_of(c.args[i]);
+    if (arg_type.kind == TypeKind::Structure) {
+      auto classes = aggregate_register_classes(arg_type);
+      if (classes.empty()) {
+        on_stack[i] = true;
+        stack_args += (arg_type.struct_def->size + 7) / 8;
+      } else {
+        const size_t needed_int = std::count(classes.begin(), classes.end(), false);
+        const size_t needed_double = classes.size() - needed_int;
+        if (int_reg + needed_int > 6 || double_reg + needed_double > 8) {
+          on_stack[i] = true;
+          stack_args += classes.size();
+        } else {
+          int_reg += needed_int;
+          double_reg += needed_double;
+        }
+      }
+    } else if (arg_type.kind == TypeKind::Double) {
       if (double_reg++ >= 8) on_stack[i] = true, ++stack_args;
     } else if (int_reg++ >= 6) {
       on_stack[i] = true;
@@ -291,24 +439,62 @@ static void emit_function_call(const NirCall &c,
   if (stack_padding != 0)
     instructions.push_back(AllocateStack{stack_padding});
 
-  int_reg = double_reg = 0;
+  int_reg = return_in_memory ? 1 : 0;
+  double_reg = 0;
+  std::vector<AsmInstruction> aggregate_copies, cx_aggregate_copies, direct_copies;
   for (size_t i = 0; i < args.size(); ++i) {
     if (on_stack[i]) continue;
-    if (type_of(c.args[i]).kind == TypeKind::Double) {
+    const Type arg_type = type_of(c.args[i]);
+    if (arg_type.kind == TypeKind::Structure) {
+      size_t ints = 0, doubles = 0;
+      const auto classes = aggregate_register_classes(arg_type);
+      for (bool is_double : classes) {
+        if (is_double) ++doubles; else ++ints;
+      }
+      size_t ii = int_reg, di = double_reg;
+      for (size_t chunk = 0; chunk < classes.size(); ++chunk) {
+        const RegId reg = classes[chunk]
+            ? static_cast<RegId>(static_cast<uint8_t>(RegId::XMM0) + di++)
+            : arg_registers[ii++];
+        Operand piece = aggregate_chunk(args[i], chunk * 8);
+        const size_t count = std::min<size_t>(8, arg_type.struct_def->size - chunk * 8);
+        if (classes[chunk]) {
+          direct_copies.push_back(Mov{AsmType::Double, piece, Reg{reg}});
+        } else if (count == 8) {
+          direct_copies.push_back(Mov{AsmType::Quadword, piece, Reg{reg}});
+        } else {
+          auto &target = reg == RegId::CX ? cx_aggregate_copies : aggregate_copies;
+          emit_bytes_to_integer_register(piece, count, reg, target);
+        }
+      }
+      int_reg += ints;
+      double_reg += doubles;
+    } else if (arg_type.kind == TypeKind::Double) {
       const auto xmm = static_cast<RegId>(
           static_cast<uint8_t>(RegId::XMM0) + double_reg++);
-      instructions.push_back(Mov{AsmType::Double, args[i], Reg{xmm}});
+      direct_copies.push_back(Mov{AsmType::Double, args[i], Reg{xmm}});
     } else {
-      instructions.push_back(
+      direct_copies.push_back(
           Mov{asm_type(type_of(c.args[i])), args[i],
               Reg{arg_registers[int_reg++]}});
     }
   }
+  instructions.insert(instructions.end(), aggregate_copies.begin(), aggregate_copies.end());
 
   for (size_t i = args.size(); i > 0; --i) {
     if (!on_stack[i - 1]) continue;
     const Operand &arg = args[i - 1];
-    if (type_of(c.args[i - 1]).kind == TypeKind::Double) {
+    const Type arg_type = type_of(c.args[i - 1]);
+    if (arg_type.kind == TypeKind::Structure) {
+      const size_t size = arg_type.struct_def->size;
+      const size_t slots = (size + 7) / 8;
+      for (size_t slot = slots; slot > 0; --slot) {
+        Operand piece = aggregate_chunk(arg, (slot - 1) * 8);
+        const size_t count = std::min<size_t>(8, size - (slot - 1) * 8);
+        emit_bytes_to_integer_register(piece, count, RegId::AX, instructions);
+        instructions.push_back(Pushq{Reg{RegId::AX}});
+      }
+    } else if (arg_type.kind == TypeKind::Double) {
       instructions.push_back(PushDouble{arg});
     } else if (std::holds_alternative<Reg>(arg) ||
                std::holds_alternative<Imm>(arg)) {
@@ -320,6 +506,9 @@ static void emit_function_call(const NirCall &c,
     }
   }
 
+  instructions.insert(instructions.end(), cx_aggregate_copies.begin(), cx_aggregate_copies.end());
+  instructions.insert(instructions.end(), direct_copies.begin(), direct_copies.end());
+
   instructions.push_back(Call{c.name});
 
   const int bytes_to_remove =
@@ -328,7 +517,13 @@ static void emit_function_call(const NirCall &c,
     instructions.push_back(DeallocateStack{bytes_to_remove});
 
   if (c.dst) {
-    if (type_of(*c.dst).kind == TypeKind::Double)
+    const Type dst_type = type_of(*c.dst);
+    if (dst_type.kind == TypeKind::Structure && !return_in_memory) {
+      emit_aggregate_register_copies(dst_type, nir_val_to_operand(*c.dst, constants),
+                                     instructions, false);
+    } else if (dst_type.kind == TypeKind::Structure) {
+      return;
+    } else if (dst_type.kind == TypeKind::Double)
       instructions.push_back(
           Mov{AsmType::Double, Reg{RegId::XMM0},
               nir_val_to_operand(*c.dst, constants)});
@@ -347,16 +542,67 @@ static AsmFunction nir_to_asm(const NirFunction &func,
 
   size_t int_reg = 0, double_reg = 0;
   int stack_offset = 16;
+  const Symbol *function_symbol = symbol_table().find(func.name);
+  const Type return_type = function_symbol && function_symbol->type.ret
+                               ? *function_symbol->type.ret
+                               : Type::void_type();
+  const bool return_in_memory = return_type.kind == TypeKind::Structure &&
+                                aggregate_register_classes(return_type).empty();
+  for (size_t i = 0; i < num_arg_registers; ++i)
+    instructions.push_back(Mov{AsmType::Quadword, Reg{arg_registers[i]},
+                               Stack{-8 - static_cast<int>(i * 8)}});
+  for (size_t i = 0; i < 8; ++i)
+    instructions.push_back(Mov{AsmType::Double,
+                               Reg{static_cast<RegId>(static_cast<uint8_t>(RegId::XMM0) + i)},
+                               Stack{-56 - static_cast<int>(i * 8)}});
+  if (return_in_memory) {
+    instructions.push_back(Mov{AsmType::Quadword, Stack{-8}, Stack{-120}});
+    int_reg = 1;
+  }
   for (size_t i = 0; i < func.params.size(); ++i) {
     const Type type = symbol_table().find(func.params[i])
                           ? symbol_table().get(func.params[i]).type
                           : Type::int_type();
+    if (type.kind == TypeKind::Structure) {
+      const auto classes = aggregate_register_classes(type);
+      const size_t needed_int = std::count(classes.begin(), classes.end(), false);
+      const size_t needed_double = classes.size() - needed_int;
+      const bool registers_available = !classes.empty() &&
+          int_reg + needed_int <= 6 && double_reg + needed_double <= 8;
+      Operand destination = PseudoMem{func.params[i], 0};
+      if (registers_available) {
+        for (size_t chunk = 0; chunk < classes.size(); ++chunk) {
+          const bool is_double = classes[chunk];
+          const Operand source = is_double
+              ? Operand{Stack{-56 - static_cast<int>(double_reg++ * 8)}}
+              : Operand{Stack{-8 - static_cast<int>(int_reg++ * 8)}};
+          Operand piece = aggregate_chunk(destination, chunk * 8);
+          const size_t count = std::min<size_t>(8, type.struct_def->size - chunk * 8);
+          if (is_double) {
+            instructions.push_back(Mov{AsmType::Double, source, piece});
+          } else {
+            instructions.push_back(Lea{source, Reg{RegId::AX}});
+            instructions.push_back(Lea{piece, Reg{RegId::DX}});
+            emit_copy_from_address_regs(count, instructions);
+          }
+        }
+      } else {
+        const size_t slots = (type.struct_def->size + 7) / 8;
+        for (size_t chunk = 0; chunk < slots; ++chunk) {
+          const size_t count = std::min<size_t>(8, type.struct_def->size - chunk * 8);
+          instructions.push_back(Lea{Stack{stack_offset + static_cast<int>(chunk * 8)}, Reg{RegId::AX}});
+          instructions.push_back(Lea{aggregate_chunk(destination, chunk * 8), Reg{RegId::DX}});
+          emit_copy_from_address_regs(count, instructions);
+        }
+        stack_offset += static_cast<int>(slots * 8);
+      }
+      continue;
+    }
     Operand source;
     if (type.kind == TypeKind::Double && double_reg < 8) {
-      source = Reg{static_cast<RegId>(
-          static_cast<uint8_t>(RegId::XMM0) + double_reg++)};
+      source = Stack{-56 - static_cast<int>(double_reg++ * 8)};
     } else if (type.kind != TypeKind::Double && int_reg < 6) {
-      source = Reg{arg_registers[int_reg++]};
+      source = Stack{-8 - static_cast<int>(int_reg++ * 8)};
     } else {
       source = Stack{stack_offset};
       stack_offset += 8;
@@ -369,10 +615,23 @@ static AsmFunction nir_to_asm(const NirFunction &func,
     std::visit(Overload{
         [&](const NirReturn &r) {
           if (r.val) {
-            const bool is_double = type_of(*r.val).kind == TypeKind::Double;
-            instructions.push_back(
-                Mov{asm_type(type_of(*r.val)), op(*r.val),
-                    Reg{is_double ? RegId::XMM0 : RegId::AX}});
+            const Type return_type = type_of(*r.val);
+            if (return_type.kind == TypeKind::Structure) {
+              if (return_in_memory) {
+                instructions.push_back(Mov{AsmType::Quadword, Stack{-8}, Reg{RegId::AX}});
+                instructions.push_back(Lea{op(*r.val), Reg{RegId::DX}});
+                instructions.push_back(Mov{AsmType::Quadword, Reg{RegId::DX}, Reg{RegId::R10}});
+                instructions.push_back(Mov{AsmType::Quadword, Reg{RegId::AX}, Reg{RegId::DX}});
+                instructions.push_back(Mov{AsmType::Quadword, Reg{RegId::R10}, Reg{RegId::AX}});
+                emit_copy_from_address_regs(return_type.struct_def->size, instructions);
+              } else {
+                emit_aggregate_register_copies(return_type, op(*r.val), instructions, true);
+              }
+            } else {
+              const bool is_double = return_type.kind == TypeKind::Double;
+              instructions.push_back(Mov{asm_type(return_type), op(*r.val),
+                                         Reg{is_double ? RegId::XMM0 : RegId::AX}});
+            }
           }
           instructions.push_back(Ret{});
         },
@@ -629,6 +888,30 @@ static AsmFunction nir_to_asm(const NirFunction &func,
           instructions.push_back(
               Mov{asm_type(type_of(c.dst)), op(c.src), op(c.dst)});
         },
+        [&](const NirCopyBytes &c) {
+          instructions.push_back(
+              Mov{AsmType::Quadword, op(c.src), Reg{RegId::AX}});
+          instructions.push_back(
+              Mov{AsmType::Quadword, op(c.dst), Reg{RegId::DX}});
+          size_t offset = 0;
+          while (offset < c.size) {
+            const size_t remaining = c.size - offset;
+            const size_t chunk = remaining >= 8 ? 8 : (remaining >= 4 ? 4 : 1);
+            const AsmType chunk_type = chunk == 8 ? AsmType::Quadword
+                                       : chunk == 4 ? AsmType::Longword
+                                                    : AsmType::Byte;
+            instructions.push_back(Mov{AsmType::Longword,
+                                       Imm{static_cast<int64_t>(offset)},
+                                       Reg{RegId::R11}});
+            instructions.push_back(Mov{
+                chunk_type, Indexed{RegId::AX, RegId::R11, 1},
+                Reg{RegId::R10}});
+            instructions.push_back(Mov{
+                chunk_type, Reg{RegId::R10},
+                Indexed{RegId::DX, RegId::R11, 1}});
+            offset += chunk;
+          }
+        },
         [&](const NirGetAddress &a) {
           instructions.push_back(Lea{op(a.src), op(a.dst)});
         },
@@ -665,6 +948,12 @@ static AsmFunction nir_to_asm(const NirFunction &func,
         },
         [&](const NirLoad &l) {
           const Type loaded_type = type_of(l.dst);
+          if (loaded_type.kind == TypeKind::Structure) {
+            instructions.push_back(Mov{AsmType::Quadword, op(l.pointer), Reg{RegId::AX}});
+            instructions.push_back(Lea{PseudoMem{std::get<NirVar>(l.dst).name, 0}, Reg{RegId::DX}});
+            emit_copy_from_address_regs(loaded_type.struct_def->size, instructions);
+            return;
+          }
           instructions.push_back(
               Mov{AsmType::Quadword, op(l.pointer), Reg{RegId::R10}});
           instructions.push_back(Mov{asm_type(loaded_type),
@@ -672,10 +961,16 @@ static AsmFunction nir_to_asm(const NirFunction &func,
         },
         [&](const NirStore &s) {
           const Type stored_type = type_of(s.src);
+          if (stored_type.kind == TypeKind::Structure) {
+            instructions.push_back(Lea{op(s.src), Reg{RegId::AX}});
+            instructions.push_back(Mov{AsmType::Quadword, op(s.pointer), Reg{RegId::DX}});
+            emit_copy_from_address_regs(stored_type.struct_def->size, instructions);
+            return;
+          }
           instructions.push_back(
-              Mov{AsmType::Quadword, op(s.pointer), Reg{RegId::R10}});
+              Mov{AsmType::Quadword, op(s.pointer), Reg{RegId::AX}});
           instructions.push_back(Mov{asm_type(stored_type), op(s.src),
-                                     Indirect{RegId::R10}});
+                                     Indirect{RegId::AX}});
         },
         [&](const NirJump &j) { instructions.push_back(Jmp{j.target}); },
         [&](const NirJumpIfZero &j) {
@@ -772,19 +1067,27 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
             case TypeKind::ULong:
             case TypeKind::Double:
             case TypeKind::Pointer: return 8;
-              case TypeKind::Array:
+            case TypeKind::Array:
                 return type.referenced
                            ? static_cast<int>(
                                  type.size * self(self, *type.referenced))
                            : 0;
+            case TypeKind::Structure:
+              return type.struct_def
+                         ? static_cast<int>(type.struct_def->size)
+                         : 0;
               case TypeKind::Void:
               case TypeKind::Function: return 0;
           }
           std::unreachable();
         };
         const auto alignment_of = [](const Type &type) {
-          if (type.kind != TypeKind::Array || !type.referenced) return 4;
-          return 16;
+          if (type.kind == TypeKind::Structure)
+            return type.struct_def
+                       ? static_cast<int>(type.struct_def->alignment)
+                       : 1;
+          if (type.kind == TypeKind::Array && type.referenced) return 16;
+          return 4;
         };
         const int size = size_of(size_of, symbol->type);
         const int alignment = static_cast<int>(alignment_of(symbol->type));
@@ -799,7 +1102,7 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
 
 static std::pair<AsmFunction, int> replace_pseudos(const AsmFunction &func) {
   std::unordered_map<std::string, int> offsets;
-  int next_offset = 0;
+  int next_offset = -128;
 
   auto fix = [&](Operand o) { return fix_operand(o, offsets, next_offset); };
 
@@ -1266,6 +1569,8 @@ static size_t type_size(const Type &type) {
     case TypeKind::Pointer: return 8;
     case TypeKind::Array:
       return type.referenced ? type.size * type_size(*type.referenced) : 0;
+    case TypeKind::Structure:
+      return type.struct_def ? type.struct_def->size : 0;
     case TypeKind::Void:
     case TypeKind::Function: return 0;
   }
@@ -1273,11 +1578,10 @@ static size_t type_size(const Type &type) {
 }
 
 static size_t type_alignment(const Type &type) {
-  if (type.kind == TypeKind::Array) {
-    const size_t size = type_size(type);
-    if (size >= 16) return 16;
+  if (type.kind == TypeKind::Structure)
+    return type.struct_def ? type.struct_def->alignment : 1;
+  if (type.kind == TypeKind::Array)
     return type.referenced ? type_alignment(*type.referenced) : 1;
-  }
   return type.kind == TypeKind::Long || type.kind == TypeKind::ULong ||
                  type.kind == TypeKind::Double || type.kind == TypeKind::Pointer
              ? 8

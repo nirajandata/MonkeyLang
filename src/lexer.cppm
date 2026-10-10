@@ -98,6 +98,8 @@ inline constexpr std::pair<std::string_view, TokenType> keyword_entries_[] = {
     {"unsigned", TokenType::Unsigned},
     {"double", TokenType::Double},
     {"char", TokenType::Char},
+    {"struct", TokenType::Struct},
+    {"union", TokenType::Union},
 };
 
 inline constexpr size_t keyword_count =
@@ -602,6 +604,8 @@ public:
             emit(TokenType::Decrement, 2);
           else if (cursor_[1] == '=')
             emit(TokenType::SubtractAssign, 2);
+          else if (cursor_[1] == '>')
+            emit(TokenType::Arrow, 2);
           else
             emit(TokenType::Subtract, 1);
           break;
@@ -679,6 +683,9 @@ public:
           break;
         case ';':
           emit(TokenType::Semicolon, 1);
+          break;
+        case '.':
+          emit(TokenType::Dot, 1);
           break;
         case '?':
           emit(TokenType::QuestionMark, 1);

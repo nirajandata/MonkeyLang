@@ -80,6 +80,6 @@ Testing/
 !benchmark/data/control_grid_branch_misses_20261007.csv
 *.png
 *.pdf
-*.txt
+benchmark/corpus/real-libstdcxx.txt
 
 __pycache__/

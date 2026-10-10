@@ -81,6 +81,10 @@ export enum class TokenType : uint32_t {
   Char,
   CharConstant,
   StringLiteral,
+  Struct,
+  Union,
+  Dot,
+  Arrow,
 };
 
 export struct Token {

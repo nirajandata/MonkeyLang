@@ -93,6 +93,11 @@ export {
     NirVal src;
     NirVal dst;
   };
+  struct NirCopyBytes {
+    NirVal src;
+    NirVal dst;
+    size_t size;
+  };
   struct NirGetAddress {
     NirVal src;
     NirVal dst;
@@ -144,8 +149,8 @@ export {
   using NirInstruction =
       std::variant<NirReturn, NirSignExtend, NirTruncate, NirZeroExtend,
                    NirDoubleToInt, NirDoubleToUInt, NirIntToDouble,
-                   NirUIntToDouble, NirUnary, NirBinary, NirCopy, NirGetAddress,
-                   NirAddPtr, NirCopyToOffset, NirLoad, NirStore, NirJump,
+                   NirUIntToDouble, NirUnary, NirBinary, NirCopy, NirCopyBytes,
+                   NirGetAddress, NirAddPtr, NirCopyToOffset, NirLoad, NirStore, NirJump,
                    NirJumpIfZero, NirJumpIfNotZero, NirJumpIfNotEqual,
                    NirLabel, NirCall>;
 
@@ -199,10 +204,22 @@ class NirEmitter {
       case TypeKind::Pointer: return 8;
       case TypeKind::Array:
         return type.referenced ? type.size * type_size(*type.referenced) : 0;
+      case TypeKind::Structure:
+        return type.struct_def ? type.struct_def->size : 0;
       case TypeKind::Void:
       case TypeKind::Function: return 0;
     }
     std::unreachable();
+  }
+
+  NirVal struct_address(const Exp &exp,
+                        std::vector<NirInstruction> &instructions) {
+    auto object = emit_val(exp, instructions);
+    if (auto *pointer = std::get_if<NirDereferencedPointer>(&object))
+      return std::move(pointer->pointer);
+    NirVal dst = make_tacky_variable(Type::pointer(exp.type));
+    instructions.push_back(NirGetAddress{std::get<NirVal>(object), dst});
+    return dst;
   }
 
   NirVar make_tacky_variable(const Type &type) {
@@ -277,13 +294,29 @@ class NirEmitter {
     }
 
     NirVal dst = make_tacky_variable(type);
-    auto then_val = emit_val_and_convert(*c.then_exp, instructions);
-    instructions.push_back(NirCopy{std::move(then_val), dst});
+    if (type.kind == TypeKind::Structure) {
+      NirVal source = struct_address(*c.then_exp, instructions);
+      NirVal destination = make_tacky_variable(Type::pointer(type));
+      instructions.push_back(NirGetAddress{dst, destination});
+      instructions.push_back(NirCopyBytes{std::move(source),
+                                          std::move(destination), type_size(type)});
+    } else {
+      auto then_val = emit_val_and_convert(*c.then_exp, instructions);
+      instructions.push_back(NirCopy{std::move(then_val), dst});
+    }
     instructions.push_back(NirJump{end_label});
     instructions.push_back(NirLabel{else_label});
 
-    auto else_val = emit_val_and_convert(*c.else_exp, instructions);
-    instructions.push_back(NirCopy{std::move(else_val), dst});
+    if (type.kind == TypeKind::Structure) {
+      NirVal source = struct_address(*c.else_exp, instructions);
+      NirVal destination = make_tacky_variable(Type::pointer(type));
+      instructions.push_back(NirGetAddress{dst, destination});
+      instructions.push_back(NirCopyBytes{std::move(source),
+                                          std::move(destination), type_size(type)});
+    } else {
+      auto else_val = emit_val_and_convert(*c.else_exp, instructions);
+      instructions.push_back(NirCopy{std::move(else_val), dst});
+    }
 
     instructions.push_back(NirLabel{then_label});
     instructions.push_back(NirLabel{end_label});
@@ -388,6 +421,14 @@ class NirEmitter {
                  },
 
                  [&](const Assignment &a) -> NirExpResult {
+                   if (a.left->type.kind == TypeKind::Structure) {
+                     NirVal dst = struct_address(*a.left, instructions);
+                    NirVal src = struct_address(*a.right, instructions);
+                    instructions.push_back(NirCopyBytes{
+                        std::move(src), dst,
+                        type_size(a.left->type)});
+                    return NirDereferencedPointer{std::move(dst)};
+                   }
                    auto left = emit_val(*a.left, instructions);
                    auto right = emit_val_and_convert(*a.right, instructions);
                    if (auto *object = std::get_if<NirVal>(&left)) {
@@ -617,11 +658,40 @@ class NirEmitter {
                         emit_val_and_convert(index_exp, instructions);
                     auto dst = NirVal{make_tacky_variable(
                         Type::pointer(exp.type))};
-                    instructions.push_back(NirAddPtr{
-                        std::move(pointer), std::move(index),
-                        type_size(exp.type), dst});
-                    return NirDereferencedPointer{std::move(dst)};
-                  }},
+                     instructions.push_back(NirAddPtr{
+                         std::move(pointer), std::move(index),
+                         type_size(exp.type), dst});
+                     return NirDereferencedPointer{std::move(dst)};
+                   },
+
+                   [&](const MemberAccess &m) -> NirExpResult {
+                     NirVal base;
+                     if (m.through_pointer) {
+                       base = emit_val_and_convert(*m.exp, instructions);
+                     } else {
+                       auto object = emit_val(*m.exp, instructions);
+                       if (auto *pointer =
+                               std::get_if<NirDereferencedPointer>(&object)) {
+                         base = std::move(pointer->pointer);
+                       } else {
+                         NirVal dst = make_tacky_variable(
+                             Type::pointer(m.exp->type));
+                         instructions.push_back(NirGetAddress{
+                             std::get<NirVal>(object), dst});
+                         base = std::move(dst);
+                       }
+                     }
+                     if (m.offset == 0)
+                       return NirDereferencedPointer{std::move(base)};
+                     NirVal dst =
+                         make_tacky_variable(Type::pointer(m.exp->type));
+                     instructions.push_back(NirAddPtr{
+                         std::move(base),
+                         NirConstant{ConstLong{
+                             static_cast<int64_t>(m.offset), m.line}},
+                         1, dst});
+                     return NirDereferencedPointer{std::move(dst)};
+                   }},
          exp.value);
   }
 
@@ -770,21 +840,53 @@ class NirEmitter {
       std::visit(
           Overload{
               [&](const SingleInit &single) {
+                if (type.kind == TypeKind::Structure) {
+                  NirVal source = struct_address(single.exp, instructions);
+                  NirVal destination =
+                      make_tacky_variable(Type::pointer(type));
+                  instructions.push_back(
+                      NirGetAddress{NirVar{d.name}, destination});
+                  if (offset != 0) {
+                    NirVal adjusted =
+                        make_tacky_variable(Type::pointer(type));
+                    instructions.push_back(NirAddPtr{
+                        destination,
+                        NirConstant{ConstLong{static_cast<int64_t>(offset), 0}},
+                        1, adjusted});
+                    destination = std::move(adjusted);
+                  }
+                  instructions.push_back(NirCopyBytes{
+                      std::move(source), std::move(destination),
+                      type_size(type)});
+                  return;
+                }
                 auto val = emit_val_and_convert(single.exp, instructions);
                 if (type.kind == TypeKind::Array) return;
-                if (d.var_type.kind != TypeKind::Array)
-                  instructions.push_back(
-                      NirCopy{std::move(val), NirVar{d.name}});
-                else
+                if (d.var_type.kind == TypeKind::Array ||
+                    d.var_type.kind == TypeKind::Structure)
                   instructions.push_back(
                       NirCopyToOffset{std::move(val), d.name, offset});
+                else
+                  instructions.push_back(
+                      NirCopy{std::move(val), NirVar{d.name}});
               },
               [&](const CompoundInit &compound) {
-                if (!type.referenced) return;
-                const size_t element_size = type_size(*type.referenced);
-                for (size_t i = 0; i < compound.initializers.size(); ++i)
-                  self(self, compound.initializers[i],
-                       offset + i * element_size, *type.referenced);
+                if (type.kind == TypeKind::Array && type.referenced) {
+                  const size_t element_size = type_size(*type.referenced);
+                  for (size_t i = 0; i < compound.initializers.size(); ++i)
+                    self(self, compound.initializers[i],
+                         offset + i * element_size, *type.referenced);
+                } else if (type.kind == TypeKind::Structure &&
+                           type.struct_def) {
+                  for (size_t i = 0;
+                       i < compound.initializers.size() &&
+                       i < type.struct_def->members.size();
+                       ++i) {
+                    const StructMember &member = type.struct_def->members[i];
+                    self(self, compound.initializers[i],
+                         offset + member.offset, member.type);
+                  }
+                }
               }},
           init.value);
     };
@@ -817,6 +919,7 @@ class NirEmitter {
                              [&](const VarDecl &v) {
                                emit_variable_declaration(v.decl, instructions);
                              },
+                             [](const StructDecl &) {},
                          },
                          d);
             },
@@ -879,6 +982,8 @@ public:
               return type.referenced
                          ? type.size * self(self, *type.referenced)
                          : 0;
+            case TypeKind::Structure:
+              return type.struct_def ? type.struct_def->size : 0;
             case TypeKind::Void:
             case TypeKind::Function: return 0;
           }

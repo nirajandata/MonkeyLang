@@ -119,6 +119,94 @@ export class Parser {
     }
   }
 
+  static int decode_escape(std::string_view text, size_t pos,
+                           size_t &consumed) {
+    const char c = text[pos];
+    switch (c) {
+    case '\'':
+      consumed = 1;
+      return '\'';
+    case '"':
+      consumed = 1;
+      return '"';
+    case '?':
+      consumed = 1;
+      return '?';
+    case '\\':
+      consumed = 1;
+      return '\\';
+    case 'a':
+      consumed = 1;
+      return 7;
+    case 'b':
+      consumed = 1;
+      return 8;
+    case 'f':
+      consumed = 1;
+      return 12;
+    case 'n':
+      consumed = 1;
+      return 10;
+    case 'r':
+      consumed = 1;
+      return 13;
+    case 't':
+      consumed = 1;
+      return 9;
+    case 'v':
+      consumed = 1;
+      return 11;
+    default: {
+      int value = 0;
+      size_t n = 0;
+      while (n < 3 && pos + n < text.size() && text[pos + n] >= '0' &&
+             text[pos + n] <= '7') {
+        value = value * 8 + (text[pos + n] - '0');
+        ++n;
+      }
+      consumed = n;
+      return value;
+    }
+    }
+  }
+
+  static Exp decode_char_constant(std::string_view text, uint32_t line) {
+    int value = 0;
+    const size_t end = text.size() > 1 ? text.size() - 1 : 1;
+    size_t i = 1;
+    while (i < end) {
+      if (text[i] == '\\') {
+        size_t consumed = 0;
+        const int v = decode_escape(text, i + 1, consumed);
+        value = (value << 8) | (v & 0xff);
+        i += 1 + consumed;
+      } else {
+        value = (value << 8) |
+                (static_cast<int>(static_cast<unsigned char>(text[i])) & 0xff);
+        ++i;
+      }
+    }
+    return Exp{ConstInt{static_cast<int32_t>(value), line}};
+  }
+
+  static std::string decode_string_literal(std::string_view text) {
+    std::string result;
+    const size_t end = text.size() > 1 ? text.size() - 1 : 1;
+    size_t i = 1;
+    while (i < end) {
+      if (text[i] == '\\') {
+        size_t consumed = 0;
+        const int v = decode_escape(text, i + 1, consumed);
+        result.push_back(static_cast<char>(static_cast<unsigned char>(v)));
+        i += 1 + consumed;
+      } else {
+        result.push_back(text[i]);
+        ++i;
+      }
+    }
+    return result;
+  }
+
   Exp parse_constant() {
     const Token& tok = advance();
     if (tok.type == TokenType::FloatingConstant) {
@@ -132,6 +220,9 @@ export class Parser {
         return Exp{ConstDouble{0.0, tok.line}};
       }
       return Exp{ConstDouble{value, tok.line}};
+    }
+    if (tok.type == TokenType::CharConstant) {
+      return decode_char_constant(tok.text, tok.line);
     }
     if (tok.type != TokenType::Constant &&
         tok.type != TokenType::LongConstant &&
@@ -229,6 +320,19 @@ export class Parser {
       case TokenType::FloatingConstant:
         return parse_constant();
 
+      case TokenType::CharConstant: {
+        advance();
+        return decode_char_constant(tok.text, tok.line);
+      }
+
+      case TokenType::StringLiteral: {
+        advance();
+        std::string value = decode_string_literal(tok.text);
+        while (check(TokenType::StringLiteral))
+          value += decode_string_literal(advance().text);
+        return Exp{String{std::move(value), {}, tok.line}};
+      }
+
       case TokenType::Identifier: {
         advance();
         if (check(TokenType::LParen)) {
@@ -269,7 +373,7 @@ export class Parser {
         advance();
         if (check(TokenType::Int) || check(TokenType::Long) ||
             check(TokenType::Signed) || check(TokenType::Unsigned) ||
-            check(TokenType::Double)) {
+            check(TokenType::Double) || check(TokenType::Char)) {
           Type target_type = parse_type_specifiers();
           if (check(TokenType::Multiply) || check(TokenType::LParen) ||
               check(TokenType::LBracket))
@@ -576,15 +680,37 @@ export class Parser {
 
   Type type_from_specifiers(const std::vector<TokenType> &types,
                             uint32_t line) {
-    const auto double_count =
-        std::count(types.begin(), types.end(), TokenType::Double);
-    if (double_count != 0) {
+    const auto count_of = [&](TokenType t) {
+      return std::count(types.begin(), types.end(), t);
+    };
+    if (count_of(TokenType::Double) != 0) {
       if (types.size() == 1)
         return Type::double_type();
       std::println("error:{}: Can't combine 'double' with other type specifiers",
                    line);
       had_error_ = true;
       return Type::double_type();
+    }
+    if (count_of(TokenType::Char) != 0) {
+      if (count_of(TokenType::Char) > 1 || types.size() > 2 ||
+          count_of(TokenType::Int) != 0 || count_of(TokenType::Long) != 0 ||
+          types.empty()) {
+        std::println("error:{}: Invalid type specifier", line);
+        had_error_ = true;
+        return Type::int_type();
+      }
+      const bool has_signed = count_of(TokenType::Signed) != 0;
+      const bool has_unsigned = count_of(TokenType::Unsigned) != 0;
+      if (has_signed && has_unsigned) {
+        std::println("error:{}: Invalid type specifier", line);
+        had_error_ = true;
+        return Type::int_type();
+      }
+      if (has_signed)
+        return Type::schar_type();
+      if (has_unsigned)
+        return Type::uchar_type();
+      return Type::char_type();
     }
     bool has_int = false;
     bool has_long = false;
@@ -614,7 +740,7 @@ export class Parser {
     std::vector<TokenType> types;
     while (check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
-           check(TokenType::Double))
+           check(TokenType::Double) || check(TokenType::Char))
       types.push_back(advance().type);
     return type_from_specifiers(types, line);
   }
@@ -680,7 +806,8 @@ export class Parser {
         } else if (size_token.type == TokenType::Constant ||
                    size_token.type == TokenType::LongConstant ||
                    size_token.type == TokenType::UnsignedConstant ||
-                   size_token.type == TokenType::UnsignedLongConstant) {
+                   size_token.type == TokenType::UnsignedLongConstant ||
+                   size_token.type == TokenType::CharConstant) {
           Exp constant = parse_constant();
           std::visit(
               Overload{
@@ -868,14 +995,15 @@ export class Parser {
 
     while (check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
-           check(TokenType::Double) ||
+           check(TokenType::Double) || check(TokenType::Char) ||
            check(TokenType::Static) || check(TokenType::Extern)) {
       const Token specifier = advance();
       if (specifier.type == TokenType::Int ||
           specifier.type == TokenType::Long ||
           specifier.type == TokenType::Signed ||
           specifier.type == TokenType::Unsigned ||
-          specifier.type == TokenType::Double) {
+          specifier.type == TokenType::Double ||
+          specifier.type == TokenType::Char) {
         types.push_back(specifier.type);
       } else if (storage_class) {
         std::println("error:{}: Invalid storage class", specifier.line);
@@ -922,7 +1050,7 @@ export class Parser {
   bool is_declaration_start() const {
     return check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
-           check(TokenType::Double) ||
+           check(TokenType::Double) || check(TokenType::Char) ||
            check(TokenType::Static) ||
            check(TokenType::Extern);
   }

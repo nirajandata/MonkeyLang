@@ -76,13 +76,10 @@ Testing/
 *.jpeg
 *.jpg
 *.lex
-!benchmark/research.lex
 *.csv
 !benchmark/data/control_grid_branch_misses_20261007.csv
 *.png
 *.pdf
-!benchmark/cost_scaling_chart.png
-!benchmark/cost_scaling_chart.pdf
 *.txt
 
 __pycache__/

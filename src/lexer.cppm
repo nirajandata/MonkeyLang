@@ -96,6 +96,7 @@ inline constexpr std::pair<std::string_view, TokenType> keyword_entries_[] = {
     {"signed", TokenType::Signed},
     {"unsigned", TokenType::Unsigned},
     {"double", TokenType::Double},
+    {"char", TokenType::Char},
 };
 
 inline constexpr size_t keyword_count =
@@ -324,6 +325,160 @@ private:
   inline void emit(TokenType type, size_t len) noexcept {
     tokens_.emplace_back(type, std::string_view(cursor_, len), current_line_);
     cursor_ += len;
+  }
+
+  static bool valid_escape(const char *p, size_t &consumed,
+                           int &value) noexcept {
+    switch (*p) {
+    case '\'':
+      value = '\'';
+      consumed = 1;
+      return true;
+    case '"':
+      value = '"';
+      consumed = 1;
+      return true;
+    case '?':
+      value = '?';
+      consumed = 1;
+      return true;
+    case '\\':
+      value = '\\';
+      consumed = 1;
+      return true;
+    case 'a':
+      value = 7;
+      consumed = 1;
+      return true;
+    case 'b':
+      value = 8;
+      consumed = 1;
+      return true;
+    case 'f':
+      value = 12;
+      consumed = 1;
+      return true;
+    case 'n':
+      value = 10;
+      consumed = 1;
+      return true;
+    case 'r':
+      value = 13;
+      consumed = 1;
+      return true;
+    case 't':
+      value = 9;
+      consumed = 1;
+      return true;
+    case 'v':
+      value = 11;
+      consumed = 1;
+      return true;
+    default:
+      if (*p >= '0' && *p <= '7') {
+        int v = 0;
+        size_t n = 0;
+        while (n < 3 && p[n] >= '0' && p[n] <= '7') {
+          v = v * 8 + (p[n] - '0');
+          ++n;
+        }
+        value = v;
+        consumed = n;
+        return true;
+      }
+      return false;
+    }
+  }
+
+  inline void read_char_constant() noexcept {
+    const char *start = cursor_;
+    ++cursor_;
+
+    bool closed = false;
+    bool bad = false;
+
+    if (cursor_ < limit_ && *cursor_ == '\'') {
+      ++cursor_;
+      had_error_ = true;
+      tokens_.emplace_back(TokenType::Error,
+                           std::string_view(start, cursor_ - start),
+                           current_line_);
+      return;
+    }
+
+    while (cursor_ < limit_) {
+      const char c = *cursor_;
+      if (c == '\n')
+        break;
+      if (c == '\\') {
+        if (cursor_ + 1 >= limit_)
+          break;
+        size_t consumed = 0;
+        int value = 0;
+        if (!valid_escape(cursor_ + 1, consumed, value)) {
+          bad = true;
+          cursor_ += 2;
+          continue;
+        }
+        cursor_ += 1 + consumed;
+        continue;
+      }
+      if (c == '\'') {
+        ++cursor_;
+        closed = true;
+        break;
+      }
+      ++cursor_;
+    }
+
+    if (!closed || bad)
+      had_error_ = true;
+
+    tokens_.emplace_back((closed && !bad) ? TokenType::CharConstant
+                                          : TokenType::Error,
+                         std::string_view(start, cursor_ - start),
+                         current_line_);
+  }
+
+  inline void read_string_literal() noexcept {
+    const char *start = cursor_;
+    ++cursor_;
+
+    bool closed = false;
+    bool bad = false;
+
+    while (cursor_ < limit_) {
+      const char c = *cursor_;
+      if (c == '\n')
+        break;
+      if (c == '\\') {
+        if (cursor_ + 1 >= limit_)
+          break;
+        size_t consumed = 0;
+        int value = 0;
+        if (!valid_escape(cursor_ + 1, consumed, value)) {
+          bad = true;
+          cursor_ += 2;
+          continue;
+        }
+        cursor_ += 1 + consumed;
+        continue;
+      }
+      if (c == '"') {
+        ++cursor_;
+        closed = true;
+        break;
+      }
+      ++cursor_;
+    }
+
+    if (!closed || bad)
+      had_error_ = true;
+
+    tokens_.emplace_back((closed && !bad) ? TokenType::StringLiteral
+                                          : TokenType::Error,
+                         std::string_view(start, cursor_ - start),
+                         current_line_);
   }
 
 public:
@@ -555,6 +710,12 @@ public:
             emit(TokenType::RemainderAssign, 2);
           else
             emit(TokenType::Remainder, 1);
+          break;
+        case '\'':
+          read_char_constant();
+          break;
+        case '"':
+          read_string_literal();
           break;
         default:
           had_error_ = true;

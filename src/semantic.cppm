@@ -155,6 +155,7 @@ class IdentifierResolver {
                      resolve_exp(*s.left, scope);
                      resolve_exp(*s.right, scope);
                    },
+                   [](String &) {},
                },
                exp.value);
   }
@@ -394,6 +395,10 @@ class TypeChecker {
         elements.push_back(zero_initializer(*type.referenced));
       return Initializer{CompoundInit{std::move(elements)}, type};
     }
+    if (is_char_kind(type.kind)) {
+      Exp zero{ConstInt{0, 0}, Type::int_type()};
+      return Initializer{SingleInit{convert_to(std::move(zero), type)}, type};
+    }
     Exp zero = type.kind == TypeKind::Double
                    ? Exp{ConstDouble{0.0, 0}, type}
                    : type.kind == TypeKind::Long
@@ -408,6 +413,36 @@ class TypeChecker {
   }
 
   Type typecheck_initializer(const Type &target, Initializer &init) {
+    if (target.kind == TypeKind::Array && target.referenced &&
+        is_char_kind(target.referenced->kind) &&
+        std::holds_alternative<SingleInit>(init.value)) {
+      SingleInit &single = std::get<SingleInit>(init.value);
+      if (auto *str = std::get_if<String>(&single.exp.value)) {
+        const std::string value = str->value;
+        const uint32_t line = str->line;
+        const size_t n = value.size();
+        if (target.size < n) {
+          std::println("error:{}: String literal is too long for array", line);
+          had_error_ = true;
+          init.type = target;
+          return target;
+        }
+        std::vector<Initializer> elements;
+        elements.reserve(target.size);
+        for (size_t i = 0; i < target.size; ++i) {
+          const int c =
+              i < n ? static_cast<int>(static_cast<unsigned char>(value[i]))
+                    : 0;
+          elements.push_back(Initializer{
+              SingleInit{Exp{ConstInt{c, line}, Type::int_type()}}, {}});
+        }
+        init = Initializer{CompoundInit{std::move(elements)}, target};
+        auto &stored = std::get<CompoundInit>(init.value);
+        for (auto &child : stored.initializers)
+          typecheck_initializer(*target.referenced, child);
+        return target;
+      }
+    }
     return std::visit(
         Overload{
             [&](SingleInit &single) {
@@ -510,24 +545,26 @@ class TypeChecker {
     if (!std::isfinite(*value)) return std::nullopt;
 
     const bool double_source = initializer.type.kind == TypeKind::Double;
+    const bool unsigned_target = target.kind == TypeKind::UInt ||
+                                 target.kind == TypeKind::ULong ||
+                                 target.kind == TypeKind::UChar;
     const int width =
-        target.kind == TypeKind::Int || target.kind == TypeKind::UInt
-            ? 32
-            : 64;
+        is_char_kind(target.kind)
+            ? 8
+            : (target.kind == TypeKind::Int || target.kind == TypeKind::UInt
+                   ? 32
+                   : 64);
     const long double modulus = std::ldexp(1.0L, width);
     if (double_source &&
         (*value < 0 ||
-         *value >= (target.kind == TypeKind::UInt ||
-                            target.kind == TypeKind::ULong
-                        ? modulus
-                        : std::ldexp(1.0L, width - 1))))
+         *value >= (unsigned_target ? modulus
+                                    : std::ldexp(1.0L, width - 1))))
       return std::nullopt;
 
     long double wrapped = std::fmod(std::trunc(*value), modulus);
     if (wrapped < 0) wrapped += modulus;
     const uint64_t bits = static_cast<uint64_t>(wrapped);
-    if (target.kind == TypeKind::UInt ||
-        target.kind == TypeKind::ULong)
+    if (unsigned_target)
       return std::variant<uint64_t, double>{bits};
     if (width == 32)
       return std::variant<uint64_t, double>{
@@ -542,6 +579,16 @@ class TypeChecker {
     return std::visit(
         Overload{
             [&](const SingleInit &single) {
+              if (initializer.type.kind == TypeKind::Pointer) {
+                if (const auto *addr =
+                        std::get_if<AddrOf>(&single.exp.value)) {
+                  if (const auto *str =
+                          std::get_if<String>(&addr->exp->value)) {
+                    values.push_back(PointerInit{str->name});
+                    return true;
+                  }
+                }
+              }
               auto value = constant_initializer(single.exp, initializer.type);
               if (!value) return false;
               const Type &type = initializer.type;
@@ -555,11 +602,23 @@ class TypeChecker {
                 const uint64_t bits = std::get<uint64_t>(*value);
                 if (bits == 0) {
                   values.push_back(ZeroInit{
-                      type.kind == TypeKind::Int || type.kind == TypeKind::UInt
-                          ? 4U
-                          : 8U});
+                      is_char_kind(type.kind)
+                          ? 1U
+                          : (type.kind == TypeKind::Int ||
+                                     type.kind == TypeKind::UInt
+                                 ? 4U
+                                 : 8U)});
                 } else {
                   switch (type.kind) {
+                    case TypeKind::Char:
+                    case TypeKind::SChar:
+                      values.push_back(
+                          CharInit{static_cast<int8_t>(bits)});
+                      break;
+                    case TypeKind::UChar:
+                      values.push_back(
+                          UCharInit{static_cast<uint8_t>(bits)});
+                      break;
                     case TypeKind::Int:
                       values.push_back(
                           IntInit{static_cast<int32_t>(bits)});
@@ -592,7 +651,9 @@ class TypeChecker {
         initializer.value);
   }
 
-  static Type common_type(const Type &left, const Type &right) {
+  static Type common_type(const Type &left_in, const Type &right_in) {
+    const Type left = promote_integer(left_in);
+    const Type right = promote_integer(right_in);
     if (left == right) return left;
     if (left.kind == TypeKind::Double || right.kind == TypeKind::Double)
       return Type::double_type();
@@ -622,7 +683,18 @@ class TypeChecker {
 
   static bool is_integer(const Type &type) {
     return type.kind == TypeKind::Int || type.kind == TypeKind::Long ||
-           type.kind == TypeKind::UInt || type.kind == TypeKind::ULong;
+           type.kind == TypeKind::UInt || type.kind == TypeKind::ULong ||
+           type.kind == TypeKind::Char || type.kind == TypeKind::SChar ||
+           type.kind == TypeKind::UChar;
+  }
+
+  static bool is_char_kind(TypeKind kind) {
+    return kind == TypeKind::Char || kind == TypeKind::SChar ||
+           kind == TypeKind::UChar;
+  }
+
+  static Type promote_integer(const Type &type) {
+    return is_char_kind(type.kind) ? Type::int_type() : type;
   }
 
   static bool is_null_pointer_constant(const Exp &exp) {
@@ -655,7 +727,8 @@ class TypeChecker {
                         [](const IncDec &v) { return v.line; },
                         [](const Conditional &v) { return v.line; },
                         [](const FunctionCall &v) { return v.line; },
-                        [](const Subscript &v) { return v.line; }},
+                        [](const Subscript &v) { return v.line; },
+                 [](const String &v) { return v.line; }},
           exp.value);
       Type decayed = Type::pointer(*type.referenced);
       exp = Exp{AddrOf{std::make_unique<Exp>(std::move(exp)), line}, decayed};
@@ -668,7 +741,8 @@ class TypeChecker {
     return exp.type.kind != TypeKind::Function &&
            (std::holds_alternative<Var>(exp.value) ||
             std::holds_alternative<Dereference>(exp.value) ||
-            std::holds_alternative<Subscript>(exp.value));
+            std::holds_alternative<Subscript>(exp.value) ||
+            std::holds_alternative<String>(exp.value));
   }
 
   Type common_pointer_type(Exp &left, Exp &right, uint32_t line) {
@@ -715,7 +789,8 @@ class TypeChecker {
                  [](const IncDec &v) { return v.line; },
                  [](const Conditional &v) { return v.line; },
                  [](const FunctionCall &v) { return v.line; },
-                 [](const Subscript &v) { return v.line; }},
+                 [](const Subscript &v) { return v.line; },
+                 [](const String &v) { return v.line; }},
         exp.value);
     std::println("error:{}: Cannot convert type for assignment", line);
     had_error_ = true;
@@ -742,7 +817,8 @@ class TypeChecker {
                    return v.line;
                  },
                  [](const FunctionCall &v) { return v.line; },
-                 [](const Subscript &v) { return v.line; }},
+                 [](const Subscript &v) { return v.line; },
+                 [](const String &v) { return v.line; }},
         exp.value);
     Exp converted{Cast{target, std::make_unique<Exp>(std::move(exp)), line},
                   target};
@@ -824,13 +900,32 @@ class TypeChecker {
               return pointer_type.referenced ? *pointer_type.referenced
                                              : Type::int_type();
             },
+            [&](String &s) {
+              if (s.name.empty()) {
+                s.name = "string." + std::to_string(next_name_id());
+                Symbol::InitialValue init;
+                init.kind = Symbol::InitialValue::Kind::Initial;
+                for (unsigned char ch : s.value)
+                  init.values.push_back(
+                      CharInit{static_cast<int8_t>(ch)});
+                init.values.push_back(CharInit{0});
+                Type str_type =
+                    Type::array(Type::char_type(), s.value.size() + 1);
+                symbol_table().add(s.name, str_type,
+                                   Symbol::StaticAttr{init, false});
+              }
+              return symbol_table().get(s.name).type;
+            },
             [&](const Unary &u) {
               Type operand_type = typecheck_exp(*u.exp);
-              if (operand_type.kind == TypeKind::Pointer &&
-                  !std::holds_alternative<Not>(u.op)) {
-                std::println("error:{}: Invalid unary operator on pointer",
-                             u.line);
+              if (std::holds_alternative<Not>(u.op))
+                return Type::int_type();
+              if (!is_arithmetic(operand_type)) {
+                std::println(
+                    "error:{}: Invalid unary operator on non-arithmetic type",
+                    u.line);
                 had_error_ = true;
+                return operand_type;
               }
               if (std::holds_alternative<Complement>(u.op) &&
                   operand_type.kind == TypeKind::Double) {
@@ -839,8 +934,10 @@ class TypeChecker {
                     u.line);
                 had_error_ = true;
               }
-              return std::holds_alternative<Not>(u.op) ? Type::int_type()
-                                                        : operand_type;
+              Type promoted = promote_integer(operand_type);
+              if (promoted != operand_type)
+                *u.exp = convert_to(std::move(*u.exp), promoted);
+              return promoted;
             },
             [&](Binary &b) {
               Type left = typecheck_and_convert(*b.left);
@@ -942,7 +1039,9 @@ class TypeChecker {
             },
             [&](const IncDec &e) {
               Type type = typecheck_exp(*e.exp);
-              if (!is_lvalue(*e.exp) || type.kind == TypeKind::Pointer) {
+              if (!is_lvalue(*e.exp) || type.kind == TypeKind::Pointer ||
+                  type.kind == TypeKind::Array ||
+                  std::holds_alternative<String>(e.exp->value)) {
                 std::println("error:{}: Invalid increment/decrement operand",
                              e.line);
                 had_error_ = true;
@@ -1021,6 +1120,16 @@ class TypeChecker {
             [&](Default &d) { typecheck_statement(*d.stmt); },
             [&](Switch &s) {
               typecheck_exp(s.condition);
+              if (!is_integer(s.condition.type)) {
+                std::println(
+                    "error:{}: Switch condition must have integer type",
+                    s.line);
+                had_error_ = true;
+              } else {
+                s.condition = convert_to(
+                    std::move(s.condition),
+                    promote_integer(s.condition.type));
+              }
               typecheck_statement(*s.body);
             },
             [&](While &w) {
@@ -1384,10 +1493,11 @@ class BreakContinueLabeler {
                   [&](FunctionCall &c) {
                     for (auto &arg : c.args) find_enclosing_loop(*arg, loop);
                   },
-                  [&](Subscript &s) {
-                    find_enclosing_loop(*s.left, loop);
-                    find_enclosing_loop(*s.right, loop);
-                  },
+                   [&](Subscript &s) {
+                     find_enclosing_loop(*s.left, loop);
+                     find_enclosing_loop(*s.right, loop);
+                   },
+                   [](String &) {},
                },
                exp.value);
   }

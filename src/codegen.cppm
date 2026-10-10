@@ -27,7 +27,7 @@ export {
     AX, CX, DX, DI, SI, R8, R9, R10, R11,
     XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM14, XMM15
   };
-  enum class AsmType : uint8_t { Longword, Quadword, Double };
+  enum class AsmType : uint8_t { Byte, Longword, Quadword, Double };
 
   struct Reg { RegId id; };
   struct Imm { int64_t value; };
@@ -54,8 +54,18 @@ export {
     Mov(AsmType type, Operand src, Operand dst)
         : type(type), src(std::move(src)), dst(std::move(dst)) {}
   };
-  struct Movsx { Operand src; Operand dst; };
-  struct Movzx { Operand src; Operand dst; };
+  struct Movsx {
+    AsmType src_type;
+    AsmType dst_type;
+    Operand src;
+    Operand dst;
+  };
+  struct Movzx {
+    AsmType src_type;
+    AsmType dst_type;
+    Operand src;
+    Operand dst;
+  };
   struct Lea { Operand src; Operand dst; };
   struct FloatBinary {
     enum class Op : uint8_t { Add, Sub, Mult, Div, Xor } op;
@@ -178,10 +188,13 @@ static Operand nir_val_to_operand(const NirVal &val,
 
 static AsmType asm_type(const Type &type) {
   if (type.kind == TypeKind::Double) return AsmType::Double;
-  return type.kind == TypeKind::Long || type.kind == TypeKind::ULong ||
-                 type.kind == TypeKind::Pointer
-             ? AsmType::Quadword
-             : AsmType::Longword;
+  if (type.kind == TypeKind::Long || type.kind == TypeKind::ULong ||
+      type.kind == TypeKind::Pointer)
+    return AsmType::Quadword;
+  if (type.kind == TypeKind::Char || type.kind == TypeKind::SChar ||
+      type.kind == TypeKind::UChar)
+    return AsmType::Byte;
+  return AsmType::Longword;
 }
 
 static Type type_of(const NirVal &value) {
@@ -359,10 +372,14 @@ static AsmFunction nir_to_asm(const NirFunction &func,
           instructions.push_back(Ret{});
         },
         [&](const NirSignExtend &c) {
-          instructions.push_back(Movsx{op(c.src), op(c.dst)});
+          instructions.push_back(
+              Movsx{asm_type(type_of(c.src)), asm_type(type_of(c.dst)),
+                    op(c.src), op(c.dst)});
         },
         [&](const NirZeroExtend &c) {
-          instructions.push_back(Movzx{op(c.src), op(c.dst)});
+          instructions.push_back(
+              Movzx{asm_type(type_of(c.src)), asm_type(type_of(c.dst)),
+                    op(c.src), op(c.dst)});
         },
         [&](const NirDoubleToInt &c) {
           instructions.push_back(
@@ -414,7 +431,8 @@ static AsmFunction nir_to_asm(const NirFunction &func,
           const Type source = type_of(c.src);
           if (source.kind == TypeKind::UInt) {
             instructions.push_back(
-                Movzx{op(c.src), Reg{RegId::R10}});
+                Movzx{AsmType::Longword, AsmType::Quadword, op(c.src),
+                      Reg{RegId::R10}});
             instructions.push_back(
                 Cvtsi2sd{AsmType::Quadword, Reg{RegId::R10}, op(c.dst)});
           } else {
@@ -449,7 +467,7 @@ static AsmFunction nir_to_asm(const NirFunction &func,
         },
         [&](const NirTruncate &c) {
           instructions.push_back(
-              Mov{AsmType::Longword, op(c.src), op(c.dst)});
+              Mov{asm_type(type_of(c.dst)), op(c.src), op(c.dst)});
         },
         [&](const NirUnary &u) {
           const AsmType type = asm_type(type_of(u.src));
@@ -613,10 +631,17 @@ static AsmFunction nir_to_asm(const NirFunction &func,
           const Type index_type = type_of(a.index);
           instructions.push_back(
               Mov{AsmType::Quadword, op(a.pointer), Reg{RegId::AX}});
-          if (index_type.kind == TypeKind::Int) {
-            instructions.push_back(Movsx{op(a.index), Reg{RegId::DX}});
-          } else if (index_type.kind == TypeKind::UInt) {
-            instructions.push_back(Movzx{op(a.index), Reg{RegId::DX}});
+          if (index_type.kind == TypeKind::Char ||
+              index_type.kind == TypeKind::SChar ||
+              index_type.kind == TypeKind::Int) {
+            instructions.push_back(Movsx{asm_type(index_type),
+                                         AsmType::Quadword, op(a.index),
+                                         Reg{RegId::DX}});
+          } else if (index_type.kind == TypeKind::UChar ||
+                     index_type.kind == TypeKind::UInt) {
+            instructions.push_back(Movzx{asm_type(index_type),
+                                         AsmType::Quadword, op(a.index),
+                                         Reg{RegId::DX}});
           } else {
             instructions.push_back(
                 Mov{AsmType::Quadword, op(a.index), Reg{RegId::DX}});
@@ -733,6 +758,9 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
       if (inserted) {
         const auto size_of = [](const auto &self, const Type &type) -> int {
           switch (type.kind) {
+            case TypeKind::Char:
+            case TypeKind::SChar:
+            case TypeKind::UChar: return 1;
             case TypeKind::Int:
             case TypeKind::UInt: return 4;
             case TypeKind::Long:
@@ -778,6 +806,8 @@ static std::pair<AsmFunction, int> replace_pseudos(const AsmFunction &func) {
           return T{i.op, fix(i.src), fix(i.dst)};
         else if constexpr (requires { i.type; })
           return T{i.type, fix(i.src), fix(i.dst)};
+        else if constexpr (requires { i.src_type; })
+          return T{i.src_type, i.dst_type, fix(i.src), fix(i.dst)};
         else
           return T{fix(i.src), fix(i.dst)};
       } else if constexpr (requires { i.operand; }) {
@@ -808,6 +838,14 @@ static AsmFunction fix_up(const AsmFunction &func, int stack_bytes) {
       } else {
         fixed.push_back(mov);
       }
+      return;
+    }
+    if (mov.type == AsmType::Byte &&
+        std::holds_alternative<Imm>(mov.src)) {
+      fixed.push_back(Mov{mov.type,
+                          Imm{static_cast<int8_t>(
+                              std::get<Imm>(mov.src).value)},
+                          mov.dst});
       return;
     }
     const bool large_quadword_immediate =
@@ -844,21 +882,32 @@ static AsmFunction fix_up(const AsmFunction &func, int stack_bytes) {
       [&](const Mov &m) { fix_mov(m); },
       [&](const Movsx &m) {
         if (std::holds_alternative<Imm>(m.src)) {
-          fix_mov(Mov{AsmType::Quadword, m.src, m.dst});
+          fix_mov(Mov{m.dst_type, m.src, m.dst});
         } else if (is_memory(m.dst)) {
-          fixed.push_back(Movsx{m.src, Reg{RegId::R11}});
           fixed.push_back(
-              Mov{AsmType::Quadword, Reg{RegId::R11}, m.dst});
+              Movsx{m.src_type, m.dst_type, m.src, Reg{RegId::R11}});
+          fixed.push_back(
+              Mov{m.dst_type, Reg{RegId::R11}, m.dst});
         } else {
           fixed.push_back(m);
         }
       },
       [&](const Movzx &m) {
         if (is_memory(m.dst)) {
-          fixed.push_back(Mov{AsmType::Longword, m.src, Reg{RegId::R11}});
-          fixed.push_back(Mov{AsmType::Quadword, Reg{RegId::R11}, m.dst});
+          if (m.src_type == AsmType::Byte) {
+            fixed.push_back(
+                Movzx{m.src_type, AsmType::Longword, m.src,
+                      Reg{RegId::R11}});
+            fixed.push_back(
+                Mov{m.dst_type, Reg{RegId::R11}, m.dst});
+          } else {
+            fixed.push_back(
+                Mov{AsmType::Longword, m.src, Reg{RegId::R11}});
+            fixed.push_back(
+                Mov{m.dst_type, Reg{RegId::R11}, m.dst});
+          }
         } else {
-          fixed.push_back(Mov{AsmType::Longword, m.src, m.dst});
+          fixed.push_back(m);
         }
       },
       [&](const Lea &l) {
@@ -941,6 +990,11 @@ static AsmFunction fix_up(const AsmFunction &func, int stack_bytes) {
           }
           Operand src = c.src;
           Operand dst = c.dst;
+          if (c.type == AsmType::Byte &&
+              std::holds_alternative<Imm>(src)) {
+            src = Imm{static_cast<int8_t>(
+                std::get<Imm>(src).value)};
+          }
           if (std::holds_alternative<Imm>(dst)) {
             fix_mov(Mov{c.type, dst, Reg{RegId::R11}});
             dst = Reg{RegId::R11};
@@ -1044,6 +1098,19 @@ static std::string reg_str(RegId id, AsmType type) {
   if (type == AsmType::Double ||
       static_cast<uint8_t>(id) >= static_cast<uint8_t>(RegId::XMM0))
     return xmm_str(id);
+  if (type == AsmType::Byte) {
+    switch (id) {
+      case RegId::AX: return "%al";
+      case RegId::CX: return "%cl";
+      case RegId::DX: return "%dl";
+      case RegId::DI: return "%dil";
+      case RegId::SI: return "%sil";
+      case RegId::R8: return "%r8b";
+      case RegId::R9: return "%r9b";
+      case RegId::R10: return "%r10b";
+      case RegId::R11: return "%r11b";
+    }
+  }
   if (type == AsmType::Quadword) return reg_q_str(id);
   switch (id) {
     case RegId::AX: return "%eax";
@@ -1172,6 +1239,7 @@ static std::string inst_name() {
 
 static std::string_view suffix(AsmType type) {
   switch (type) {
+    case AsmType::Byte: return "b";
     case AsmType::Longword: return "l";
     case AsmType::Quadword: return "q";
     case AsmType::Double: return "sd";
@@ -1181,6 +1249,9 @@ static std::string_view suffix(AsmType type) {
 
 static size_t type_size(const Type &type) {
   switch (type.kind) {
+    case TypeKind::Char:
+    case TypeKind::SChar:
+    case TypeKind::UChar: return 1;
     case TypeKind::Int:
     case TypeKind::UInt: return 4;
     case TypeKind::Long:
@@ -1239,23 +1310,37 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
                                            operand_str(m.dst, m.type) + "\n";
                                },
                                [&](const Movsx &m) {
-                                 output += "    movslq " +
-                                           operand_str(m.src,
-                                                       AsmType::Longword) +
+                                 const std::string mnem = [&]() {
+                                   if (m.src_type != AsmType::Byte)
+                                     return std::string("movslq");
+                                   return m.dst_type == AsmType::Quadword
+                                              ? std::string("movsbq")
+                                              : std::string("movsbl");
+                                 }();
+                                 output += "    " + mnem + " " +
+                                           operand_str(m.src, m.src_type) +
                                            ", " +
-                                           operand_str(m.dst,
-                                                       AsmType::Quadword) +
+                                           operand_str(m.dst, m.dst_type) +
                                            "\n";
                                },
                                [&](const Movzx &m) {
-                                 output += "    movl " +
-                                           operand_str(m.src,
-                                                       AsmType::Longword) +
-                                           ", %r11d\n";
-                                 output += "    movq %r11, " +
-                                           operand_str(m.dst,
-                                                       AsmType::Quadword) +
-                                           "\n";
+                                 if (m.src_type == AsmType::Byte) {
+                                   output += "    movzbl " +
+                                             operand_str(m.src,
+                                                         AsmType::Byte) +
+                                             ", " +
+                                             operand_str(m.dst,
+                                                         AsmType::Longword) +
+                                             "\n";
+                                 } else {
+                                   output += "    movl " +
+                                             operand_str(m.src,
+                                                         AsmType::Longword) +
+                                             ", " +
+                                             operand_str(m.dst,
+                                                         AsmType::Longword) +
+                                             "\n";
+                                 }
                                },
                                [&](const Lea &l) {
                                  output += "    leaq " +
@@ -1368,28 +1453,22 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
                                            operand_str(c.dst, c.type) + "\n";
                                },
                                [&](const Shll &s) {
-                                 output += "    sh" +
-                                           std::string(s.type == AsmType::Longword
-                                                           ? "ll"
-                                                           : "lq") +
+                                 output += "    shl" +
+                                           std::string(suffix(s.type)) +
                                            " %cl, " +
                                            operand_str(s.operand, s.type) +
                                            "\n";
                                },
                                [&](const Sarl &s) {
                                  output += "    sar" +
-                                           std::string(s.type == AsmType::Longword
-                                                           ? "l"
-                                                           : "q") +
+                                           std::string(suffix(s.type)) +
                                            " %cl, " +
                                            operand_str(s.operand, s.type) +
                                            "\n";
                                },
                                [&](const Shrl &s) {
                                  output += "    shr" +
-                                           std::string(s.type == AsmType::Longword
-                                                           ? "l"
-                                                           : "q") +
+                                           std::string(suffix(s.type)) +
                                            " %cl, " +
                                            operand_str(s.operand, s.type) +
                                            "\n";
@@ -1481,6 +1560,20 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
               for (const auto &init : variable.init) {
                 std::visit(
                     Overload{
+                        [&](const CharInit &value) {
+                          output += "    .byte " +
+                                    std::to_string(static_cast<int>(value.value)) +
+                                    "\n";
+                        },
+                        [&](const UCharInit &value) {
+                          output += "    .byte " +
+                                    std::to_string(static_cast<int>(value.value)) +
+                                    "\n";
+                        },
+                        [&](const PointerInit &value) {
+                          output += "    .quad " + platform_prefix() +
+                                    value.name + "\n";
+                        },
                         [&](const IntInit &value) {
                           output += "    .long " +
                                     std::to_string(value.value) + "\n";

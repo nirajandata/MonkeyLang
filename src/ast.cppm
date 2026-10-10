@@ -21,6 +21,9 @@ export {
     UInt,
     ULong,
     Double,
+    Char,
+    SChar,
+    UChar,
     Function,
     Pointer,
     Array
@@ -38,6 +41,9 @@ export {
     static Type uint_type() { return {TypeKind::UInt, {}, nullptr, nullptr, 0}; }
     static Type ulong_type() { return {TypeKind::ULong, {}, nullptr, nullptr, 0}; }
     static Type double_type() { return {TypeKind::Double, {}, nullptr, nullptr, 0}; }
+    static Type char_type() { return {TypeKind::Char, {}, nullptr, nullptr, 0}; }
+    static Type schar_type() { return {TypeKind::SChar, {}, nullptr, nullptr, 0}; }
+    static Type uchar_type() { return {TypeKind::UChar, {}, nullptr, nullptr, 0}; }
     static Type function(std::vector<Type> params, Type ret) {
       return {TypeKind::Function, std::move(params),
               std::make_shared<Type>(std::move(ret)), nullptr, 0};
@@ -110,9 +116,21 @@ export {
     size_t bytes;
   };
 
+  struct CharInit {
+    int8_t value;
+  };
+
+  struct UCharInit {
+    uint8_t value;
+  };
+
+  struct PointerInit {
+    std::string name;
+  };
+
   using StaticInit =
       std::variant<IntInit, LongInit, UIntInit, ULongInit, DoubleInit,
-                   ZeroInit>;
+                   ZeroInit, CharInit, UCharInit, PointerInit>;
 
   struct Complement {};
 
@@ -254,10 +272,17 @@ export {
     uint32_t line;
   };
 
+  struct String {
+    std::string value;
+    std::string name;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble, Var,
                  Cast, Unary, Binary, Assignment, CompoundAssignment, IncDec,
-                 Conditional, FunctionCall, Dereference, AddrOf, Subscript> value;
+                 Conditional, FunctionCall, Dereference, AddrOf, Subscript,
+                 String> value;
     Type type;
   };
 

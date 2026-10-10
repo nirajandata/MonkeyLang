@@ -187,6 +187,9 @@ consteval TargetEnum reflect_to_enum() {
 class NirEmitter {
   static size_t type_size(const Type &type) {
     switch (type.kind) {
+      case TypeKind::Char:
+      case TypeKind::SChar:
+      case TypeKind::UChar: return 1;
       case TypeKind::Int:
       case TypeKind::UInt: return 4;
       case TypeKind::Long:
@@ -298,40 +301,62 @@ class NirEmitter {
                    return NirVar{v.name};
                  },
 
+                 [](const String &s) -> NirExpResult {
+                   return NirVar{s.name};
+                 },
+
                  [&](const Cast &c) -> NirExpResult {
                    NirVal src = emit_val_and_convert(*c.exp, instructions);
                    if (c.target_type == c.exp->type) return src;
                    NirVar dst = make_tacky_variable(c.target_type);
                    if (c.target_type.kind == TypeKind::Double) {
+                     NirVal source = src;
+                     if (c.exp->type.kind == TypeKind::Char ||
+                         c.exp->type.kind == TypeKind::SChar ||
+                         c.exp->type.kind == TypeKind::UChar) {
+                       NirVar promoted = make_tacky_variable(Type::int_type());
+                       if (c.exp->type.kind == TypeKind::UChar)
+                         instructions.push_back(
+                             NirZeroExtend{src, promoted});
+                       else
+                         instructions.push_back(
+                             NirSignExtend{src, promoted});
+                       source = promoted;
+                     }
                      if (c.exp->type.kind == TypeKind::UInt ||
                          c.exp->type.kind == TypeKind::ULong)
-                       instructions.push_back(NirUIntToDouble{src, dst});
+                       instructions.push_back(NirUIntToDouble{source, dst});
                      else
-                       instructions.push_back(NirIntToDouble{src, dst});
+                       instructions.push_back(NirIntToDouble{source, dst});
                      return dst;
                    }
                    if (c.exp->type.kind == TypeKind::Double) {
-                     if (c.target_type.kind == TypeKind::UInt ||
-                         c.target_type.kind == TypeKind::ULong)
+                     if (type_size(c.target_type) < 4) {
+                       NirVar tmp = make_tacky_variable(Type::int_type());
+                       instructions.push_back(NirDoubleToInt{src, tmp});
+                       instructions.push_back(NirTruncate{tmp, dst});
+                     } else if (c.target_type.kind == TypeKind::UInt ||
+                                c.target_type.kind == TypeKind::ULong) {
                        instructions.push_back(NirDoubleToUInt{src, dst});
-                     else
+                     } else {
                        instructions.push_back(NirDoubleToInt{src, dst});
+                     }
                      return dst;
                    }
-                   const bool source_is_wide =
-                       c.exp->type.kind == TypeKind::Long ||
-                       c.exp->type.kind == TypeKind::ULong ||
-                       c.exp->type.kind == TypeKind::Pointer;
-                   const bool target_is_wide =
-                       c.target_type.kind == TypeKind::Long ||
-                       c.target_type.kind == TypeKind::ULong ||
-                       c.target_type.kind == TypeKind::Pointer;
-                   if (source_is_wide == target_is_wide) {
+                   const size_t source_size = type_size(c.exp->type);
+                   const size_t target_size = type_size(c.target_type);
+                   if (source_size == target_size) {
                      instructions.push_back(NirCopy{src, dst});
-                   } else if (target_is_wide && c.exp->type.kind == TypeKind::Int) {
-                     instructions.push_back(NirSignExtend{src, dst});
-                   } else if (target_is_wide) {
-                     instructions.push_back(NirZeroExtend{src, dst});
+                   } else if (target_size > source_size) {
+                     const bool source_is_signed =
+                         c.exp->type.kind == TypeKind::Char ||
+                         c.exp->type.kind == TypeKind::SChar ||
+                         c.exp->type.kind == TypeKind::Int ||
+                         c.exp->type.kind == TypeKind::Long;
+                     if (source_is_signed)
+                       instructions.push_back(NirSignExtend{src, dst});
+                     else
+                       instructions.push_back(NirZeroExtend{src, dst});
                    } else {
                      instructions.push_back(NirTruncate{src, dst});
                    }
@@ -805,6 +830,9 @@ public:
         std::vector<StaticInit> init = attrs->init.values;
         const auto type_size = [](const auto &self, const Type &type) -> size_t {
           switch (type.kind) {
+            case TypeKind::Char:
+            case TypeKind::SChar:
+            case TypeKind::UChar: return 1;
             case TypeKind::Int:
             case TypeKind::UInt: return 4;
             case TypeKind::Long:

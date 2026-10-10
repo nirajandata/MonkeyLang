@@ -1,11 +1,16 @@
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <meta>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -57,324 +62,144 @@ static void print_tokens(const std::vector<Token> &tokens) {
   }
 }
 
-struct GetTypeName {
-  template <typename T> constexpr std::string_view operator()(const T &) const {
-    return std::meta::identifier_of(^^T);
-  }
-};
-constexpr GetTypeName get_type_name{};
+template <typename T>
+consteval std::size_t count_ast_members() {
+    return std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()).size();
+}
 
-static std::string join_names(const std::vector<std::string> &names) {
-  std::string joined;
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (i) joined += ", ";
-    joined += names[i];
-  }
-  return joined;
+template <typename T>
+consteval auto get_ast_members() {
+    constexpr std::size_t N = count_ast_members<T>();
+    std::array<std::meta::info, N> arr{};
+    auto vec = std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current());
+    for (std::size_t i = 0; i < N; ++i) {
+        arr[i] = vec[i];
+    }
+    return arr;
+}
+
+template <typename T>
+consteval std::size_t count_ast_enumerators() {
+    return std::meta::enumerators_of(^^T).size();
+}
+
+template <typename T>
+consteval auto get_ast_enumerators() {
+    constexpr std::size_t N = count_ast_enumerators<T>();
+    std::array<std::meta::info, N> arr{};
+    auto vec = std::meta::enumerators_of(^^T);
+    for (std::size_t i = 0; i < N; ++i) {
+        arr[i] = vec[i];
+    }
+    return arr;
 }
 
 static std::string type_name(const Type &type) {
-  if (type.kind == TypeKind::Int) return "Int";
-  if (type.kind == TypeKind::Long) return "Long";
-  if (type.kind == TypeKind::UInt) return "UInt";
-  if (type.kind == TypeKind::ULong) return "ULong";
-  if (type.kind == TypeKind::Double) return "Double";
   if (type.kind == TypeKind::Pointer)
-    return "Pointer(" +
-           (type.referenced ? type_name(*type.referenced) : "<?>") + ")";
+    return "Pointer(" + (type.referenced ? type_name(*type.referenced) : "<?>") + ")";
+  if (type.kind == TypeKind::Array)
+    return "Array(" + (type.referenced ? type_name(*type.referenced) : "<?>") + ", " + std::to_string(type.size) + ")";
 
-  std::string name = "FunType(";
-  for (size_t i = 0; i < type.params.size(); ++i) {
-    if (i) name += ", ";
-    name += type_name(type.params[i]);
+  std::string name = "";
+  template for (constexpr auto e : get_ast_enumerators<decltype(type.kind)>()) {
+    if (type.kind == [:e:]) {
+      name = std::meta::identifier_of(e);
+    }
   }
-  name += " -> ";
-  name += type.ret ? type_name(*type.ret) : "Int";
-  name += ")";
+
+  if (name.empty() || name == "Function" || name == "FunType" || name == "Fun") {
+    std::string fn_name = "FunType(";
+    for (size_t i = 0; i < type.params.size(); ++i) {
+      if (i) fn_name += ", ";
+      fn_name += type_name(type.params[i]);
+    }
+    fn_name += " -> ";
+    fn_name += type.ret ? type_name(*type.ret) : "Int";
+    fn_name += ")";
+    return fn_name;
+  }
+
   return name;
 }
 
-static void pretty_print(const Block &block, int indent = 0);
-static void pretty_print(const Exp &exp, int indent = 0);
-static void pretty_print(const VariableDeclaration &d, int indent = 0);
-static void pretty_print(const Declaration &d, int indent = 0);
-static void pretty_print(const ForInit &init, int indent = 0);
+template <typename T> constexpr bool is_variant_v = false;
+template <typename... Ts> constexpr bool is_variant_v<std::variant<Ts...>> = true;
 
-static void pretty_print(const VariableDeclaration &d, int indent) {
-  std::string pad(indent * 2, ' ');
-  std::println("{}{}(name=\"{}\"", pad,
-               std::meta::identifier_of(^^VariableDeclaration), d.name);
-  std::println("{}  var_type={},", pad, type_name(d.var_type));
-  if (d.storage_class)
-    std::println("{}  storage_class={},", pad,
-                 std::visit(get_type_name, *d.storage_class));
-  if (d.init)
-    pretty_print(*d.init, indent + 2);
-  std::println("{})", pad);
-}
+template <typename T> constexpr bool is_vector_v = false;
+template <typename T, typename A> constexpr bool is_vector_v<std::vector<T, A>> = true;
 
-static void pretty_print(const Declaration &d, int indent) {
-  std::string pad(indent * 2, ' ');
+template <typename T> constexpr bool is_optional_v = false;
+template <typename T> constexpr bool is_optional_v<std::optional<T>> = true;
 
-  std::println("{}{}(", pad, std::meta::identifier_of(^^Declaration));
-  std::visit(
-      Overload{
-          [&](const VarDecl &v) {
-            pretty_print(v.decl, indent + 2);
-          },
-          [&](const FunDecl &f) {
-            std::println("{}  {}(", pad, std::meta::identifier_of(^^FunDecl));
-            std::println("{}    name=\"{}\",", pad, f.decl.name);
-            std::println("{}    params=[{}],", pad, join_names(f.decl.params));
-            std::println("{}    fun_type={},", pad, type_name(f.decl.fun_type));
-            if (f.decl.storage_class)
-              std::println("{}    storage_class={},", pad,
-                           std::visit(get_type_name, *f.decl.storage_class));
-            if (f.decl.body)
-              pretty_print(*f.decl.body, indent + 4);
-            std::println("{}  )", pad);
-          },
-      },
-      d);
-  std::println("{})", pad);
-}
+template <typename T> constexpr bool is_unique_ptr_v = false;
+template <typename T, typename D> constexpr bool is_unique_ptr_v<std::unique_ptr<T, D>> = true;
 
-static void pretty_print(const ForInit &init, int indent) {
-  std::string pad(indent * 2, ' ');
+template <typename T> constexpr bool is_string_like_v =
+    std::is_same_v<std::decay_t<T>, std::string> || std::is_same_v<std::decay_t<T>, std::string_view>;
 
-  std::visit(
-      Overload{
-          [&](const InitDecl &d) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^InitDecl));
-            pretty_print(d.decl, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const InitExp &e) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^InitExp));
-            if (e.exp)
-              pretty_print(*e.exp, indent + 2);
-            std::println("{})", pad);
-          },
-      },
-      init);
-}
+template <typename T>
+void pretty_print(const T& obj, int indent = 0) {
+    std::string pad(indent * 2, ' ');
 
-static void pretty_print(const Exp &exp, int indent) {
-  std::string pad(indent * 2, ' ');
-  std::visit(
-      Overload{
-          [&](const ConstInt &c) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstInt),
-                         c.value);
-          },
-          [&](const ConstLong &c) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstLong),
-                         c.value);
-          },
-          [&](const ConstUInt &c) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstUInt),
-                         c.value);
-          },
-          [&](const ConstULong &c) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^ConstULong),
-                         c.value);
-          },
-          [&](const ConstDouble &c) {
-            std::println("{}{}({})", pad,
-                         std::meta::identifier_of(^^ConstDouble), c.value);
-          },
-          [&](const Var &v) {
-            std::println("{}{}({})", pad, std::meta::identifier_of(^^Var),
-                         v.name);
-          },
-          [&](const Cast &c) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Cast));
-            std::println("{}  target_type={}", pad, type_name(c.target_type));
-            pretty_print(*c.exp, indent + 2);
+    if constexpr (std::is_same_v<std::decay_t<T>, Type>) {
+        std::println("{}{}", pad, type_name(obj));
+    }
+    else if constexpr (is_string_like_v<T>) {
+        std::println("{}\"{}\"", pad, obj);
+    }
+    else if constexpr (std::is_arithmetic_v<T>) {
+        std::println("{}{}", pad, obj);
+    }
+    else if constexpr (std::is_enum_v<T>) {
+        std::string_view name = "<unknown>";
+        template for (constexpr auto e : get_ast_enumerators<T>()) {
+            if (obj == [:e:]) {
+                name = std::meta::identifier_of(e);
+            }
+        }
+        std::println("{}{}", pad, name);
+    }
+    else if constexpr (is_optional_v<T> || is_unique_ptr_v<T> || std::is_pointer_v<T>) {
+        if (obj) {
+            pretty_print(*obj, indent);
+        } else {
+            std::println("{}<null>", pad);
+        }
+    }
+    else if constexpr (is_variant_v<T>) {
+        std::visit([indent](const auto& v) { pretty_print(v, indent); }, obj);
+    }
+    else if constexpr (is_vector_v<T>) {
+        if (obj.empty()) {
+            std::println("{}[]", pad);
+        } else {
+            std::println("{}[", pad);
+            for (const auto& item : obj) {
+                pretty_print(item, indent + 1);
+            }
+            std::println("{}]", pad);
+        }
+    }
+    else if constexpr (std::is_class_v<T>) {
+        if constexpr (count_ast_members<T>() == 0) {
+            std::println("{}{}", pad, std::meta::identifier_of(^^T));
+        }
+        else if constexpr (count_ast_members<T>() == 1 &&
+                      std::meta::identifier_of(get_ast_members<T>()[0]) == "value") {
+            pretty_print(obj.[:get_ast_members<T>()[0]:], indent);
+        }
+        else {
+            std::println("{}{}(", pad, std::meta::identifier_of(^^T));
+            template for (constexpr auto mem : get_ast_members<T>()) {
+                std::println("{}  {} =", pad, std::meta::identifier_of(mem));
+                pretty_print(obj.[:mem:], indent + 2);
+            }
             std::println("{})", pad);
-          },
-          [&](const Dereference &d) {
-            std::println("{}{}(", pad,
-                         std::meta::identifier_of(^^Dereference));
-            pretty_print(*d.exp, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const AddrOf &a) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^AddrOf));
-            pretty_print(*a.exp, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Assignment &a) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Assignment));
-            pretty_print(*a.left, indent + 2);
-            pretty_print(*a.right, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const CompoundAssignment &a) {
-            std::string_view op_name = std::visit(get_type_name, a.op);
-            std::println("{}{}(", pad,
-                         std::meta::identifier_of(^^CompoundAssignment));
-            std::println("{}  {},", pad, op_name);
-            pretty_print(*a.left, indent + 2);
-            pretty_print(*a.right, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const IncDec &e) {
-            std::string_view op_name = std::visit(get_type_name, e.op);
-            std::println("{}{}(", pad, std::meta::identifier_of(^^IncDec));
-            std::println("{}  {},", pad, op_name);
-            std::println("{}  {},", pad, e.postfix ? "postfix" : "prefix");
-            pretty_print(*e.exp, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Unary &u) {
-            std::string_view op_name = std::visit(get_type_name, u.op);
-
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Unary));
-            std::println("{}  {},", pad, op_name);
-            pretty_print(*u.exp, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Binary &b) {
-            std::string_view op_name = std::visit(get_type_name, b.op);
-
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Binary));
-            std::println("{}  {},", pad, op_name);
-            pretty_print(*b.left, indent + 2);
-            pretty_print(*b.right, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Conditional &c) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Conditional));
-            pretty_print(*c.condition, indent + 2);
-            pretty_print(*c.then_exp, indent + 2);
-            pretty_print(*c.else_exp, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const FunctionCall &c) {
-            std::println("{}{}(\"{}\"", pad,
-                         std::meta::identifier_of(^^FunctionCall), c.name);
-            for (const auto &arg : c.args) pretty_print(*arg, indent + 2);
-            std::println("{})", pad);
-          },
-      },
-      exp.value);
-}
-
-static void pretty_print(const Expression &e, int indent = 0) {
-  pretty_print(e.value, indent);
-}
-
-static void pretty_print(const Statement &stmt, int indent = 0) {
-  std::string pad(indent * 2, ' ');
-
-  std::visit(
-      Overload{
-          [&](const Return &r) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Return));
-            pretty_print(r.value, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Expression &e) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Expression));
-            pretty_print(e.value, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Null &) {
-            std::println("{}{}", pad, std::meta::identifier_of(^^Null));
-          },
-          [&](const If &i) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^If));
-            pretty_print(i.condition, indent + 2);
-            pretty_print(*i.then_stmt, indent + 2);
-            if (i.else_stmt)
-              pretty_print(*i.else_stmt, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Goto &g) {
-            std::println("{}{}(\"{}\")", pad, std::meta::identifier_of(^^Goto),
-                         g.label);
-          },
-          [&](const Label &l) {
-            std::println("{}{}(\"{}\"", pad, std::meta::identifier_of(^^Label),
-                         l.name);
-            pretty_print(*l.stmt, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Compound &c) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Compound));
-            pretty_print(*c.block, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Break &b) {
-            std::println("{}{}(\"{}\")", pad, std::meta::identifier_of(^^Break),
-                         b.label);
-          },
-          [&](const Continue &c) {
-            std::println("{}{}(\"{}\")", pad,
-                         std::meta::identifier_of(^^Continue), c.label);
-          },
-          [&](const Case &c) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Case));
-            pretty_print(c.value, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const Default &) {
-            std::println("{}{}", pad, std::meta::identifier_of(^^Default));
-          },
-          [&](const Switch &s) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^Switch));
-            pretty_print(s.condition, indent + 2);
-            pretty_print(*s.body, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const While &w) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^While));
-            pretty_print(*w.condition, indent + 2);
-            pretty_print(*w.body, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const DoWhile &d) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^DoWhile));
-            pretty_print(*d.body, indent + 2);
-            pretty_print(*d.condition, indent + 2);
-            std::println("{})", pad);
-          },
-          [&](const For &f) {
-            std::println("{}{}(", pad, std::meta::identifier_of(^^For));
-            pretty_print(f.init, indent + 2);
-            if (f.condition)
-              pretty_print(*f.condition, indent + 2);
-            if (f.post)
-              pretty_print(*f.post, indent + 2);
-            pretty_print(*f.body, indent + 2);
-            std::println("{})", pad);
-          },
-      },
-      stmt.value);
-}
-
-static void pretty_print(const Block &block, int indent) {
-  std::string pad(indent * 2, ' ');
-
-  std::println("{}{}(", pad, std::meta::identifier_of(^^Block));
-  for (const auto &item : block.items) {
-    std::visit(Overload{
-                   [&](const Statement &s) { pretty_print(s, indent + 1); },
-                   [&](const Declaration &d) { pretty_print(d, indent); },
-               },
-               item);
-  }
-  std::println("{})", pad);
-}
-
-static void pretty_print(const Program &program, int indent = 0) {
-  std::string pad(indent * 2, ' ');
-
-  std::println("{}{}(", pad, std::meta::identifier_of(^^Program));
-  for (const auto &declaration : program.declarations)
-    pretty_print(declaration, indent + 1);
-  std::println("{})", pad);
+        }
+    }
+    else {
+        std::println("{}<unknown>", pad);
+    }
 }
 
 static int compile_file(const std::filesystem::path &source_path, Stage stage,
@@ -415,6 +240,7 @@ static int compile_file(const std::filesystem::path &source_path, Stage stage,
   if (!resolve_switches(*program))
     return 1;
   auto t5 = std::chrono::steady_clock::now();
+
   if (std::getenv("MCC_TIMING"))
     std::println(
         "labels={}us breaks={}us identifiers={}us typecheck={}us switches={}us",

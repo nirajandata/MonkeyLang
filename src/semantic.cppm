@@ -35,6 +35,7 @@ export {
       uint64_t value = 0;
       double double_value = 0.0;
       bool is_double = false;
+      std::vector<StaticInit> values;
     };
     struct StaticAttr {
       InitialValue init;
@@ -150,8 +151,23 @@ class IdentifierResolver {
                      }
                      for (auto &arg : c.args) resolve_exp(*arg, scope);
                    },
+                   [&](Subscript &s) {
+                     resolve_exp(*s.left, scope);
+                     resolve_exp(*s.right, scope);
+                   },
                },
                exp.value);
+  }
+
+  void resolve_initializer(Initializer &init, const Scope &scope) {
+    std::visit(
+        Overload{
+            [&](SingleInit &single) { resolve_exp(single.exp, scope); },
+            [&](CompoundInit &compound) {
+              for (auto &child : compound.initializers)
+                resolve_initializer(child, scope);
+            }},
+        init.value);
   }
 
   void resolve_statement(Statement &stmt, Scope &scope,
@@ -246,7 +262,7 @@ class IdentifierResolver {
       return;
     resolve_local_declaration(d.name, d.line, scope, local_names);
     if (d.init)
-      resolve_exp(*d.init, scope);
+      resolve_initializer(*d.init, scope);
   }
 
   void resolve_file_scope_variable_declaration(VariableDeclaration &d,
@@ -370,9 +386,65 @@ class TypeChecker {
            std::holds_alternative<Static>(*d.storage_class);
   }
 
+  static Initializer zero_initializer(const Type &type) {
+    if (type.kind == TypeKind::Array && type.referenced) {
+      std::vector<Initializer> elements;
+      elements.reserve(type.size);
+      for (size_t i = 0; i < type.size; ++i)
+        elements.push_back(zero_initializer(*type.referenced));
+      return Initializer{CompoundInit{std::move(elements)}, type};
+    }
+    Exp zero = type.kind == TypeKind::Double
+                   ? Exp{ConstDouble{0.0, 0}, type}
+                   : type.kind == TypeKind::Long
+                         ? Exp{ConstLong{0, 0}, type}
+                         : type.kind == TypeKind::UInt
+                               ? Exp{ConstUInt{0, 0}, type}
+                               : type.kind == TypeKind::ULong ||
+                                         type.kind == TypeKind::Pointer
+                                     ? Exp{ConstULong{0, 0}, type}
+                                     : Exp{ConstInt{0, 0}, type};
+    return Initializer{SingleInit{std::move(zero)}, type};
+  }
+
+  Type typecheck_initializer(const Type &target, Initializer &init) {
+    return std::visit(
+        Overload{
+            [&](SingleInit &single) {
+              if (target.kind == TypeKind::Array) {
+                std::println("error: Cannot initialize an array with a scalar initializer");
+                had_error_ = true;
+              } else {
+                typecheck_and_convert(single.exp);
+                convert_by_assignment(single.exp, target);
+              }
+              init.type = target;
+              return target;
+            },
+            [&](CompoundInit &compound) {
+              if (target.kind != TypeKind::Array || !target.referenced) {
+                std::println("error: Compound initializer requires an array type");
+                had_error_ = true;
+                init.type = target;
+                return target;
+              }
+              if (compound.initializers.size() > target.size) {
+                std::println("error: Too many values in array initializer");
+                had_error_ = true;
+              }
+              for (auto &child : compound.initializers)
+                typecheck_initializer(*target.referenced, child);
+              while (compound.initializers.size() < target.size)
+                compound.initializers.push_back(
+                    zero_initializer(*target.referenced));
+              init.type = target;
+              return target;
+            }},
+        init.value);
+  }
+
   std::optional<std::variant<uint64_t, double>>
-  constant_initializer(const VariableDeclaration &d) {
-    if (!d.init) return std::nullopt;
+  constant_initializer(const Exp &initializer, const Type &target) {
     auto evaluate = [&](const auto &self, const Exp &exp)
         -> std::optional<long double> {
       return std::visit(
@@ -426,27 +498,27 @@ class TypeChecker {
               }},
           exp.value);
     };
-    auto value = evaluate(evaluate, *d.init);
+    auto value = evaluate(evaluate, initializer);
     if (!value) return std::nullopt;
-    if (d.var_type.kind == TypeKind::Pointer) {
+    if (target.kind == TypeKind::Pointer) {
       if (*value == 0)
         return std::variant<uint64_t, double>{uint64_t{0}};
       return std::nullopt;
     }
-    if (d.var_type.kind == TypeKind::Double)
+    if (target.kind == TypeKind::Double)
       return std::variant<uint64_t, double>{static_cast<double>(*value)};
     if (!std::isfinite(*value)) return std::nullopt;
 
-    const bool double_source = d.init->type.kind == TypeKind::Double;
+    const bool double_source = initializer.type.kind == TypeKind::Double;
     const int width =
-        d.var_type.kind == TypeKind::Int || d.var_type.kind == TypeKind::UInt
+        target.kind == TypeKind::Int || target.kind == TypeKind::UInt
             ? 32
             : 64;
     const long double modulus = std::ldexp(1.0L, width);
     if (double_source &&
         (*value < 0 ||
-         *value >= (d.var_type.kind == TypeKind::UInt ||
-                            d.var_type.kind == TypeKind::ULong
+         *value >= (target.kind == TypeKind::UInt ||
+                            target.kind == TypeKind::ULong
                         ? modulus
                         : std::ldexp(1.0L, width - 1))))
       return std::nullopt;
@@ -454,8 +526,8 @@ class TypeChecker {
     long double wrapped = std::fmod(std::trunc(*value), modulus);
     if (wrapped < 0) wrapped += modulus;
     const uint64_t bits = static_cast<uint64_t>(wrapped);
-    if (d.var_type.kind == TypeKind::UInt ||
-        d.var_type.kind == TypeKind::ULong)
+    if (target.kind == TypeKind::UInt ||
+        target.kind == TypeKind::ULong)
       return std::variant<uint64_t, double>{bits};
     if (width == 32)
       return std::variant<uint64_t, double>{
@@ -463,6 +535,61 @@ class TypeChecker {
               std::bit_cast<int32_t>(static_cast<uint32_t>(bits))))};
     return std::variant<uint64_t, double>{
         static_cast<uint64_t>(std::bit_cast<int64_t>(bits))};
+  }
+
+  bool collect_static_initializers(const Initializer &initializer,
+                                   std::vector<StaticInit> &values) {
+    return std::visit(
+        Overload{
+            [&](const SingleInit &single) {
+              auto value = constant_initializer(single.exp, initializer.type);
+              if (!value) return false;
+              const Type &type = initializer.type;
+              if (type.kind == TypeKind::Double) {
+                const double number = std::get<double>(*value);
+                if (number == 0.0 && !std::signbit(number))
+                  values.push_back(ZeroInit{8});
+                else
+                  values.push_back(DoubleInit{number});
+              } else {
+                const uint64_t bits = std::get<uint64_t>(*value);
+                if (bits == 0) {
+                  values.push_back(ZeroInit{
+                      type.kind == TypeKind::Int || type.kind == TypeKind::UInt
+                          ? 4U
+                          : 8U});
+                } else {
+                  switch (type.kind) {
+                    case TypeKind::Int:
+                      values.push_back(
+                          IntInit{static_cast<int32_t>(bits)});
+                      break;
+                    case TypeKind::Long:
+                      values.push_back(
+                          LongInit{std::bit_cast<int64_t>(bits)});
+                      break;
+                    case TypeKind::UInt:
+                      values.push_back(
+                          UIntInit{static_cast<uint32_t>(bits)});
+                      break;
+                    case TypeKind::ULong:
+                    case TypeKind::Pointer:
+                      values.push_back(ULongInit{bits});
+                      break;
+                    default: return false;
+                  }
+                }
+              }
+              return true;
+            },
+            [&](const CompoundInit &compound) {
+              for (const auto &child : compound.initializers) {
+                if (!collect_static_initializers(child, values))
+                  return false;
+              }
+              return true;
+            }},
+        initializer.value);
   }
 
   static Type common_type(const Type &left, const Type &right) {
@@ -489,7 +616,13 @@ class TypeChecker {
   }
 
   static bool is_arithmetic(const Type &type) {
-    return type.kind != TypeKind::Pointer && type.kind != TypeKind::Function;
+    return type.kind != TypeKind::Pointer && type.kind != TypeKind::Function &&
+           type.kind != TypeKind::Array;
+  }
+
+  static bool is_integer(const Type &type) {
+    return type.kind == TypeKind::Int || type.kind == TypeKind::Long ||
+           type.kind == TypeKind::UInt || type.kind == TypeKind::ULong;
   }
 
   static bool is_null_pointer_constant(const Exp &exp) {
@@ -502,10 +635,40 @@ class TypeChecker {
         exp.value);
   }
 
+  Type typecheck_and_convert(Exp &exp) {
+    Type type = typecheck_exp(exp);
+    if (type.kind == TypeKind::Array && type.referenced) {
+      const uint32_t line = std::visit(
+          Overload{[](const ConstInt &v) { return v.line; },
+                        [](const ConstLong &v) { return v.line; },
+                        [](const ConstUInt &v) { return v.line; },
+                        [](const ConstULong &v) { return v.line; },
+                        [](const ConstDouble &v) { return v.line; },
+                        [](const Var &v) { return v.line; },
+                        [](const Dereference &v) { return v.line; },
+                        [](const AddrOf &v) { return v.line; },
+                        [](const Cast &v) { return v.line; },
+                        [](const Unary &v) { return v.line; },
+                        [](const Binary &v) { return v.line; },
+                        [](const Assignment &v) { return v.line; },
+                        [](const CompoundAssignment &v) { return v.line; },
+                        [](const IncDec &v) { return v.line; },
+                        [](const Conditional &v) { return v.line; },
+                        [](const FunctionCall &v) { return v.line; },
+                        [](const Subscript &v) { return v.line; }},
+          exp.value);
+      Type decayed = Type::pointer(*type.referenced);
+      exp = Exp{AddrOf{std::make_unique<Exp>(std::move(exp)), line}, decayed};
+      return decayed;
+    }
+    return type;
+  }
+
   static bool is_lvalue(const Exp &exp) {
     return exp.type.kind != TypeKind::Function &&
            (std::holds_alternative<Var>(exp.value) ||
-            std::holds_alternative<Dereference>(exp.value));
+            std::holds_alternative<Dereference>(exp.value) ||
+            std::holds_alternative<Subscript>(exp.value));
   }
 
   Type common_pointer_type(Exp &left, Exp &right, uint32_t line) {
@@ -551,7 +714,8 @@ class TypeChecker {
                  [](const CompoundAssignment &v) { return v.line; },
                  [](const IncDec &v) { return v.line; },
                  [](const Conditional &v) { return v.line; },
-                 [](const FunctionCall &v) { return v.line; }},
+                 [](const FunctionCall &v) { return v.line; },
+                 [](const Subscript &v) { return v.line; }},
         exp.value);
     std::println("error:{}: Cannot convert type for assignment", line);
     had_error_ = true;
@@ -577,7 +741,8 @@ class TypeChecker {
                  [](const Conditional &v) {
                    return v.line;
                  },
-                 [](const FunctionCall &v) { return v.line; }},
+                 [](const FunctionCall &v) { return v.line; },
+                 [](const Subscript &v) { return v.line; }},
         exp.value);
     Exp converted{Cast{target, std::make_unique<Exp>(std::move(exp)), line},
                   target};
@@ -606,13 +771,14 @@ class TypeChecker {
               return var_type;
             },
             [&](const Cast &c) {
-              Type source = typecheck_exp(*c.exp);
+              Type source = typecheck_and_convert(*c.exp);
               if ((source.kind == TypeKind::Double &&
                    c.target_type.kind == TypeKind::Pointer) ||
                   (source.kind == TypeKind::Pointer &&
                    c.target_type.kind == TypeKind::Double) ||
                   source.kind == TypeKind::Function ||
-                  c.target_type.kind == TypeKind::Function) {
+                  c.target_type.kind == TypeKind::Function ||
+                  c.target_type.kind == TypeKind::Array) {
                 std::println("error:{}: Invalid cast involving pointer type",
                              c.line);
                 had_error_ = true;
@@ -620,7 +786,7 @@ class TypeChecker {
               return c.target_type;
             },
             [&](Dereference &d) {
-              Type pointer_type = typecheck_exp(*d.exp);
+              Type pointer_type = typecheck_and_convert(*d.exp);
               if (pointer_type.kind != TypeKind::Pointer ||
                   !pointer_type.referenced) {
                 std::println("error:{}: Cannot dereference non-pointer",
@@ -638,6 +804,25 @@ class TypeChecker {
                 had_error_ = true;
               }
               return Type::pointer(std::move(referenced));
+            },
+            [&](Subscript &s) {
+              Type left = typecheck_and_convert(*s.left);
+              Type right = typecheck_and_convert(*s.right);
+              Type pointer_type;
+              if (left.kind == TypeKind::Pointer &&
+                  is_arithmetic(right) && right.kind != TypeKind::Double) {
+                pointer_type = left;
+              } else if (right.kind == TypeKind::Pointer &&
+                         is_arithmetic(left) && left.kind != TypeKind::Double) {
+                pointer_type = right;
+              } else {
+                std::println("error:{}: Subscript requires pointer and integer operands",
+                             s.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              return pointer_type.referenced ? *pointer_type.referenced
+                                             : Type::int_type();
             },
             [&](const Unary &u) {
               Type operand_type = typecheck_exp(*u.exp);
@@ -658,8 +843,8 @@ class TypeChecker {
                                                         : operand_type;
             },
             [&](Binary &b) {
-              Type left = typecheck_exp(*b.left);
-              Type right = typecheck_exp(*b.right);
+              Type left = typecheck_and_convert(*b.left);
+              Type right = typecheck_and_convert(*b.right);
               if (std::holds_alternative<Remainder>(b.op) &&
                   (left.kind == TypeKind::Double ||
                    right.kind == TypeKind::Double)) {
@@ -679,6 +864,30 @@ class TypeChecker {
                   return Type::int_type();
                 }
               }
+              if (std::holds_alternative<Add>(b.op)) {
+                if (left.kind == TypeKind::Pointer && is_integer(right)) {
+                  convert_to(b.right, Type::long_type());
+                  return left;
+                }
+                if (right.kind == TypeKind::Pointer && is_integer(left)) {
+                  convert_to(b.left, Type::long_type());
+                  return right;
+                }
+              }
+              if (std::holds_alternative<Subtract>(b.op)) {
+                if (left.kind == TypeKind::Pointer && is_integer(right)) {
+                  convert_to(b.right, Type::long_type());
+                  return left;
+                }
+                if (left.kind == TypeKind::Pointer && left == right)
+                  return Type::long_type();
+              }
+              if ((std::holds_alternative<LessThan>(b.op) ||
+                   std::holds_alternative<LessOrEqual>(b.op) ||
+                   std::holds_alternative<GreaterThan>(b.op) ||
+                   std::holds_alternative<GreaterOrEqual>(b.op)) &&
+                  left.kind == TypeKind::Pointer && left == right)
+                return Type::int_type();
               if (left.kind == TypeKind::Pointer ||
                   right.kind == TypeKind::Pointer) {
                 std::println("error:{}: Unsupported operation on pointer",
@@ -703,8 +912,8 @@ class TypeChecker {
               return Type::int_type();
             },
             [&](Assignment &a) {
-              Type left = typecheck_exp(*a.left);
-              typecheck_exp(*a.right);
+              Type left = typecheck_and_convert(*a.left);
+              typecheck_and_convert(*a.right);
               if (!is_lvalue(*a.left)) {
                 std::println("error:{}: Expression is not a valid lvalue",
                              a.line);
@@ -714,15 +923,16 @@ class TypeChecker {
               return left;
             },
             [&](CompoundAssignment &a) {
-              Type left = typecheck_exp(*a.left);
-              typecheck_exp(*a.right);
+              Type left = typecheck_and_convert(*a.left);
+              typecheck_and_convert(*a.right);
               if (!is_lvalue(*a.left)) {
                 std::println("error:{}: Expression is not a valid lvalue",
                              a.line);
                 had_error_ = true;
               }
               if (left.kind == TypeKind::Pointer ||
-                  a.right->type.kind == TypeKind::Pointer) {
+                  a.right->type.kind == TypeKind::Pointer ||
+                  left.kind == TypeKind::Array) {
                 std::println("error:{}: Unsupported compound operation on pointer",
                              a.line);
                 had_error_ = true;
@@ -740,9 +950,9 @@ class TypeChecker {
               return type;
             },
             [&](Conditional &c) {
-              typecheck_exp(*c.condition);
-              Type then_type = typecheck_exp(*c.then_exp);
-              Type else_type = typecheck_exp(*c.else_exp);
+              typecheck_and_convert(*c.condition);
+              Type then_type = typecheck_and_convert(*c.then_exp);
+              Type else_type = typecheck_and_convert(*c.else_exp);
               Type common;
               if (then_type.kind == TypeKind::Pointer ||
                   else_type.kind == TypeKind::Pointer) {
@@ -772,7 +982,7 @@ class TypeChecker {
                 had_error_ = true;
               }
               for (size_t i = 0; i < c.args.size(); ++i) {
-                typecheck_exp(*c.args[i]);
+                typecheck_and_convert(*c.args[i]);
                 if (i < fun_type.params.size())
                   convert_by_assignment(*c.args[i], fun_type.params[i]);
               }
@@ -788,7 +998,7 @@ class TypeChecker {
     std::visit(
         Overload{
             [&](Return &r) {
-              typecheck_exp(r.value);
+              typecheck_and_convert(r.value);
               convert_by_assignment(r.value, return_type_);
             },
             [&](Expression &e) { typecheck_exp(e.value); },
@@ -861,20 +1071,15 @@ class TypeChecker {
     if (is_static(d)) {
       InitialValue init{InitialValue::Kind::Initial, 0};
       if (d.init) {
-        typecheck_exp(*d.init);
-        convert_by_assignment(*d.init, decl_type);
-        if (auto value = constant_initializer(d)) {
-          if (const auto *integer = std::get_if<uint64_t>(&*value))
-            init.value = *integer;
-          else {
-            init.double_value = std::get<double>(*value);
-            init.is_double = true;
-          }
-        } else {
+        typecheck_initializer(decl_type, *d.init);
+        if (!collect_static_initializers(*d.init, init.values)) {
           std::println("error:{}: Non-constant initializer on local static variable '{}'",
                        d.line, d.name);
           had_error_ = true;
         }
+      } else {
+        Initializer zero = zero_initializer(decl_type);
+        collect_static_initializers(zero, init.values);
       }
       symbol_table().add(d.name, decl_type,
                          Symbol::StaticAttr{init, false});
@@ -882,27 +1087,17 @@ class TypeChecker {
     }
 
     symbol_table().add(d.name, decl_type, Symbol::LocalAttr{});
-    if (d.init) {
-      typecheck_exp(*d.init);
-      convert_by_assignment(*d.init, decl_type);
-    }
+    if (d.init)
+      typecheck_initializer(decl_type, *d.init);
   }
 
   void typecheck_file_scope_variable_declaration(
       VariableDeclaration &d) {
     InitialValue init{InitialValue::Kind::Tentative, 0};
     if (d.init) {
-      typecheck_exp(*d.init);
-      convert_by_assignment(*d.init, d.var_type);
-      if (auto value = constant_initializer(d)) {
-        init.kind = InitialValue::Kind::Initial;
-        if (const auto *integer = std::get_if<uint64_t>(&*value))
-          init.value = *integer;
-        else {
-          init.double_value = std::get<double>(*value);
-          init.is_double = true;
-        }
-      } else {
+      typecheck_initializer(d.var_type, *d.init);
+      init.kind = InitialValue::Kind::Initial;
+      if (!collect_static_initializers(*d.init, init.values)) {
         std::println("error:{}: Non-constant initializer for file-scope variable '{}'",
                      d.line, d.name);
         had_error_ = true;
@@ -954,6 +1149,14 @@ class TypeChecker {
   }
 
   void typecheck_function_declaration(FunctionDeclaration &d) {
+    if (d.fun_type.ret && d.fun_type.ret->kind == TypeKind::Array) {
+      std::println("error:{}: A function cannot return an array", d.line);
+      had_error_ = true;
+    }
+    for (Type &param : d.fun_type.params) {
+      if (param.kind == TypeKind::Array && param.referenced)
+        param = Type::pointer(*param.referenced);
+    }
     const Type fun_type = d.fun_type;
     const bool has_body = static_cast<bool>(d.body);
     bool already_defined = false;
@@ -1181,8 +1384,25 @@ class BreakContinueLabeler {
                   [&](FunctionCall &c) {
                     for (auto &arg : c.args) find_enclosing_loop(*arg, loop);
                   },
+                  [&](Subscript &s) {
+                    find_enclosing_loop(*s.left, loop);
+                    find_enclosing_loop(*s.right, loop);
+                  },
                },
                exp.value);
+  }
+
+  void find_enclosing_loop(Initializer &init, const Targets *loop) {
+    std::visit(
+        Overload{
+            [&](SingleInit &single) {
+              find_enclosing_loop(single.exp, loop);
+            },
+            [&](CompoundInit &compound) {
+              for (auto &child : compound.initializers)
+                find_enclosing_loop(child, loop);
+            }},
+        init.value);
   }
 
   void find_enclosing_loop(ForInit &init, const Targets *loop) {

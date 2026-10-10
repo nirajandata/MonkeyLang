@@ -15,30 +15,44 @@ export {
     using Ts::operator()...;
   };
 
-  enum class TypeKind { Int, Long, UInt, ULong, Double, Function, Pointer };
+  enum class TypeKind {
+    Int,
+    Long,
+    UInt,
+    ULong,
+    Double,
+    Function,
+    Pointer,
+    Array
+  };
 
   struct Type {
     TypeKind kind = TypeKind::Int;
     std::vector<Type> params;
     std::shared_ptr<Type> ret;
     std::shared_ptr<Type> referenced;
+    size_t size = 0;
 
     static Type int_type() { return {}; }
-    static Type long_type() { return {TypeKind::Long, {}, nullptr, nullptr}; }
-    static Type uint_type() { return {TypeKind::UInt, {}, nullptr, nullptr}; }
-    static Type ulong_type() { return {TypeKind::ULong, {}, nullptr, nullptr}; }
-    static Type double_type() { return {TypeKind::Double, {}, nullptr, nullptr}; }
+    static Type long_type() { return {TypeKind::Long, {}, nullptr, nullptr, 0}; }
+    static Type uint_type() { return {TypeKind::UInt, {}, nullptr, nullptr, 0}; }
+    static Type ulong_type() { return {TypeKind::ULong, {}, nullptr, nullptr, 0}; }
+    static Type double_type() { return {TypeKind::Double, {}, nullptr, nullptr, 0}; }
     static Type function(std::vector<Type> params, Type ret) {
       return {TypeKind::Function, std::move(params),
-              std::make_shared<Type>(std::move(ret)), nullptr};
+              std::make_shared<Type>(std::move(ret)), nullptr, 0};
     }
     static Type pointer(Type referenced) {
       return {TypeKind::Pointer, {},
-              nullptr, std::make_shared<Type>(std::move(referenced))};
+              nullptr, std::make_shared<Type>(std::move(referenced)), 0};
+    }
+    static Type array(Type element, size_t size) {
+      return {TypeKind::Array, {},
+              nullptr, std::make_shared<Type>(std::move(element)), size};
     }
 
     friend bool operator==(const Type &a, const Type &b) {
-      if (a.kind != b.kind || a.params != b.params ||
+      if (a.kind != b.kind || a.params != b.params || a.size != b.size ||
           static_cast<bool>(a.ret) != static_cast<bool>(b.ret) ||
           static_cast<bool>(a.referenced) != static_cast<bool>(b.referenced))
         return false;
@@ -92,8 +106,13 @@ export {
     double value;
   };
 
+  struct ZeroInit {
+    size_t bytes;
+  };
+
   using StaticInit =
-      std::variant<IntInit, LongInit, UIntInit, ULongInit, DoubleInit>;
+      std::variant<IntInit, LongInit, UIntInit, ULongInit, DoubleInit,
+                   ZeroInit>;
 
   struct Complement {};
 
@@ -229,10 +248,28 @@ export {
     uint32_t line;
   };
 
+  struct Subscript {
+    std::unique_ptr<Exp> left;
+    std::unique_ptr<Exp> right;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble, Var,
                  Cast, Unary, Binary, Assignment, CompoundAssignment, IncDec,
-                 Conditional, FunctionCall, Dereference, AddrOf> value;
+                 Conditional, FunctionCall, Dereference, AddrOf, Subscript> value;
+    Type type;
+  };
+
+  struct Initializer;
+  struct SingleInit {
+    Exp exp;
+  };
+  struct CompoundInit {
+    std::vector<Initializer> initializers;
+  };
+  struct Initializer {
+    std::variant<SingleInit, CompoundInit> value;
     Type type;
   };
 
@@ -303,7 +340,7 @@ export {
 
   struct VariableDeclaration {
     std::string name;
-    std::optional<Exp> init;
+    std::optional<Initializer> init;
     uint32_t line;
     std::optional<StorageClass> storage_class;
     Type var_type;

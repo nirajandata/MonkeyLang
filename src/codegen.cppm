@@ -33,10 +33,18 @@ export {
   struct Imm { int64_t value; };
   struct Pseudo { std::string name; };
   struct Stack { int offset; };
-  struct Data { std::string name; bool constant = false; };
+  struct Data {
+    std::string name;
+    bool constant = false;
+    int offset = 0;
+  };
   struct Indirect { RegId base; };
+  struct PseudoMem { std::string name; int offset; };
+  struct Indexed { RegId base; RegId index; int scale; };
 
-  using Operand = std::variant<Imm, Reg, Pseudo, Stack, Data, Indirect>;
+  using Operand =
+      std::variant<Imm, Reg, Pseudo, Stack, Data, Indirect, PseudoMem,
+                   Indexed>;
 
   struct Mov {
     AsmType type;
@@ -117,7 +125,7 @@ export {
     std::string name;
     bool global;
     Type type;
-    StaticInit init;
+    std::vector<StaticInit> init;
   };
 
   using AsmTopLevel =
@@ -159,7 +167,12 @@ static Operand nir_val_to_operand(const NirVal &val,
               }},
           c);
     },
-    [](const NirVar &v) -> Operand { return Pseudo{v.name}; }
+    [](const NirVar &v) -> Operand {
+      if (const Symbol *symbol = symbol_table().find(v.name);
+          symbol && symbol->type.kind == TypeKind::Array)
+        return PseudoMem{v.name, 0};
+      return Pseudo{v.name};
+    }
   }, val);
 }
 
@@ -205,7 +218,9 @@ static Operand param_source(size_t index) {
 
 static bool is_memory(const Operand &o) {
   return std::holds_alternative<Stack>(o) || std::holds_alternative<Data>(o) ||
-         std::holds_alternative<Indirect>(o);
+         std::holds_alternative<Indirect>(o) ||
+         std::holds_alternative<PseudoMem>(o) ||
+         std::holds_alternative<Indexed>(o);
 }
 
 static void track_stack(const Operand &o, int &stack_bytes) {
@@ -594,6 +609,30 @@ static AsmFunction nir_to_asm(const NirFunction &func,
         [&](const NirGetAddress &a) {
           instructions.push_back(Lea{op(a.src), op(a.dst)});
         },
+        [&](const NirAddPtr &a) {
+          const Type index_type = type_of(a.index);
+          instructions.push_back(
+              Mov{AsmType::Quadword, op(a.pointer), Reg{RegId::AX}});
+          if (index_type.kind == TypeKind::Int) {
+            instructions.push_back(Movsx{op(a.index), Reg{RegId::DX}});
+          } else if (index_type.kind == TypeKind::UInt) {
+            instructions.push_back(Movzx{op(a.index), Reg{RegId::DX}});
+          } else {
+            instructions.push_back(
+                Mov{AsmType::Quadword, op(a.index), Reg{RegId::DX}});
+          }
+          if (a.scale != 1)
+            instructions.push_back(Imull{
+                AsmType::Quadword, Imm{static_cast<int64_t>(a.scale)},
+                Reg{RegId::DX}});
+          instructions.push_back(Lea{
+              Indexed{RegId::AX, RegId::DX, 1}, op(a.dst)});
+        },
+        [&](const NirCopyToOffset &c) {
+          instructions.push_back(Mov{
+              asm_type(type_of(c.src)), op(c.src), PseudoMem{c.dst,
+                                                              static_cast<int>(c.offset)}});
+        },
         [&](const NirLoad &l) {
           const Type loaded_type = type_of(l.dst);
           instructions.push_back(
@@ -685,6 +724,41 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
       next_offset -= 4;
     }
     return offsets[p->name] = next_offset, Stack{next_offset};
+  }
+  if (auto *p = std::get_if<PseudoMem>(&o)) {
+    if (const Symbol *symbol = symbol_table().find(p->name)) {
+      if (std::holds_alternative<Symbol::StaticAttr>(symbol->attrs))
+        return Data{p->name, false, p->offset};
+      auto [it, inserted] = offsets.try_emplace(p->name, 0);
+      if (inserted) {
+        const auto size_of = [](const auto &self, const Type &type) -> int {
+          switch (type.kind) {
+            case TypeKind::Int:
+            case TypeKind::UInt: return 4;
+            case TypeKind::Long:
+            case TypeKind::ULong:
+            case TypeKind::Double:
+            case TypeKind::Pointer: return 8;
+            case TypeKind::Array:
+              return type.referenced
+                         ? static_cast<int>(
+                               type.size * self(self, *type.referenced))
+                         : 0;
+            case TypeKind::Function: return 0;
+          }
+          std::unreachable();
+        };
+        const auto alignment_of = [](const Type &type) {
+          if (type.kind != TypeKind::Array || !type.referenced) return 4;
+          return 16;
+        };
+        const int size = size_of(size_of, symbol->type);
+        const int alignment = static_cast<int>(alignment_of(symbol->type));
+        next_offset = (next_offset - size) & -alignment;
+        it->second = next_offset;
+      }
+      return Stack{it->second + p->offset};
+    }
   }
   return o;
 }
@@ -995,14 +1069,24 @@ static std::string operand_str(const Operand &o,
       [](const Stack &s) { return std::to_string(s.offset) + "(%rbp)"; },
       [](const Indirect &i) { return "(" + reg_q_str(i.base) + ")"; },
       [](const Data &d) {
-        if (!d.constant) return platform_prefix() + d.name + "(%rip)";
+        const std::string offset = d.offset == 0
+                                       ? ""
+                                       : (d.offset > 0 ? "+" : "") +
+                                             std::to_string(d.offset);
+        if (!d.constant)
+          return platform_prefix() + d.name + offset + "(%rip)";
 #if defined(__APPLE__)
-        return d.name + "(%rip)";
+        return d.name + offset + "(%rip)";
 #else
-        return "." + d.name + "(%rip)";
+        return "." + d.name + offset + "(%rip)";
 #endif
       },
-      [](const Pseudo &) -> std::string { std::unreachable(); }
+      [](const Indexed &i) {
+        return "(" + reg_q_str(i.base) + ", " + reg_q_str(i.index) + ", " +
+               std::to_string(i.scale) + ")";
+      },
+      [](const Pseudo &) -> std::string { std::unreachable(); },
+      [](const PseudoMem &) -> std::string { std::unreachable(); }
     }, o);
 }
 
@@ -1047,9 +1131,17 @@ static std::string operand_byte_str(const Operand &o) {
         std::unreachable();
       },
       [](const Stack &s) { return std::to_string(s.offset) + "(%rbp)"; },
-      [](const Data &d) { return platform_prefix() + d.name + "(%rip)"; },
+      [](const Data &d) {
+        return platform_prefix() + d.name +
+               (d.offset ? (d.offset > 0 ? "+" : "") +
+                               std::to_string(d.offset)
+                         : "") +
+               "(%rip)";
+      },
       [](const Indirect &) -> std::string { std::unreachable(); },
-      [](const Pseudo &) -> std::string { std::unreachable(); }
+      [](const Pseudo &) -> std::string { std::unreachable(); },
+      [](const PseudoMem &) -> std::string { std::unreachable(); },
+      [](const Indexed &) -> std::string { std::unreachable(); }
   }, o);
 }
 
@@ -1085,6 +1177,33 @@ static std::string_view suffix(AsmType type) {
     case AsmType::Double: return "sd";
   }
   std::unreachable();
+}
+
+static size_t type_size(const Type &type) {
+  switch (type.kind) {
+    case TypeKind::Int:
+    case TypeKind::UInt: return 4;
+    case TypeKind::Long:
+    case TypeKind::ULong:
+    case TypeKind::Double:
+    case TypeKind::Pointer: return 8;
+    case TypeKind::Array:
+      return type.referenced ? type.size * type_size(*type.referenced) : 0;
+    case TypeKind::Function: return 0;
+  }
+  std::unreachable();
+}
+
+static size_t type_alignment(const Type &type) {
+  if (type.kind == TypeKind::Array) {
+    const size_t size = type_size(type);
+    if (size >= 16) return 16;
+    return type.referenced ? type_alignment(*type.referenced) : 1;
+  }
+  return type.kind == TypeKind::Long || type.kind == TypeKind::ULong ||
+                 type.kind == TypeKind::Double || type.kind == TypeKind::Pointer
+             ? 8
+             : 4;
 }
 
 export void emit_asm(const AsmProgram &program, std::string &output) {
@@ -1345,46 +1464,50 @@ export void emit_asm(const AsmProgram &program, std::string &output) {
             },
             [&](const AsmStaticVariable &variable) {
               const std::string name = prefix + variable.name;
-              const bool zero = variable.type.kind != TypeKind::Double &&
-                  std::visit([](const auto &init) { return init.value == 0; },
-                             variable.init);
-              const bool is_long = variable.type.kind == TypeKind::Long ||
-                                   variable.type.kind == TypeKind::ULong ||
-                                   variable.type.kind == TypeKind::Pointer ||
-                                   variable.type.kind == TypeKind::Double;
+              const bool zero = !variable.init.empty() &&
+                  std::all_of(variable.init.begin(), variable.init.end(),
+                              [](const StaticInit &init) {
+                                return std::holds_alternative<ZeroInit>(init);
+                              });
               if (variable.global) output += "    .globl " + name + "\n";
               output += zero ? "    .bss\n" : "    .data\n";
-              const int alignment = is_long ? 8 : 4;
+              const size_t alignment = type_alignment(variable.type);
 #if defined(__linux__)
               output += "    .align " + std::to_string(alignment) + "\n";
 #else
               output += "    .balign " + std::to_string(alignment) + "\n";
 #endif
               output += name + ":\n";
-              if (zero)
-                output += is_long ? "    .zero 8\n" : "    .zero 4\n";
-              else {
-                const std::string value = std::visit(
+              for (const auto &init : variable.init) {
+                std::visit(
                     Overload{
-                        [](const IntInit &init) {
-                          return std::to_string(init.value);
+                        [&](const IntInit &value) {
+                          output += "    .long " +
+                                    std::to_string(value.value) + "\n";
                         },
-                        [](const LongInit &init) {
-                          return std::to_string(init.value);
+                        [&](const LongInit &value) {
+                          output += "    .quad " +
+                                    std::to_string(value.value) + "\n";
                         },
-                        [](const UIntInit &init) {
-                          return std::to_string(init.value);
+                        [&](const UIntInit &value) {
+                          output += "    .long " +
+                                    std::to_string(value.value) + "\n";
                         },
-                        [](const ULongInit &init) {
-                          return std::to_string(init.value);
+                        [&](const ULongInit &value) {
+                          output += "    .quad " +
+                                    std::to_string(value.value) + "\n";
                         },
-                        [](const DoubleInit &init) {
-                          return std::to_string(
-                              std::bit_cast<uint64_t>(init.value));
+                        [&](const DoubleInit &value) {
+                          output += "    .quad " +
+                                    std::to_string(
+                                        std::bit_cast<uint64_t>(value.value)) +
+                                    "\n";
+                        },
+                        [&](const ZeroInit &value) {
+                          output += "    .zero " +
+                                    std::to_string(value.bytes) + "\n";
                         }},
-                    variable.init);
-                output += (is_long ? "    .quad " : "    .long ") + value +
-                          "\n";
+                    init);
               }
             },
             [&](const AsmStaticConstant &constant) {

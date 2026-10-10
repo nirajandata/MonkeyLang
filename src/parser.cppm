@@ -79,10 +79,11 @@ export class Parser {
     std::unique_ptr<Declarator> declarator;
   };
   struct Declarator {
-    enum class Kind { Identifier, Pointer, Function } kind;
+    enum class Kind { Identifier, Pointer, Function, Array } kind;
     std::string name;
     std::unique_ptr<Declarator> inner;
     std::vector<ParameterSyntax> params;
+    size_t array_size = 0;
   };
   struct ProcessedDeclarator {
     std::string name;
@@ -199,6 +200,24 @@ export class Parser {
     return {std::string(name_tok.text), std::move(args), name_tok.line};
   }
 
+  Initializer parse_initializer() {
+    if (!match(TokenType::LBrace))
+      return Initializer{SingleInit{parse_exp(0)}, {}};
+
+    std::vector<Initializer> initializers;
+    if (!check(TokenType::RBrace)) {
+      do {
+        initializers.push_back(parse_initializer());
+      } while (match(TokenType::Comma) && !check(TokenType::RBrace));
+    }
+    expect(TokenType::RBrace, "\"}\"");
+    if (initializers.empty()) {
+      std::println("error:{}: Empty initializer list", peek().line);
+      had_error_ = true;
+    }
+    return Initializer{CompoundInit{std::move(initializers)}, {}};
+  }
+
   Exp parse_primary() {
     auto tok = peek();
 
@@ -252,7 +271,8 @@ export class Parser {
             check(TokenType::Signed) || check(TokenType::Unsigned) ||
             check(TokenType::Double)) {
           Type target_type = parse_type_specifiers();
-          if (check(TokenType::Multiply) || check(TokenType::LParen))
+          if (check(TokenType::Multiply) || check(TokenType::LParen) ||
+              check(TokenType::LBracket))
             target_type = process_abstract_declarator(
                 parse_abstract_declarator(), std::move(target_type));
           expect(TokenType::RParen, "\")\"");
@@ -274,7 +294,16 @@ export class Parser {
 
   Exp parse_postfix() {
     auto exp = parse_primary();
-    while (check(TokenType::Increment) || check(TokenType::Decrement)) {
+    while (check(TokenType::Increment) || check(TokenType::Decrement) ||
+           check(TokenType::LBracket)) {
+      if (match(TokenType::LBracket)) {
+        const uint32_t line = peek().line;
+        auto index = parse_exp(0);
+        expect(TokenType::RBracket, "\"]\"");
+        exp = Exp{Subscript{std::make_unique<Exp>(std::move(exp)),
+                           std::make_unique<Exp>(std::move(index)), line}};
+        continue;
+      }
       auto tok = advance();
       exp = Exp{IncDec{inc_dec_op(tok.type),
                         std::make_unique<Exp>(std::move(exp)), true, tok.line}};
@@ -596,6 +625,7 @@ export class Parser {
       ++pointer_count;
 
     std::unique_ptr<Declarator> result;
+    bool parenthesized = false;
     if (check(TokenType::Identifier)) {
       result = std::make_unique<Declarator>(
           Declarator{Declarator::Kind::Identifier, parse_identifier(), {},
@@ -603,6 +633,7 @@ export class Parser {
     } else if (match(TokenType::LParen)) {
       result = parse_declarator();
       expect(TokenType::RParen, "\")\"");
+      parenthesized = true;
     } else {
       std::println("error:{}: Expected declarator but found '{}'",
                    peek().line, peek().text);
@@ -611,7 +642,8 @@ export class Parser {
           Declarator{Declarator::Kind::Identifier, "__error", {}, {}});
     }
 
-    if (match(TokenType::LParen)) {
+    while (true) {
+      if (match(TokenType::LParen)) {
       std::vector<ParameterSyntax> params;
       if (!match(TokenType::Void)) {
         if (!check(TokenType::RParen)) {
@@ -628,9 +660,77 @@ export class Parser {
         }
       }
       expect(TokenType::RParen, "\")\"");
+      if (result->kind == Declarator::Kind::Array) {
+        std::println("error:{}: Invalid combination of array and function declarators",
+                     peek().line);
+        had_error_ = true;
+      }
       result = std::make_unique<Declarator>(Declarator{
           Declarator::Kind::Function, {}, std::move(result),
           std::move(params)});
+      parenthesized = false;
+      } else if (match(TokenType::LBracket)) {
+        const Token size_token = peek();
+        size_t array_size = 0;
+        if (size_token.type == TokenType::FloatingConstant) {
+          std::println("error:{}: Array size must be an integer constant",
+                       size_token.line);
+          had_error_ = true;
+          advance();
+        } else if (size_token.type == TokenType::Constant ||
+                   size_token.type == TokenType::LongConstant ||
+                   size_token.type == TokenType::UnsignedConstant ||
+                   size_token.type == TokenType::UnsignedLongConstant) {
+          Exp constant = parse_constant();
+          std::visit(
+              Overload{
+                  [&](const ConstInt &value) {
+                    array_size = static_cast<size_t>(value.value);
+                  },
+                  [&](const ConstLong &value) {
+                    if (value.value < 0 ||
+                        static_cast<uint64_t>(value.value) >
+                            std::numeric_limits<size_t>::max()) {
+                      had_error_ = true;
+                    } else {
+                      array_size = static_cast<size_t>(value.value);
+                    }
+                  },
+                  [&](const ConstUInt &value) { array_size = value.value; },
+                  [&](const ConstULong &value) {
+                    if (value.value > std::numeric_limits<size_t>::max())
+                      had_error_ = true;
+                    else
+                      array_size = static_cast<size_t>(value.value);
+                  },
+                  [&](const auto &) { std::unreachable(); }},
+              constant.value);
+          if (std::holds_alternative<ConstInt>(constant.value) &&
+              std::get<ConstInt>(constant.value).value < 0) {
+            had_error_ = true;
+          } else if (std::holds_alternative<ConstUInt>(constant.value) &&
+                     std::get<ConstUInt>(constant.value).value == 0) {
+            had_error_ = true;
+          }
+        } else {
+          std::println("error:{}: Expected integer array size but found '{}'",
+                       size_token.line, size_token.text);
+          had_error_ = true;
+          if (!check(TokenType::RBracket) && !check(TokenType::Eof))
+            advance();
+        }
+        expect(TokenType::RBracket, "\"]\"");
+        if (result->kind == Declarator::Kind::Function && !parenthesized) {
+          std::println("error:{}: Invalid combination of array and function declarators",
+                       peek().line);
+          had_error_ = true;
+        }
+        result = std::make_unique<Declarator>(Declarator{
+            Declarator::Kind::Array, {}, std::move(result), {}, array_size});
+        parenthesized = false;
+      } else {
+        break;
+      }
     }
 
     while (pointer_count-- > 0) {
@@ -653,6 +753,10 @@ export class Parser {
         }
         return process_declarator(*declarator.inner,
                                   Type::pointer(std::move(base_type)));
+      case Declarator::Kind::Array:
+        return process_declarator(
+            *declarator.inner,
+            Type::array(std::move(base_type), declarator.array_size));
       case Declarator::Kind::Function: {
         if (declarator.inner->kind != Declarator::Kind::Identifier) {
           std::println("error:{}: Function pointers and functions returning functions are not supported",
@@ -682,26 +786,79 @@ export class Parser {
   }
 
   struct AbstractDeclarator {
-    size_t pointer_count = 0;
+    enum class Kind { Base, Pointer, Array } kind = Kind::Base;
+    std::unique_ptr<AbstractDeclarator> inner;
+    size_t array_size = 0;
   };
 
   AbstractDeclarator parse_abstract_declarator() {
-    AbstractDeclarator result;
+    size_t pointer_count = 0;
     while (match(TokenType::Multiply))
-      ++result.pointer_count;
+      ++pointer_count;
+
+    AbstractDeclarator result;
     if (match(TokenType::LParen)) {
-      auto nested = parse_abstract_declarator();
+      result = parse_abstract_declarator();
       expect(TokenType::RParen, "\")\"");
-      result.pointer_count += nested.pointer_count;
     }
+    while (match(TokenType::LBracket)) {
+      const Token size_token = peek();
+      Exp constant = parse_constant();
+      size_t array_size = 0;
+      std::visit(
+          Overload{
+              [&](const ConstInt &value) {
+                if (value.value < 0)
+                  had_error_ = true;
+                else
+                  array_size = static_cast<size_t>(value.value);
+              },
+              [&](const ConstLong &value) {
+                if (value.value < 0)
+                  had_error_ = true;
+                else
+                  array_size = static_cast<size_t>(value.value);
+              },
+              [&](const ConstUInt &value) { array_size = value.value; },
+              [&](const ConstULong &value) {
+                if (value.value > std::numeric_limits<size_t>::max())
+                  had_error_ = true;
+                else
+                  array_size = static_cast<size_t>(value.value);
+              },
+              [&](const auto &) {
+                std::println("error:{}: Array size must be an integer constant",
+                             size_token.line);
+                had_error_ = true;
+              }},
+          constant.value);
+      expect(TokenType::RBracket, "\"]\"");
+      result = AbstractDeclarator{
+          AbstractDeclarator::Kind::Array,
+          std::make_unique<AbstractDeclarator>(std::move(result)), array_size};
+    }
+    while (pointer_count-- > 0)
+      result = AbstractDeclarator{AbstractDeclarator::Kind::Pointer,
+                                  std::make_unique<AbstractDeclarator>(
+                                      std::move(result)),
+                                  0};
     return result;
   }
 
   static Type process_abstract_declarator(AbstractDeclarator declarator,
                                           Type base_type) {
-    while (declarator.pointer_count-- > 0)
-      base_type = Type::pointer(std::move(base_type));
-    return base_type;
+    switch (declarator.kind) {
+      case AbstractDeclarator::Kind::Base: return base_type;
+      case AbstractDeclarator::Kind::Pointer:
+        return process_abstract_declarator(
+            std::move(*declarator.inner),
+            Type::pointer(std::move(base_type)));
+      case AbstractDeclarator::Kind::Array:
+        return process_abstract_declarator(
+            std::move(*declarator.inner),
+            Type::array(std::move(base_type), declarator.array_size));
+    }
+    std::unreachable();
   }
 
   std::pair<Type, std::optional<StorageClass>> parse_specifiers() {
@@ -754,8 +911,8 @@ export class Parser {
           std::move(processed.type)}};
     }
 
-    std::optional<Exp> init;
-    if (match(TokenType::Assign)) init = parse_exp(0);
+    std::optional<Initializer> init;
+    if (match(TokenType::Assign)) init = parse_initializer();
     expect(TokenType::Semicolon, "\";\"");
     return VarDecl{VariableDeclaration{
         std::move(processed.name), std::move(init), line,

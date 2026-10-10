@@ -515,6 +515,12 @@ public:
         case '}':
           emit(TokenType::RBrace, 1);
           break;
+        case '[':
+          emit(TokenType::LBracket, 1);
+          break;
+        case ']':
+          emit(TokenType::RBracket, 1);
+          break;
         case ';':
           emit(TokenType::Semicolon, 1);
           break;

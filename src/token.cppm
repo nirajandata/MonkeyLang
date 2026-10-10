@@ -15,6 +15,8 @@ export enum class TokenType : uint32_t {
   RParen,
   LBrace,
   RBrace,
+  LBracket,
+  RBracket,
   Semicolon,
   Divide,
   Complement,

@@ -96,6 +96,17 @@ export {
     NirVal src;
     NirVal dst;
   };
+  struct NirAddPtr {
+    NirVal pointer;
+    NirVal index;
+    size_t scale;
+    NirVal dst;
+  };
+  struct NirCopyToOffset {
+    NirVal src;
+    std::string dst;
+    size_t offset;
+  };
   struct NirLoad {
     NirVal pointer;
     NirVal dst;
@@ -133,7 +144,7 @@ export {
       std::variant<NirReturn, NirSignExtend, NirTruncate, NirZeroExtend,
                    NirDoubleToInt, NirDoubleToUInt, NirIntToDouble,
                    NirUIntToDouble, NirUnary, NirBinary, NirCopy, NirGetAddress,
-                   NirLoad, NirStore, NirJump,
+                   NirAddPtr, NirCopyToOffset, NirLoad, NirStore, NirJump,
                    NirJumpIfZero, NirJumpIfNotZero, NirJumpIfNotEqual,
                    NirLabel, NirCall>;
 
@@ -147,7 +158,7 @@ export {
     std::string name;
     bool global;
     Type type;
-    StaticInit init;
+    std::vector<StaticInit> init;
   };
   using NirTopLevel = std::variant<NirFunction, NirStaticVariable>;
   struct NirProgram {
@@ -174,6 +185,21 @@ consteval TargetEnum reflect_to_enum() {
 }
 
 class NirEmitter {
+  static size_t type_size(const Type &type) {
+    switch (type.kind) {
+      case TypeKind::Int:
+      case TypeKind::UInt: return 4;
+      case TypeKind::Long:
+      case TypeKind::ULong:
+      case TypeKind::Double:
+      case TypeKind::Pointer: return 8;
+      case TypeKind::Array:
+        return type.referenced ? type.size * type_size(*type.referenced) : 0;
+      case TypeKind::Function: return 0;
+    }
+    std::unreachable();
+  }
+
   NirVar make_tacky_variable(const Type &type) {
     std::string name = "tmp." + std::to_string(next_name_id());
     symbol_table().add(name, type, Symbol::LocalAttr{});
@@ -421,12 +447,67 @@ class NirEmitter {
                          } else if constexpr (std::is_same_v<OpType, Or>) {
                            return emit_or(b, instructions);
                          } else {
+                           const bool left_pointer =
+                               b.left->type.kind == TypeKind::Pointer;
+                           const bool right_pointer =
+                               b.right->type.kind == TypeKind::Pointer;
                            auto left =
                                emit_val_and_convert(*b.left, instructions);
                            auto right =
                                emit_val_and_convert(*b.right, instructions);
                            NirVal dst = make_tacky_variable(exp.type);
 
+                           if constexpr (std::is_same_v<OpType, Add> ||
+                                         std::is_same_v<OpType, Subtract>) {
+                             if (left_pointer &&
+                                 (!right_pointer ||
+                                  std::is_same_v<OpType, Add>)) {
+                               NirVal index = std::move(right);
+                               if constexpr (std::is_same_v<OpType,
+                                                             Subtract>) {
+                                 NirVal negated =
+                                     make_tacky_variable(Type::long_type());
+                                 instructions.push_back(NirUnary{
+                                     NirUnaryOp::Negate, index, negated});
+                                 index = std::move(negated);
+                               }
+                               instructions.push_back(NirAddPtr{
+                                   std::move(left), std::move(index),
+                                   type_size(*b.left->type.referenced), dst});
+                               return dst;
+                             }
+                             if constexpr (std::is_same_v<OpType, Add>) {
+                               if (right_pointer) {
+                                 instructions.push_back(NirAddPtr{
+                                     std::move(right), std::move(left),
+                                     type_size(*b.right->type.referenced),
+                                     dst});
+                                 return dst;
+                               }
+                             }
+                             if constexpr (std::is_same_v<OpType, Subtract>) {
+                               if (left_pointer && right_pointer) {
+                                 NirVal byte_difference =
+                                     make_tacky_variable(Type::long_type());
+                                 instructions.push_back(NirBinary{
+                                     NirBinaryOp::Subtract, left, right,
+                                     byte_difference});
+                                 const size_t scale =
+                                     type_size(*b.left->type.referenced);
+                                 if (scale == 1) {
+                                   instructions.push_back(
+                                       NirCopy{byte_difference, dst});
+                                 } else {
+                                   instructions.push_back(NirBinary{
+                                       NirBinaryOp::Divide, byte_difference,
+                                       NirConstant{ConstLong{
+                                           static_cast<int64_t>(scale), 0}},
+                                       dst});
+                                 }
+                                 return dst;
+                               }
+                             }
+                           }
                            instructions.push_back(NirBinary{
                             reflect_to_enum<OpType, NirBinaryOp>(),
                             std::move(left), std::move(right), dst});
@@ -467,6 +548,25 @@ class NirEmitter {
                     instructions.push_back(
                         NirGetAddress{std::get<NirVal>(object), dst});
                     return dst;
+                  },
+
+                  [&](const Subscript &s) -> NirExpResult {
+                    const bool left_is_pointer =
+                        s.left->type.kind == TypeKind::Pointer;
+                    const Exp &pointer_exp =
+                        left_is_pointer ? *s.left : *s.right;
+                    const Exp &index_exp =
+                        left_is_pointer ? *s.right : *s.left;
+                    auto pointer =
+                        emit_val_and_convert(pointer_exp, instructions);
+                    auto index =
+                        emit_val_and_convert(index_exp, instructions);
+                    auto dst = NirVal{make_tacky_variable(
+                        Type::pointer(exp.type))};
+                    instructions.push_back(NirAddPtr{
+                        std::move(pointer), std::move(index),
+                        type_size(exp.type), dst});
+                    return NirDereferencedPointer{std::move(dst)};
                   }},
          exp.value);
   }
@@ -608,8 +708,30 @@ class NirEmitter {
   void emit_variable_declaration(const VariableDeclaration &d,
                                  std::vector<NirInstruction> &instructions) {
     if (d.storage_class || !d.init) return;
-    auto val = emit_val_and_convert(*d.init, instructions);
-    instructions.push_back(NirCopy{std::move(val), NirVar{d.name}});
+    auto emit_init = [&](auto &&self, const Initializer &init, size_t offset,
+                         const Type &type) -> void {
+      std::visit(
+          Overload{
+              [&](const SingleInit &single) {
+                auto val = emit_val_and_convert(single.exp, instructions);
+                if (type.kind == TypeKind::Array) return;
+                if (d.var_type.kind != TypeKind::Array)
+                  instructions.push_back(
+                      NirCopy{std::move(val), NirVar{d.name}});
+                else
+                  instructions.push_back(
+                      NirCopyToOffset{std::move(val), d.name, offset});
+              },
+              [&](const CompoundInit &compound) {
+                if (!type.referenced) return;
+                const size_t element_size = type_size(*type.referenced);
+                for (size_t i = 0; i < compound.initializers.size(); ++i)
+                  self(self, compound.initializers[i],
+                       offset + i * element_size, *type.referenced);
+              }},
+          init.value);
+    };
+    emit_init(emit_init, *d.init, 0, d.var_type);
   }
 
   void emit_for_init(const ForInit &init,
@@ -680,33 +802,29 @@ public:
       if (const auto *attrs = std::get_if<Symbol::StaticAttr>(&symbol.attrs)) {
         if (attrs->init.kind == Symbol::InitialValue::Kind::NoInitializer)
           continue;
-        const uint64_t initial_value =
-            attrs->init.kind == Symbol::InitialValue::Kind::Initial
-                ? attrs->init.value
-                : 0;
-        StaticInit init;
-        switch (symbol.type.kind) {
-          case TypeKind::Int:
-            init = IntInit{static_cast<int32_t>(initial_value)};
-            break;
-          case TypeKind::Long:
-            init = LongInit{static_cast<int64_t>(initial_value)};
-            break;
-          case TypeKind::UInt:
-            init = UIntInit{static_cast<uint32_t>(initial_value)};
-            break;
-          case TypeKind::ULong:
-          case TypeKind::Pointer:
-            init = ULongInit{initial_value};
-            break;
-          case TypeKind::Double:
-            init = DoubleInit{attrs->init.is_double
-                                  ? attrs->init.double_value
-                                  : static_cast<double>(initial_value)};
-            break;
-          case TypeKind::Function:
-            init = IntInit{0};
-            break;
+        std::vector<StaticInit> init = attrs->init.values;
+        const auto type_size = [](const auto &self, const Type &type) -> size_t {
+          switch (type.kind) {
+            case TypeKind::Int:
+            case TypeKind::UInt: return 4;
+            case TypeKind::Long:
+            case TypeKind::ULong:
+            case TypeKind::Double:
+            case TypeKind::Pointer: return 8;
+            case TypeKind::Array:
+              return type.referenced
+                         ? type.size * self(self, *type.referenced)
+                         : 0;
+            case TypeKind::Function: return 0;
+          }
+          std::unreachable();
+        };
+        if (init.empty())
+          init.push_back(ZeroInit{type_size(type_size, symbol.type)});
+        if (symbol.type.kind == TypeKind::Array) {
+          top_levels.push_back(NirStaticVariable{
+              name, attrs->global, symbol.type, std::move(init)});
+          continue;
         }
         top_levels.push_back(NirStaticVariable{
             name, attrs->global, symbol.type, std::move(init)});

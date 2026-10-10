@@ -72,7 +72,7 @@ vcpkg_installed/
 Testing/
 .cache/
 
-#Docs
+#benchmark docs
 *.jpeg
 *.jpg
 *.lex

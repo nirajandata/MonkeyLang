@@ -10,6 +10,7 @@ export enum class TokenType : uint32_t {
   Constant,
   Int,
   Void,
+  Sizeof,
   Return,
   LParen,
   RParen,

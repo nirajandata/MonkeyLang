@@ -2,6 +2,7 @@ module;
 
 #include <cstdint>
 #include <meta>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -47,7 +48,7 @@ export {
   };
 
   struct NirReturn {
-    NirVal val;
+    std::optional<NirVal> val;
   };
   struct NirSignExtend {
     NirVal src;
@@ -137,7 +138,7 @@ export {
   struct NirCall {
     std::string name;
     std::vector<NirVal> args;
-    NirVal dst;
+    std::optional<NirVal> dst;
   };
 
   using NirInstruction =
@@ -198,6 +199,7 @@ class NirEmitter {
       case TypeKind::Pointer: return 8;
       case TypeKind::Array:
         return type.referenced ? type.size * type_size(*type.referenced) : 0;
+      case TypeKind::Void:
       case TypeKind::Function: return 0;
     }
     std::unreachable();
@@ -257,7 +259,6 @@ class NirEmitter {
 
   NirVal emit_conditional(const Conditional &c, const Type &type,
                           std::vector<NirInstruction> &instructions) {
-    NirVal dst = make_tacky_variable(type);
     auto then_label = make_label("then");
     auto else_label = make_label("else");
     auto end_label = make_label("end");
@@ -265,6 +266,17 @@ class NirEmitter {
     auto condition = emit_val_and_convert(*c.condition, instructions);
     instructions.push_back(NirJumpIfZero{std::move(condition), else_label});
 
+    if (type.kind == TypeKind::Void) {
+      emit_val_and_convert(*c.then_exp, instructions);
+      instructions.push_back(NirJump{end_label});
+      instructions.push_back(NirLabel{else_label});
+      emit_val_and_convert(*c.else_exp, instructions);
+      instructions.push_back(NirLabel{then_label});
+      instructions.push_back(NirLabel{end_label});
+      return NirConstant{ConstInt{0, 0}};
+    }
+
+    NirVal dst = make_tacky_variable(type);
     auto then_val = emit_val_and_convert(*c.then_exp, instructions);
     instructions.push_back(NirCopy{std::move(then_val), dst});
     instructions.push_back(NirJump{end_label});
@@ -305,8 +317,20 @@ class NirEmitter {
                    return NirVar{s.name};
                  },
 
+                 [&](const SizeOfT &s) -> NirExpResult {
+                   return NirConstant{ConstULong{
+                       static_cast<uint64_t>(type_size(s.target_type)), s.line}};
+                 },
+
+                 [&](const SizeOf &s) -> NirExpResult {
+                   return NirConstant{ConstULong{
+                       static_cast<uint64_t>(type_size(s.exp->type)), s.line}};
+                 },
+
                  [&](const Cast &c) -> NirExpResult {
                    NirVal src = emit_val_and_convert(*c.exp, instructions);
+                   if (c.target_type.kind == TypeKind::Void)
+                     return NirConstant{ConstInt{0, 0}};
                    if (c.target_type == c.exp->type) return src;
                    NirVar dst = make_tacky_variable(c.target_type);
                    if (c.target_type.kind == TypeKind::Double) {
@@ -546,18 +570,23 @@ class NirEmitter {
                     return emit_conditional(c, exp.type, instructions);
                   },
 
-                  [&](const FunctionCall &c) -> NirExpResult {
-                    std::vector<NirVal> args;
-                    args.reserve(c.args.size());
-                    for (const auto &arg : c.args)
-                      args.push_back(
-                          emit_val_and_convert(*arg, instructions));
+                 [&](const FunctionCall &c) -> NirExpResult {
+                   std::vector<NirVal> args;
+                   args.reserve(c.args.size());
+                   for (const auto &arg : c.args)
+                     args.push_back(
+                         emit_val_and_convert(*arg, instructions));
 
-                    NirVal dst = make_tacky_variable(exp.type);
-                    instructions.push_back(
-                        NirCall{c.name, std::move(args), dst});
-                    return dst;
-                  },
+                   if (exp.type.kind == TypeKind::Void) {
+                     instructions.push_back(
+                         NirCall{c.name, std::move(args), std::nullopt});
+                     return NirConstant{ConstInt{0, 0}};
+                   }
+                   NirVal dst = make_tacky_variable(exp.type);
+                   instructions.push_back(
+                       NirCall{c.name, std::move(args), dst});
+                   return dst;
+                 },
 
                   [&](const Dereference &d) -> NirExpResult {
                     auto pointer = emit_val_and_convert(*d.exp, instructions);
@@ -611,8 +640,11 @@ class NirEmitter {
     std::visit(
         Overload{
             [&](const Return &r) {
-              instructions.push_back(
-                  NirReturn{emit_val_and_convert(r.value, instructions)});
+              if (r.value)
+                instructions.push_back(NirReturn{
+                    emit_val_and_convert(*r.value, instructions)});
+              else
+                instructions.push_back(NirReturn{std::nullopt});
             },
             [&](const Expression &e) { emit_val(e.value, instructions); },
             [&](const Null &) {},
@@ -801,7 +833,11 @@ class NirEmitter {
     std::vector<NirInstruction> instructions;
     if (func.body) {
       emit_block(*func.body, instructions);
-      instructions.push_back(NirReturn{NirConstant{ConstInt{0, 0}}});
+      if (func.fun_type.ret &&
+          func.fun_type.ret->kind == TypeKind::Void)
+        instructions.push_back(NirReturn{std::nullopt});
+      else
+        instructions.push_back(NirReturn{NirConstant{ConstInt{0, 0}}});
     }
 
     bool global = true;
@@ -843,6 +879,7 @@ public:
               return type.referenced
                          ? type.size * self(self, *type.referenced)
                          : 0;
+            case TypeKind::Void:
             case TypeKind::Function: return 0;
           }
           std::unreachable();

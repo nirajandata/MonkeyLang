@@ -369,11 +369,32 @@ export class Parser {
         return Exp{AddrOf{std::make_unique<Exp>(std::move(inner)), tok.line}};
       }
 
+      case TokenType::Sizeof: {
+        advance();
+        if (check(TokenType::LParen) &&
+            (check(TokenType::Int, 1) || check(TokenType::Long, 1) ||
+             check(TokenType::Signed, 1) || check(TokenType::Unsigned, 1) ||
+             check(TokenType::Double, 1) || check(TokenType::Char, 1) ||
+             check(TokenType::Void, 1))) {
+          advance();
+          Type target_type = parse_type_specifiers();
+          if (check(TokenType::Multiply) || check(TokenType::LParen) ||
+              check(TokenType::LBracket))
+            target_type = process_abstract_declarator(
+                parse_abstract_declarator(), std::move(target_type));
+          expect(TokenType::RParen, "\")\"");
+          return Exp{SizeOfT{std::move(target_type), tok.line}};
+        }
+        Exp operand = parse_postfix();
+        return Exp{SizeOf{std::make_unique<Exp>(std::move(operand)), tok.line}};
+      }
+
       case TokenType::LParen: {
         advance();
         if (check(TokenType::Int) || check(TokenType::Long) ||
             check(TokenType::Signed) || check(TokenType::Unsigned) ||
-            check(TokenType::Double) || check(TokenType::Char)) {
+            check(TokenType::Double) || check(TokenType::Char) ||
+            check(TokenType::Void)) {
           Type target_type = parse_type_specifiers();
           if (check(TokenType::Multiply) || check(TokenType::LParen) ||
               check(TokenType::LBracket))
@@ -496,7 +517,9 @@ export class Parser {
   Return parse_return() {
     uint32_t line = peek().line;
     expect(TokenType::Return, "\"return\"");
-    auto val = parse_exp(0);
+    std::optional<Exp> val;
+    if (!check(TokenType::Semicolon))
+      val = parse_exp(0);
     expect(TokenType::Semicolon, "\";\"");
     return {std::move(val), line};
   }
@@ -683,6 +706,14 @@ export class Parser {
     const auto count_of = [&](TokenType t) {
       return std::count(types.begin(), types.end(), t);
     };
+    if (count_of(TokenType::Void) != 0) {
+      if (types.size() == 1)
+        return Type::void_type();
+      std::println("error:{}: Can't combine 'void' with other type specifiers",
+                   line);
+      had_error_ = true;
+      return Type::void_type();
+    }
     if (count_of(TokenType::Double) != 0) {
       if (types.size() == 1)
         return Type::double_type();
@@ -740,7 +771,8 @@ export class Parser {
     std::vector<TokenType> types;
     while (check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
-           check(TokenType::Double) || check(TokenType::Char))
+           check(TokenType::Double) || check(TokenType::Char) ||
+           check(TokenType::Void))
       types.push_back(advance().type);
     return type_from_specifiers(types, line);
   }
@@ -771,19 +803,19 @@ export class Parser {
     while (true) {
       if (match(TokenType::LParen)) {
       std::vector<ParameterSyntax> params;
-      if (!match(TokenType::Void)) {
-        if (!check(TokenType::RParen)) {
-          do {
-            if (check(TokenType::Static) || check(TokenType::Extern)) {
-              std::println("error:{}: Storage-class specifier is not allowed on a parameter",
-                           peek().line);
-              had_error_ = true;
-              advance();
-            }
-            Type base_type = parse_type_specifiers();
-            params.push_back({std::move(base_type), parse_declarator()});
-          } while (match(TokenType::Comma));
-        }
+      if (check(TokenType::Void) && check(TokenType::RParen, 1)) {
+        advance();
+      } else if (!check(TokenType::RParen)) {
+        do {
+          if (check(TokenType::Static) || check(TokenType::Extern)) {
+            std::println("error:{}: Storage-class specifier is not allowed on a parameter",
+                         peek().line);
+            had_error_ = true;
+            advance();
+          }
+          Type base_type = parse_type_specifiers();
+          params.push_back({std::move(base_type), parse_declarator()});
+        } while (match(TokenType::Comma));
       }
       expect(TokenType::RParen, "\")\"");
       if (result->kind == Declarator::Kind::Array) {
@@ -996,6 +1028,7 @@ export class Parser {
     while (check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
            check(TokenType::Double) || check(TokenType::Char) ||
+           check(TokenType::Void) ||
            check(TokenType::Static) || check(TokenType::Extern)) {
       const Token specifier = advance();
       if (specifier.type == TokenType::Int ||
@@ -1003,7 +1036,8 @@ export class Parser {
           specifier.type == TokenType::Signed ||
           specifier.type == TokenType::Unsigned ||
           specifier.type == TokenType::Double ||
-          specifier.type == TokenType::Char) {
+          specifier.type == TokenType::Char ||
+          specifier.type == TokenType::Void) {
         types.push_back(specifier.type);
       } else if (storage_class) {
         std::println("error:{}: Invalid storage class", specifier.line);
@@ -1051,6 +1085,7 @@ export class Parser {
     return check(TokenType::Int) || check(TokenType::Long) ||
            check(TokenType::Signed) || check(TokenType::Unsigned) ||
            check(TokenType::Double) || check(TokenType::Char) ||
+           check(TokenType::Void) ||
            check(TokenType::Static) ||
            check(TokenType::Extern);
   }

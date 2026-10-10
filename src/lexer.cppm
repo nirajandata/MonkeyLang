@@ -80,6 +80,7 @@ inline constexpr std::pair<std::string_view, TokenType> keyword_entries_[] = {
     {"else", TokenType::Else},
     {"int", TokenType::Int},
     {"void", TokenType::Void},
+    {"sizeof", TokenType::Sizeof},
     {"return", TokenType::Return},
     {"goto", TokenType::Goto},
     {"do", TokenType::Do},

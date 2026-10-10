@@ -327,13 +327,15 @@ static void emit_function_call(const NirCall &c,
   if (bytes_to_remove != 0)
     instructions.push_back(DeallocateStack{bytes_to_remove});
 
-  if (type_of(c.dst).kind == TypeKind::Double)
-    instructions.push_back(
-        Mov{AsmType::Double, Reg{RegId::XMM0},
-            nir_val_to_operand(c.dst, constants)});
-  else
-    instructions.push_back(Mov{asm_type(type_of(c.dst)), Reg{RegId::AX},
-                               nir_val_to_operand(c.dst, constants)});
+  if (c.dst) {
+    if (type_of(*c.dst).kind == TypeKind::Double)
+      instructions.push_back(
+          Mov{AsmType::Double, Reg{RegId::XMM0},
+              nir_val_to_operand(*c.dst, constants)});
+    else
+      instructions.push_back(Mov{asm_type(type_of(*c.dst)), Reg{RegId::AX},
+                                 nir_val_to_operand(*c.dst, constants)});
+  }
 }
 
 static AsmFunction nir_to_asm(const NirFunction &func,
@@ -366,9 +368,12 @@ static AsmFunction nir_to_asm(const NirFunction &func,
   for (const auto &instr : func.instructions) {
     std::visit(Overload{
         [&](const NirReturn &r) {
-          const bool is_double = type_of(r.val).kind == TypeKind::Double;
-          instructions.push_back(Mov{asm_type(type_of(r.val)), op(r.val),
-                                     Reg{is_double ? RegId::XMM0 : RegId::AX}});
+          if (r.val) {
+            const bool is_double = type_of(*r.val).kind == TypeKind::Double;
+            instructions.push_back(
+                Mov{asm_type(type_of(*r.val)), op(*r.val),
+                    Reg{is_double ? RegId::XMM0 : RegId::AX}});
+          }
           instructions.push_back(Ret{});
         },
         [&](const NirSignExtend &c) {
@@ -767,12 +772,13 @@ static Operand fix_operand(Operand o, std::unordered_map<std::string, int> &offs
             case TypeKind::ULong:
             case TypeKind::Double:
             case TypeKind::Pointer: return 8;
-            case TypeKind::Array:
-              return type.referenced
-                         ? static_cast<int>(
-                               type.size * self(self, *type.referenced))
-                         : 0;
-            case TypeKind::Function: return 0;
+              case TypeKind::Array:
+                return type.referenced
+                           ? static_cast<int>(
+                                 type.size * self(self, *type.referenced))
+                           : 0;
+              case TypeKind::Void:
+              case TypeKind::Function: return 0;
           }
           std::unreachable();
         };
@@ -1260,6 +1266,7 @@ static size_t type_size(const Type &type) {
     case TypeKind::Pointer: return 8;
     case TypeKind::Array:
       return type.referenced ? type.size * type_size(*type.referenced) : 0;
+    case TypeKind::Void:
     case TypeKind::Function: return 0;
   }
   std::unreachable();

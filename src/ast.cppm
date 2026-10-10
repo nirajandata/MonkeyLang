@@ -24,6 +24,7 @@ export {
     Char,
     SChar,
     UChar,
+    Void,
     Function,
     Pointer,
     Array
@@ -44,6 +45,7 @@ export {
     static Type char_type() { return {TypeKind::Char, {}, nullptr, nullptr, 0}; }
     static Type schar_type() { return {TypeKind::SChar, {}, nullptr, nullptr, 0}; }
     static Type uchar_type() { return {TypeKind::UChar, {}, nullptr, nullptr, 0}; }
+    static Type void_type() { return {TypeKind::Void, {}, nullptr, nullptr, 0}; }
     static Type function(std::vector<Type> params, Type ret) {
       return {TypeKind::Function, std::move(params),
               std::make_shared<Type>(std::move(ret)), nullptr, 0};
@@ -278,11 +280,21 @@ export {
     uint32_t line;
   };
 
+  struct SizeOfT {
+    Type target_type;
+    uint32_t line;
+  };
+
+  struct SizeOf {
+    std::unique_ptr<Exp> exp;
+    uint32_t line;
+  };
+
   struct Exp {
     std::variant<ConstInt, ConstLong, ConstUInt, ConstULong, ConstDouble, Var,
                  Cast, Unary, Binary, Assignment, CompoundAssignment, IncDec,
                  Conditional, FunctionCall, Dereference, AddrOf, Subscript,
-                 String> value;
+                 String, SizeOfT, SizeOf> value;
     Type type;
   };
 
@@ -299,7 +311,7 @@ export {
   };
 
   struct Return {
-    Exp value;
+    std::optional<Exp> value;
     uint32_t line;
   };
 

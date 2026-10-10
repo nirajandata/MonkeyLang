@@ -156,6 +156,8 @@ class IdentifierResolver {
                      resolve_exp(*s.right, scope);
                    },
                    [](String &) {},
+                   [](SizeOfT &) {},
+                   [&](SizeOf &s) { resolve_exp(*s.exp, scope); },
                },
                exp.value);
   }
@@ -175,7 +177,7 @@ class IdentifierResolver {
                          LocalNames &local_names) {
     std::visit(
         Overload{
-            [&](Return &r) { resolve_exp(r.value, scope); },
+            [&](Return &r) { if (r.value) resolve_exp(*r.value, scope); },
             [&](Expression &e) { resolve_exp(e.value, scope); },
             [&](Null &) {},
             [&](If &i) {
@@ -678,7 +680,7 @@ class TypeChecker {
 
   static bool is_arithmetic(const Type &type) {
     return type.kind != TypeKind::Pointer && type.kind != TypeKind::Function &&
-           type.kind != TypeKind::Array;
+           type.kind != TypeKind::Array && type.kind != TypeKind::Void;
   }
 
   static bool is_integer(const Type &type) {
@@ -691,6 +693,45 @@ class TypeChecker {
   static bool is_char_kind(TypeKind kind) {
     return kind == TypeKind::Char || kind == TypeKind::SChar ||
            kind == TypeKind::UChar;
+  }
+
+  static bool is_void(const Type &type) { return type.kind == TypeKind::Void; }
+
+  static bool is_complete(const Type &type) {
+    switch (type.kind) {
+    case TypeKind::Void:
+    case TypeKind::Function:
+      return false;
+    case TypeKind::Array:
+      return type.referenced && is_complete(*type.referenced);
+    default:
+      return true;
+    }
+  }
+
+  static bool has_invalid_array(const Type &type) {
+    switch (type.kind) {
+    case TypeKind::Array:
+      return !type.referenced || !is_complete(*type.referenced) ||
+             has_invalid_array(*type.referenced);
+    case TypeKind::Pointer:
+      return type.referenced && has_invalid_array(*type.referenced);
+    case TypeKind::Function: {
+      if (type.ret && has_invalid_array(*type.ret))
+        return true;
+      for (const Type &param : type.params)
+        if (has_invalid_array(param))
+          return true;
+      return false;
+    }
+    default:
+      return false;
+    }
+  }
+
+  static bool is_pointer_to_void(const Type &type) {
+    return type.kind == TypeKind::Pointer && type.referenced &&
+           is_void(*type.referenced);
   }
 
   static Type promote_integer(const Type &type) {
@@ -728,7 +769,9 @@ class TypeChecker {
                         [](const Conditional &v) { return v.line; },
                         [](const FunctionCall &v) { return v.line; },
                         [](const Subscript &v) { return v.line; },
-                 [](const String &v) { return v.line; }},
+                 [](const String &v) { return v.line; },
+                 [](const SizeOfT &v) { return v.line; },
+                 [](const SizeOf &v) { return v.line; }},
           exp.value);
       Type decayed = Type::pointer(*type.referenced);
       exp = Exp{AddrOf{std::make_unique<Exp>(std::move(exp)), line}, decayed};
@@ -757,6 +800,14 @@ class TypeChecker {
       left = convert_to(std::move(left), right.type);
       return right.type;
     }
+    if (left.type.kind == TypeKind::Pointer &&
+        right.type.kind == TypeKind::Pointer &&
+        (is_pointer_to_void(left.type) || is_pointer_to_void(right.type))) {
+      Type result = is_pointer_to_void(left.type) ? left.type : right.type;
+      left = convert_to(std::move(left), result);
+      right = convert_to(std::move(right), result);
+      return result;
+    }
     std::println("error:{}: Expressions have incompatible pointer types", line);
     had_error_ = true;
     return left.type;
@@ -769,6 +820,12 @@ class TypeChecker {
       return;
     }
     if (target.kind == TypeKind::Pointer && is_null_pointer_constant(exp)) {
+      exp = convert_to(std::move(exp), target);
+      return;
+    }
+    if (exp.type.kind == TypeKind::Pointer &&
+        target.kind == TypeKind::Pointer &&
+        (is_pointer_to_void(exp.type) || is_pointer_to_void(target))) {
       exp = convert_to(std::move(exp), target);
       return;
     }
@@ -790,7 +847,9 @@ class TypeChecker {
                  [](const Conditional &v) { return v.line; },
                  [](const FunctionCall &v) { return v.line; },
                  [](const Subscript &v) { return v.line; },
-                 [](const String &v) { return v.line; }},
+                 [](const String &v) { return v.line; },
+                 [](const SizeOfT &v) { return v.line; },
+                 [](const SizeOf &v) { return v.line; }},
         exp.value);
     std::println("error:{}: Cannot convert type for assignment", line);
     had_error_ = true;
@@ -818,7 +877,9 @@ class TypeChecker {
                  },
                  [](const FunctionCall &v) { return v.line; },
                  [](const Subscript &v) { return v.line; },
-                 [](const String &v) { return v.line; }},
+                 [](const String &v) { return v.line; },
+                 [](const SizeOfT &v) { return v.line; },
+                 [](const SizeOf &v) { return v.line; }},
         exp.value);
     Exp converted{Cast{target, std::make_unique<Exp>(std::move(exp)), line},
                   target};
@@ -854,8 +915,13 @@ class TypeChecker {
                    c.target_type.kind == TypeKind::Double) ||
                   source.kind == TypeKind::Function ||
                   c.target_type.kind == TypeKind::Function ||
-                  c.target_type.kind == TypeKind::Array) {
+                  c.target_type.kind == TypeKind::Array ||
+                  has_invalid_array(c.target_type)) {
                 std::println("error:{}: Invalid cast involving pointer type",
+                             c.line);
+                had_error_ = true;
+              } else if (is_void(source) && !is_void(c.target_type)) {
+                std::println("error:{}: Cannot convert void to non-void type",
                              c.line);
                 had_error_ = true;
               }
@@ -869,6 +935,12 @@ class TypeChecker {
                              d.line);
                 had_error_ = true;
                 return Type::int_type();
+              }
+              if (!is_complete(*pointer_type.referenced)) {
+                std::println(
+                    "error:{}: Cannot dereference pointer to incomplete type",
+                    d.line);
+                had_error_ = true;
               }
               return *pointer_type.referenced;
             },
@@ -897,8 +969,15 @@ class TypeChecker {
                 had_error_ = true;
                 return Type::int_type();
               }
-              return pointer_type.referenced ? *pointer_type.referenced
-                                             : Type::int_type();
+              if (!pointer_type.referenced ||
+                  !is_complete(*pointer_type.referenced)) {
+                std::println(
+                    "error:{}: Cannot subscript pointer to incomplete type",
+                    s.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
+              return *pointer_type.referenced;
             },
             [&](String &s) {
               if (s.name.empty()) {
@@ -916,10 +995,38 @@ class TypeChecker {
               }
               return symbol_table().get(s.name).type;
             },
+            [&](const SizeOfT &s) {
+              if (!is_complete(s.target_type) ||
+                  has_invalid_array(s.target_type)) {
+                std::println(
+                    "error:{}: Cannot apply sizeof to incomplete type",
+                    s.line);
+                had_error_ = true;
+              }
+              return Type::ulong_type();
+            },
+            [&](SizeOf &s) {
+              Type operand_type = typecheck_exp(*s.exp);
+              if (!is_complete(operand_type) ||
+                  has_invalid_array(operand_type)) {
+                std::println(
+                    "error:{}: Cannot apply sizeof to incomplete type",
+                    s.line);
+                had_error_ = true;
+              }
+              return Type::ulong_type();
+            },
             [&](const Unary &u) {
               Type operand_type = typecheck_exp(*u.exp);
-              if (std::holds_alternative<Not>(u.op))
+              if (std::holds_alternative<Not>(u.op)) {
+                if (is_void(operand_type)) {
+                  std::println(
+                      "error:{}: Invalid unary operator on non-arithmetic type",
+                      u.line);
+                  had_error_ = true;
+                }
                 return Type::int_type();
+              }
               if (!is_arithmetic(operand_type)) {
                 std::println(
                     "error:{}: Invalid unary operator on non-arithmetic type",
@@ -942,6 +1049,12 @@ class TypeChecker {
             [&](Binary &b) {
               Type left = typecheck_and_convert(*b.left);
               Type right = typecheck_and_convert(*b.right);
+              if (is_void(left) || is_void(right)) {
+                std::println("error:{}: Invalid operands to binary operator",
+                             b.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
               if (std::holds_alternative<Remainder>(b.op) &&
                   (left.kind == TypeKind::Double ||
                    right.kind == TypeKind::Double)) {
@@ -963,34 +1076,79 @@ class TypeChecker {
               }
               if (std::holds_alternative<Add>(b.op)) {
                 if (left.kind == TypeKind::Pointer && is_integer(right)) {
+                  if (!left.referenced || !is_complete(*left.referenced)) {
+                    std::println(
+                        "error:{}: Pointer arithmetic on pointer to incomplete type",
+                        b.line);
+                    had_error_ = true;
+                    return Type::int_type();
+                  }
                   convert_to(b.right, Type::long_type());
                   return left;
                 }
                 if (right.kind == TypeKind::Pointer && is_integer(left)) {
+                  if (!right.referenced || !is_complete(*right.referenced)) {
+                    std::println(
+                        "error:{}: Pointer arithmetic on pointer to incomplete type",
+                        b.line);
+                    had_error_ = true;
+                    return Type::int_type();
+                  }
                   convert_to(b.left, Type::long_type());
                   return right;
                 }
               }
               if (std::holds_alternative<Subtract>(b.op)) {
                 if (left.kind == TypeKind::Pointer && is_integer(right)) {
+                  if (!left.referenced || !is_complete(*left.referenced)) {
+                    std::println(
+                        "error:{}: Pointer arithmetic on pointer to incomplete type",
+                        b.line);
+                    had_error_ = true;
+                    return Type::int_type();
+                  }
                   convert_to(b.right, Type::long_type());
                   return left;
                 }
-                if (left.kind == TypeKind::Pointer && left == right)
+                if (left.kind == TypeKind::Pointer && left == right) {
+                  if (!left.referenced || !is_complete(*left.referenced)) {
+                    std::println(
+                        "error:{}: Pointer arithmetic on pointer to incomplete type",
+                        b.line);
+                    had_error_ = true;
+                    return Type::int_type();
+                  }
                   return Type::long_type();
+                }
               }
               if ((std::holds_alternative<LessThan>(b.op) ||
                    std::holds_alternative<LessOrEqual>(b.op) ||
                    std::holds_alternative<GreaterThan>(b.op) ||
                    std::holds_alternative<GreaterOrEqual>(b.op)) &&
-                  left.kind == TypeKind::Pointer && left == right)
+                  left.kind == TypeKind::Pointer && left == right) {
+                if (!left.referenced || !is_complete(*left.referenced)) {
+                  std::println(
+                      "error:{}: Comparison of pointer to incomplete type",
+                      b.line);
+                  had_error_ = true;
+                }
                 return Type::int_type();
+              }
               if (left.kind == TypeKind::Pointer ||
                   right.kind == TypeKind::Pointer) {
                 std::println("error:{}: Unsupported operation on pointer",
                              b.line);
                 had_error_ = true;
                 return Type::int_type();
+              }
+              if (std::holds_alternative<ShiftLeft>(b.op) ||
+                  std::holds_alternative<ShiftRight>(b.op)) {
+                const Type promoted_left = promote_integer(left);
+                const Type promoted_right = promote_integer(right);
+                if (promoted_left != left) convert_to(b.left, promoted_left);
+                if (promoted_right != right)
+                  convert_to(b.right, promoted_right);
+                return promoted_left;
               }
               Type common = common_type(left, right);
               convert_to(b.left, common);
@@ -1014,6 +1172,10 @@ class TypeChecker {
               if (!is_lvalue(*a.left)) {
                 std::println("error:{}: Expression is not a valid lvalue",
                              a.line);
+                had_error_ = true;
+              }
+              if (is_void(left)) {
+                std::println("error:{}: Cannot assign to void", a.line);
                 had_error_ = true;
               }
               convert_by_assignment(*a.right, left);
@@ -1049,9 +1211,23 @@ class TypeChecker {
               return type;
             },
             [&](Conditional &c) {
-              typecheck_and_convert(*c.condition);
+              Type condition = typecheck_and_convert(*c.condition);
+              if (is_void(condition)) {
+                std::println("error:{}: Conditional condition must have scalar type",
+                             c.line);
+                had_error_ = true;
+              }
               Type then_type = typecheck_and_convert(*c.then_exp);
               Type else_type = typecheck_and_convert(*c.else_exp);
+              if (is_void(then_type) || is_void(else_type)) {
+                if (is_void(then_type) && is_void(else_type))
+                  return Type::void_type();
+                std::println(
+                    "error:{}: Conditional branches must have compatible types",
+                    c.line);
+                had_error_ = true;
+                return Type::int_type();
+              }
               Type common;
               if (then_type.kind == TypeKind::Pointer ||
                   else_type.kind == TypeKind::Pointer) {
@@ -1093,17 +1269,52 @@ class TypeChecker {
     return result;
   }
 
+  void check_object_type(const Type &type, uint32_t line,
+                         bool allow_void) {
+    if (has_invalid_array(type)) {
+      std::println(
+          "error:{}: Array has incomplete element type", line);
+      had_error_ = true;
+    }
+    if (!allow_void && is_void(type)) {
+      std::println("error:{}: Variable cannot have type void", line);
+      had_error_ = true;
+    }
+  }
+
+  void typecheck_condition(Exp &exp, uint32_t line) {
+    Type type = typecheck_exp(exp);
+    if (is_void(type)) {
+      std::println("error:{}: Controlling condition must have scalar type",
+                   line);
+      had_error_ = true;
+    }
+  }
+
   void typecheck_statement(Statement &stmt) {
     std::visit(
         Overload{
             [&](Return &r) {
-              typecheck_and_convert(r.value);
-              convert_by_assignment(r.value, return_type_);
+              if (r.value) {
+                if (is_void(return_type_)) {
+                  std::println(
+                      "error:{}: Void function should not return a value",
+                      r.line);
+                  had_error_ = true;
+                }
+                typecheck_and_convert(*r.value);
+                convert_by_assignment(*r.value, return_type_);
+              } else if (!is_void(return_type_)) {
+                std::println(
+                    "error:{}: Non-void function should return a value",
+                    r.line);
+                had_error_ = true;
+              }
             },
             [&](Expression &e) { typecheck_exp(e.value); },
             [](const Null &) {},
             [&](If &i) {
-              typecheck_exp(i.condition);
+              typecheck_condition(i.condition, i.line);
               typecheck_statement(*i.then_stmt);
               if (i.else_stmt)
                 typecheck_statement(*i.else_stmt);
@@ -1133,17 +1344,17 @@ class TypeChecker {
               typecheck_statement(*s.body);
             },
             [&](While &w) {
-              typecheck_exp(w.condition->value);
+              typecheck_condition(w.condition->value, w.line);
               typecheck_statement(*w.body);
             },
             [&](DoWhile &d) {
               typecheck_statement(*d.body);
-              typecheck_exp(d.condition->value);
+              typecheck_condition(d.condition->value, d.line);
             },
             [&](For &f) {
               typecheck_for_init(f.init);
               if (f.condition)
-                typecheck_exp(f.condition->value);
+                typecheck_condition(f.condition->value, f.line);
               if (f.post)
                 typecheck_exp(f.post->value);
               typecheck_statement(*f.body);
@@ -1154,6 +1365,7 @@ class TypeChecker {
 
   void typecheck_local_variable_declaration(VariableDeclaration &d) {
     const Type &decl_type = d.var_type;
+    check_object_type(decl_type, d.line, false);
     if (is_extern(d)) {
       if (d.init) {
         std::println("error:{}: Initializer on local extern variable '{}'",
@@ -1202,6 +1414,7 @@ class TypeChecker {
 
   void typecheck_file_scope_variable_declaration(
       VariableDeclaration &d) {
+    check_object_type(d.var_type, d.line, false);
     InitialValue init{InitialValue::Kind::Tentative, 0};
     if (d.init) {
       typecheck_initializer(d.var_type, *d.init);
@@ -1261,6 +1474,19 @@ class TypeChecker {
     if (d.fun_type.ret && d.fun_type.ret->kind == TypeKind::Array) {
       std::println("error:{}: A function cannot return an array", d.line);
       had_error_ = true;
+    }
+    if (d.fun_type.ret && has_invalid_array(*d.fun_type.ret)) {
+      std::println("error:{}: Array has incomplete element type", d.line);
+      had_error_ = true;
+    }
+    for (const Type &param : d.fun_type.params) {
+      if (is_void(param)) {
+        std::println("error:{}: Parameter cannot have type void", d.line);
+        had_error_ = true;
+      } else if (has_invalid_array(param)) {
+        std::println("error:{}: Array has incomplete element type", d.line);
+        had_error_ = true;
+      }
     }
     for (Type &param : d.fun_type.params) {
       if (param.kind == TypeKind::Array && param.referenced)
@@ -1498,6 +1724,8 @@ class BreakContinueLabeler {
                      find_enclosing_loop(*s.right, loop);
                    },
                    [](String &) {},
+                   [](SizeOfT &) {},
+                   [&](SizeOf &s) { find_enclosing_loop(*s.exp, loop); },
                },
                exp.value);
   }
